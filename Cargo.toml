@@ -1,0 +1,18 @@
+[package]
+name = "sundowner"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Fast, dependency-free Markdown to PDF converter"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Keep unwinding so an unexpected internal bug is caught and reported per file
+# instead of aborting the whole process.
+panic = "unwind"
