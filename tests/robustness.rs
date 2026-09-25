@@ -1,5 +1,9 @@
 //! End-to-end robustness tests: random and adversarial documents must always
 //! convert into a structurally valid PDF, without panicking or hanging.
+//!
+//! The default tests are small smoke runs. The full-size stress runs are
+//! `#[ignore]`d; run them with `cargo test --release -- --include-ignored`
+//! (CI does).
 
 use std::time::{Duration, Instant};
 use sundowner::{convert, Options};
@@ -110,11 +114,10 @@ fn assert_valid_pdf(pdf: &[u8]) {
     }
 }
 
-#[test]
-fn random_documents_convert() {
+fn random_documents(rounds: usize) {
     let mut rng = Rng(0x5eed_1234_abcd_ef01);
     let opts = Options::default();
-    for round in 0..1500 {
+    for round in 0..rounds {
         let len = 1 + rng.below(if round % 10 == 0 { 2000 } else { 120 });
         let doc = random_doc(&mut rng, len);
         let out = convert(&doc, &opts);
@@ -122,10 +125,9 @@ fn random_documents_convert() {
     }
 }
 
-#[test]
-fn random_bytes_convert() {
+fn random_bytes(rounds: usize) {
     let mut rng = Rng(99);
-    for _ in 0..300 {
+    for _ in 0..rounds {
         let bytes: Vec<u8> = (0..rng.below(3000)).map(|_| rng.next() as u8).collect();
         let text = String::from_utf8_lossy(&bytes);
         assert_valid_pdf(&convert(&text, &Options::default()).pdf);
@@ -151,24 +153,23 @@ fn extreme_options() {
     }
 }
 
-#[test]
-fn adversarial_inputs_are_fast() {
+fn adversarial(scale: usize) {
     let cases = [
-        "> ".repeat(100_000),
-        "- ".repeat(50_000),
-        "  - x\n".repeat(20_000),
-        "*".repeat(200_000),
-        "[".repeat(100_000) + &"](".repeat(50_000),
-        "`".repeat(100_000),
-        "|a".repeat(5000) + "\n" + &"|-".repeat(5000) + "\n" + &"|b".repeat(5000),
-        "a\n".repeat(200_000),
-        "x".repeat(1_000_000),
-        "```\n".to_string() + &"line\n".repeat(100_000),
-        "<!--".repeat(50_000),
-        "&#".repeat(100_000),
-        "1. ".repeat(50_000),
-        "# ".repeat(100_000),
-        "![".repeat(50_000) + &"](a)".repeat(10),
+        "> ".repeat(100_000 / scale),
+        "- ".repeat(50_000 / scale),
+        "  - x\n".repeat(20_000 / scale),
+        "*".repeat(200_000 / scale),
+        "[".repeat(100_000 / scale) + &"](".repeat(50_000 / scale),
+        "`".repeat(100_000 / scale),
+        "|a".repeat(5000 / scale) + "\n" + &"|-".repeat(5000 / scale) + "\n" + &"|b".repeat(5000 / scale),
+        "a\n".repeat(200_000 / scale),
+        "x".repeat(1_000_000 / scale),
+        "```\n".to_string() + &"line\n".repeat(100_000 / scale),
+        "<!--".repeat(50_000 / scale),
+        "&#".repeat(100_000 / scale),
+        "1. ".repeat(50_000 / scale),
+        "# ".repeat(100_000 / scale),
+        "![".repeat(50_000 / scale) + &"](a)".repeat(10),
     ];
     for case in &cases {
         let start = Instant::now();
@@ -180,4 +181,37 @@ fn adversarial_inputs_are_fast() {
             &case[..20.min(case.len())]
         );
     }
+}
+
+#[test]
+fn random_documents_smoke() {
+    random_documents(150);
+}
+
+#[test]
+fn random_bytes_smoke() {
+    random_bytes(40);
+}
+
+#[test]
+fn adversarial_smoke() {
+    adversarial(20);
+}
+
+#[test]
+#[ignore = "stress test; run with --release -- --include-ignored"]
+fn random_documents_stress() {
+    random_documents(1500);
+}
+
+#[test]
+#[ignore = "stress test; run with --release -- --include-ignored"]
+fn random_bytes_stress() {
+    random_bytes(300);
+}
+
+#[test]
+#[ignore = "stress test; run with --release -- --include-ignored"]
+fn adversarial_stress() {
+    adversarial(1);
 }

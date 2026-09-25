@@ -16,13 +16,14 @@ With no INPUT, or INPUT '-', Markdown is read from standard input.
 
 OPTIONS:
     -o, --output <FILE>     Output file ('-' for standard output); single input only
-    -p, --paper <SIZE>      a4 (default), a5, letter, legal, or WIDTHxHEIGHT in mm
+    -p, --paper <SIZE>      a4 (default), a3, a5, letter, legal, or WIDTHxHEIGHT in mm
     -f, --font <FAMILY>     sans (default) or serif
     -s, --font-size <PT>    Body font size in points (default 11)
     -m, --margin <MM>       Page margin in millimetres (default 20)
     -t, --title <TEXT>      Document title (default: first level-1 heading)
         --no-page-numbers   Do not number pages
-        --no-images         Do not load local image files
+        --no-images         Do not load image files (images must be relative paths
+                            inside the input file's directory)
     -q, --quiet             Do not print warnings
     -h, --help              Show this help
     -V, --version           Show version
@@ -140,24 +141,38 @@ fn parse_args() -> Result<Option<Args>, String> {
     Ok(Some(a))
 }
 
-/// Write via a temporary file and rename, so a failed run never leaves a
-/// truncated PDF behind.
+/// Write via a temporary sibling file and rename, so a failed run never
+/// leaves a truncated PDF behind. The temporary file lives in the target's
+/// directory, so the rename never crosses filesystems. If the directory does
+/// not allow creating it (or the rename is refused), fall back to writing the
+/// target directly; the whole PDF is already in memory, so only an I/O error
+/// mid-write could leave a partial file.
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "out.pdf".into());
     let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    let result = (|| {
+    let atomic = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    match atomic {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            let _ = std::fs::remove_file(&tmp);
+            let direct = (|| {
+                let mut f = std::fs::File::create(path)?;
+                f.write_all(data)?;
+                f.sync_all()
+            })();
+            direct.map_err(|e| {
+                std::io::Error::new(e.kind(), format!("{e} (temporary file also failed: {first})"))
+            })
+        }
     }
-    result
 }
 
 fn convert_one(input: &str, args: &Args) -> Result<(), String> {
@@ -223,8 +238,10 @@ fn convert_one(input: &str, args: &Args) -> Result<(), String> {
 
 fn main() -> ExitCode {
     // Internal errors are reported per file by convert_one; keep the default
-    // panic message out of the user's terminal.
-    std::panic::set_hook(Box::new(|_| {}));
+    // panic message out of the user's terminal unless someone is debugging.
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
     let args = match parse_args() {
         Ok(Some(a)) => a,
         Ok(None) => return ExitCode::SUCCESS,

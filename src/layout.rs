@@ -8,7 +8,7 @@ use crate::markdown::{Align, Block, Document};
 use crate::metrics;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 const LINE_SPACING: f32 = 1.4;
@@ -218,6 +218,7 @@ struct Layout<'a> {
     marker: Option<Marker>,
     images: Vec<Image>,
     image_cache: HashMap<String, Option<usize>>,
+    image_bytes: usize,
     headings: Vec<Heading>,
     anchors: HashMap<String, (usize, f32)>,
     slug_counts: HashMap<String, usize>,
@@ -235,6 +236,7 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         marker: None,
         images: Vec::new(),
         image_cache: HashMap::new(),
+        image_bytes: 0,
         headings: Vec::new(),
         anchors: HashMap::new(),
         slug_counts: HashMap::new(),
@@ -706,7 +708,14 @@ impl Layout<'_> {
         if let Some(r) = self.image_cache.get(src) {
             return *r;
         }
-        let result = self.read_image(src);
+        let result = self.read_image(src).and_then(|img| {
+            let size = img.data.len() + img.smask.as_ref().map_or(0, Vec::len);
+            if self.image_bytes + size > image::MAX_TOTAL_BYTES {
+                return Err("total size of embedded images exceeds the limit".into());
+            }
+            self.image_bytes += size;
+            Ok(img)
+        });
         let idx = match result {
             Ok(img) => {
                 self.images.push(img);
@@ -722,15 +731,9 @@ impl Layout<'_> {
     }
 
     fn read_image(&self, src: &str) -> Result<Image, String> {
-        let lower = src.to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("data:") {
-            return Err("remote images are not supported".into());
-        }
         let base = self.o.base_dir.as_ref().ok_or("image loading is disabled")?;
-        let path = percent_decode(src.strip_prefix("file://").unwrap_or(src));
-        let path = base.join(path);
-        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-        image::load(&bytes)
+        let path = confine(base, src)?;
+        image::load(&image::read_file(&path)?)
     }
 
     fn image(&mut self, alt: &str, src: &str, ctx: Ctx) {
@@ -1117,6 +1120,36 @@ impl Layout<'_> {
     }
 }
 
+/// Resolve an image reference to a file inside `base`. Only relative paths
+/// are accepted, and the resolved file (after following symlinks) must stay
+/// under the document directory, so a Markdown file cannot pull arbitrary
+/// files such as `/etc/passwd` or `../../secret.png` into the PDF.
+fn confine(base: &Path, src: &str) -> Result<PathBuf, String> {
+    let lower = src.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Err("remote images are not supported".into());
+    }
+    if lower.contains("://") || lower.starts_with("file:") || lower.starts_with("data:") {
+        return Err("only relative file paths are supported".into());
+    }
+    let rel = percent_decode(src);
+    let rel = Path::new(&rel);
+    let escapes = rel
+        .components()
+        .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir));
+    if rel.as_os_str().is_empty() || escapes {
+        return Err("image path must be relative and inside the document directory".into());
+    }
+    let base = base
+        .canonicalize()
+        .map_err(|e| format!("document directory: {e}"))?;
+    let full = base.join(rel).canonicalize().map_err(|e| e.to_string())?;
+    if !full.starts_with(&base) {
+        return Err("image path resolves outside the document directory".into());
+    }
+    Ok(full)
+}
+
 fn placeholder(alt: &str, src: &str) -> Inline {
     Inline::Text {
         text: format!("[image: {}]", if alt.is_empty() { src } else { alt }),
@@ -1156,16 +1189,47 @@ mod tests {
     #[test]
     fn number_formatting() {
         let mut v = Vec::new();
-        for x in [0.0, 1.0, -2.5, 3.14159, 0.05, f32::NAN, 100.999] {
+        for x in [0.0, 1.0, -2.5, 1.23456, 0.05, f32::NAN, 100.999] {
             num(&mut v, x);
             v.push(b' ');
         }
-        assert_eq!(String::from_utf8(v).unwrap(), "0 1 -2.5 3.14 0.05 0 101 ");
+        assert_eq!(String::from_utf8(v).unwrap(), "0 1 -2.5 1.23 0.05 0 101 ");
     }
 
     #[test]
     fn slugs() {
         assert_eq!(slugify("Hello, World! 2"), "hello-world-2");
         assert_eq!(percent_decode("a%20b%zz%2"), "a b%zz%2");
+    }
+
+    #[test]
+    fn image_paths_are_confined() {
+        let dir = std::env::temp_dir().join(format!("sundowner-confine-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("img"));
+        std::fs::write(dir.join("img/a.png"), b"x").unwrap();
+        assert!(confine(&dir, "img/a.png").is_ok());
+        assert!(confine(&dir, "./img/a.png").is_ok());
+        assert!(confine(&dir, "img%2Fa.png").is_ok());
+        for bad in [
+            "/etc/passwd",
+            "file:///etc/passwd",
+            "file:img/a.png",
+            "../x.png",
+            "img/../../x.png",
+            "%2e%2e/x.png",
+            "http://example.com/a.png",
+            "data:image/png;base64,AA==",
+            "",
+        ] {
+            assert!(confine(&dir, bad).is_err(), "{bad} was accepted");
+        }
+        #[cfg(unix)]
+        {
+            let link = dir.join("img/link.png");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink("/etc/hostname", &link).unwrap();
+            assert!(confine(&dir, "img/link.png").is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

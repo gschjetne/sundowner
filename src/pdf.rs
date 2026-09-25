@@ -44,6 +44,15 @@ fn text_string(s: &str) -> String {
     out
 }
 
+/// Only web and mail links become clickable; other schemes (`javascript:`,
+/// `file:`, custom handlers) and relative paths are left as plain text.
+fn uri_allowed(u: &str) -> bool {
+    let lower = u.trim_start().to_ascii_lowercase();
+    ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|p| lower.starts_with(p))
+}
+
 /// Escape a URI as a PDF literal string (7-bit ASCII only).
 fn uri_string(s: &str) -> String {
     let mut out = String::from("(");
@@ -138,9 +147,11 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32, serif: bool) -> Vec<u8> {
         w.stream(id, &dict, &img.data);
     }
 
-    let dest = |page: usize, y: f32| -> String {
-        let pid = page_ids.get(page).map(|p| p.0).unwrap_or(page_ids[0].0);
-        format!("[{pid} 0 R /XYZ null {} null]", n(y))
+    // None if the page does not exist; callers then omit the destination
+    // rather than point at the wrong page.
+    let dest = |page: usize, y: f32| -> Option<String> {
+        let pid = page_ids.get(page)?.0;
+        Some(format!("[{pid} 0 R /XYZ null {} null]", n(y)))
     };
 
     // Pages, content streams and link annotations.
@@ -148,14 +159,15 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32, serif: bool) -> Vec<u8> {
         let mut annots = String::new();
         for link in &page.links {
             let action = match &link.target {
-                Target::Uri(u) => format!("/A << /S /URI /URI {} >>", uri_string(u)),
+                Target::Uri(u) if uri_allowed(u) => format!("/A << /S /URI /URI {} >>", uri_string(u)),
+                Target::Uri(_) => continue,
                 Target::Anchor(a) => {
                     let found = doc
                         .anchors
                         .get(a.as_str())
                         .or_else(|| doc.anchors.get(&a.to_lowercase()));
-                    match found {
-                        Some(&(p, y)) => format!("/Dest {}", dest(p, y)),
+                    match found.and_then(|&(p, y)| dest(p, y)) {
+                        Some(d) => format!("/Dest {d}"),
                         None => continue,
                     }
                 }
@@ -224,11 +236,13 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32, serif: bool) -> Vec<u8> {
         };
         for (i, h) in doc.headings.iter().enumerate() {
             let mut d = format!(
-                "<< /Title {} /Parent {} 0 R /Dest {}",
+                "<< /Title {} /Parent {} 0 R",
                 text_string(&h.title),
                 parent[i].map(|p| outline_ids[p]).unwrap_or(root),
-                dest(h.page, h.y)
             );
+            if let Some(dst) = dest(h.page, h.y) {
+                d.push_str(&format!(" /Dest {dst}"));
+            }
             let sib = siblings(i);
             if let Some(pos) = sib.iter().position(|&s| s == i) {
                 if pos > 0 {
@@ -292,4 +306,23 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32, serif: bool) -> Vec<u8> {
         "trailer\n<< /Size {size} /Root {catalog} 0 R /Info {info} 0 R >>\nstartxref\n{xref}\n%%EOF\n"
     );
     w.out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn uri_allowlist() {
+        for ok in ["http://a.b", "HTTPS://a.b/c?d", "mailto:x@y.z"] {
+            assert!(super::uri_allowed(ok), "{ok}");
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "other.md",
+            "vscode://x",
+            "",
+        ] {
+            assert!(!super::uri_allowed(bad), "{bad}");
+        }
+    }
 }

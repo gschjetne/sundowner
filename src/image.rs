@@ -6,8 +6,47 @@
 
 use crate::flate;
 
+/// Largest image file that will be read.
+pub const MAX_FILE_BYTES: u64 = 64 << 20;
+/// Largest total of embedded image data per document.
+pub const MAX_TOTAL_BYTES: usize = 256 << 20;
+/// Largest image dimensions accepted, for every format and code path.
+pub const MAX_SIDE: u32 = 20_000;
+pub const MAX_PIXELS: u64 = 64_000_000;
 /// Refuse images whose decoded size would exceed this many bytes.
 const MAX_DECODED: usize = 512 << 20;
+
+/// Read an image file, refusing anything that is not a regular file or is
+/// larger than [`MAX_FILE_BYTES`].
+pub fn read_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!("file is larger than {} MiB", MAX_FILE_BYTES >> 20));
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    if buf.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!("file is larger than {} MiB", MAX_FILE_BYTES >> 20));
+    }
+    Ok(buf)
+}
+
+fn check_dimensions(width: u32, height: u32) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("image has zero width or height".into());
+    }
+    if width > MAX_SIDE || height > MAX_SIDE || width as u64 * height as u64 > MAX_PIXELS {
+        return Err(format!("image is too large ({width}x{height} pixels)"));
+    }
+    Ok(())
+}
 
 pub struct Image {
     pub width: u32,
@@ -20,6 +59,9 @@ pub struct Image {
 }
 
 pub fn load(bytes: &[u8]) -> Result<Image, String> {
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!("file is larger than {} MiB", MAX_FILE_BYTES >> 20));
+    }
     if bytes.starts_with(&[0xFF, 0xD8]) {
         jpeg(bytes)
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -66,8 +108,9 @@ fn jpeg(b: &[u8]) -> Result<Image, String> {
             let height = be16(b, i + 3).ok_or_else(bad)?;
             let width = be16(b, i + 5).ok_or_else(bad)?;
             let comps = *b.get(i + 7).ok_or_else(bad)?;
-            if width == 0 || height == 0 || bpc != 8 {
-                return Err("unsupported JPEG dimensions or precision".into());
+            check_dimensions(width, height)?;
+            if bpc != 8 {
+                return Err("unsupported JPEG precision".into());
             }
             let cs = match comps {
                 1 => "/DeviceGray",
@@ -119,9 +162,7 @@ fn png(b: &[u8]) -> Result<Image, String> {
     let width = be32(h, 0).unwrap_or(0);
     let height = be32(h, 4).unwrap_or(0);
     let (depth, color, interlace) = (h[8], h[9], h[12]);
-    if width == 0 || height == 0 || width > 1 << 24 || height > 1 << 24 {
-        return Err(bad("bad dimensions"));
-    }
+    check_dimensions(width, height)?;
     if idat.is_empty() {
         return Err(bad("no image data"));
     }
@@ -298,6 +339,17 @@ mod tests {
         j.extend_from_slice(&[0; 9]);
         let img = load(&j).unwrap();
         assert_eq!((img.width, img.height), (30, 20));
+    }
+
+    #[test]
+    fn oversized_images_are_rejected() {
+        let big = make_png(2, 8, MAX_SIDE + 1, 1, &[0; 8]);
+        assert!(load(&big).err().unwrap().contains("too large"));
+        let big = make_png(0, 8, 10_000, 10_000, &[0; 8]);
+        assert!(load(&big).err().unwrap().contains("too large"));
+        let mut j = vec![0xFF, 0xD8, 0xFF, 0xC0, 0, 11, 8, 0x4E, 0x21, 0x4E, 0x21, 3];
+        j.extend_from_slice(&[0; 9]);
+        assert!(load(&j).err().unwrap().contains("too large"));
     }
 
     #[test]
