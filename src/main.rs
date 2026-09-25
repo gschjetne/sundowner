@@ -1,8 +1,12 @@
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use sundowner::config::{self, Config};
+use sundowner::fonts::{Fonts, FONT_LICENSES};
 use sundowner::Options;
 
 const USAGE: &str = "\
@@ -16,8 +20,10 @@ With no INPUT, or INPUT '-', Markdown is read from standard input.
 
 OPTIONS:
     -o, --output <FILE>     Output file ('-' for standard output); single input only
+    -c, --config <FILE>     Settings and fonts file (default: the nearest .sundowner
+                            in the input's directory or a parent directory)
+        --no-config         Ignore .sundowner files
     -p, --paper <SIZE>      a4 (default), a3, a5, letter, legal, or WIDTHxHEIGHT in mm
-    -f, --font <FAMILY>     sans (default) or serif
     -s, --font-size <PT>    Body font size in points (default 11)
     -m, --margin <MM>       Page margin in millimetres (default 20)
     -t, --title <TEXT>      Document title (default: first level-1 heading)
@@ -25,54 +31,59 @@ OPTIONS:
         --no-images         Do not load image files (images must be relative paths
                             inside the input file's directory)
     -q, --quiet             Do not print warnings
+        --licenses          Show the licenses of sundowner and its bundled fonts
     -h, --help              Show this help
     -V, --version           Show version
+
+Text is set in the bundled Alegreya and code in IBM Plex Mono. Other fonts,
+including fallbacks for other scripts, are added in a .sundowner file; see
+the README. Installed system fonts are never used.
 ";
 
 const MM: f32 = 72.0 / 25.4;
 
+enum ConfigChoice {
+    Nearest,
+    File(PathBuf),
+    Ignore,
+}
+
+/// Command-line settings; `None` means "use the config file or default".
 struct Args {
     inputs: Vec<String>,
     output: Option<String>,
-    options: Options,
+    config: ConfigChoice,
+    paper: Option<(f32, f32)>,
+    font_size: Option<f32>,
+    margin: Option<f32>,
+    title: Option<String>,
+    page_numbers: Option<bool>,
     images: bool,
     quiet: bool,
 }
 
-fn parse_num(flag: &str, v: &str, lo: f32, hi: f32) -> Result<f32, String> {
-    match v.trim().parse::<f32>() {
-        Ok(x) if x.is_finite() && x >= lo && x <= hi => Ok(x),
-        _ => Err(format!(
-            "{flag}: expected a number between {lo} and {hi}, got '{v}'"
-        )),
+fn licenses() -> String {
+    let mut s = String::from(
+        "sundowner is licensed under the MIT License.\n\n\
+         The fonts bundled in this program are licensed under the SIL Open Font\n\
+         License, Version 1.1. Their copyright notices and license follow.\n",
+    );
+    for (name, text) in FONT_LICENSES {
+        s.push_str(&format!("\n==== {name} ====\n\n{text}\n"));
     }
-}
-
-fn paper(v: &str) -> Result<(f32, f32), String> {
-    let (w, h) = match v.to_ascii_lowercase().as_str() {
-        "a4" => (210.0, 297.0),
-        "a5" => (148.0, 210.0),
-        "a3" => (297.0, 420.0),
-        "letter" => (215.9, 279.4),
-        "legal" => (215.9, 355.6),
-        other => {
-            let (w, h) = other
-                .split_once('x')
-                .ok_or_else(|| format!("--paper: unknown size '{v}'"))?;
-            (
-                parse_num("--paper", w, 50.0, 5000.0)?,
-                parse_num("--paper", h, 50.0, 5000.0)?,
-            )
-        }
-    };
-    Ok((w * MM, h * MM))
+    s
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
     let mut a = Args {
         inputs: Vec::new(),
         output: None,
-        options: Options::default(),
+        config: ConfigChoice::Nearest,
+        paper: None,
+        font_size: None,
+        margin: None,
+        title: None,
+        page_numbers: None,
         images: true,
         quiet: false,
     };
@@ -81,7 +92,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     while let Some(raw) = it.next() {
         let arg = raw.to_string_lossy().into_owned();
         if only_files || arg == "-" || !arg.starts_with('-') {
-            a.inputs.push(raw.to_string_lossy().into_owned());
+            a.inputs.push(arg);
             continue;
         }
         let (flag, inline_val) = match arg.split_once('=') {
@@ -106,32 +117,25 @@ fn parse_args() -> Result<Option<Args>, String> {
                 println!("sundowner {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
+            "--licenses" => {
+                print!("{}", licenses());
+                return Ok(None);
+            }
             "-o" | "--output" => a.output = Some(value()?),
-            "-p" | "--paper" => {
-                let (w, h) = paper(&value()?)?;
-                a.options.page_width = w;
-                a.options.page_height = h;
+            "-c" | "--config" => a.config = ConfigChoice::File(PathBuf::from(value()?)),
+            "--no-config" => a.config = ConfigChoice::Ignore,
+            "-p" | "--paper" => a.paper = Some(config::parse_paper(&value()?).map_err(|e| format!("--{e}"))?),
+            "-s" | "--font-size" => {
+                a.font_size = Some(config::parse_number("--font-size", &value()?, 4.0, 72.0)?)
             }
-            "-f" | "--font" => {
-                a.options.serif = match value()?.to_ascii_lowercase().as_str() {
-                    "sans" | "sans-serif" | "helvetica" => false,
-                    "serif" | "times" => true,
-                    v => return Err(format!("--font: expected 'sans' or 'serif', got '{v}'")),
-                }
-            }
-            "-s" | "--font-size" => a.options.font_size = parse_num("--font-size", &value()?, 4.0, 72.0)?,
-            "-m" | "--margin" => a.options.margin = parse_num("--margin", &value()?, 0.0, 100.0)? * MM,
-            "-t" | "--title" => a.options.title = Some(value()?),
-            "--no-page-numbers" => a.options.page_numbers = false,
+            "-m" | "--margin" => a.margin = Some(config::parse_number("--margin", &value()?, 0.0, 100.0)?),
+            "-t" | "--title" => a.title = Some(value()?),
+            "--no-page-numbers" => a.page_numbers = Some(false),
             "--no-images" => a.images = false,
             "-q" | "--quiet" => a.quiet = true,
             _ => return Err(format!("unknown option '{arg}' (see --help)")),
         }
     }
-    // Keep a sensible text column no matter what margin and paper were chosen.
-    let o = &mut a.options;
-    let max_margin = (o.page_width.min(o.page_height) - 4.0 * o.font_size * 3.0) / 2.0;
-    o.margin = o.margin.min(max_margin.max(0.0));
     if a.inputs.is_empty() {
         a.inputs.push("-".into());
     }
@@ -139,6 +143,57 @@ fn parse_args() -> Result<Option<Args>, String> {
         return Err("--output can only be used with a single input".into());
     }
     Ok(Some(a))
+}
+
+/// Loaded configurations and their fonts, keyed by config file (None = no
+/// config), so fonts are parsed once per run.
+type ConfigCache = HashMap<Option<PathBuf>, Result<(Config, Arc<Fonts>), String>>;
+
+fn load_config(
+    path: Option<PathBuf>,
+    cache: &mut ConfigCache,
+    quiet: bool,
+) -> Result<(Config, Arc<Fonts>), String> {
+    cache
+        .entry(path.clone())
+        .or_insert_with(|| match &path {
+            None => Ok((Config::default(), Fonts::builtin())),
+            Some(p) => {
+                let cfg = config::load(p)?;
+                let fonts = Fonts::load(&cfg.fonts).map_err(|e| format!("{}: {e}", p.display()))?;
+                if !quiet {
+                    for w in &fonts.warnings {
+                        eprintln!("sundowner: warning: {w}");
+                    }
+                }
+                Ok((cfg, Arc::new(fonts)))
+            }
+        })
+        .clone()
+}
+
+fn build_options(args: &Args, cfg: &Config, fonts: Arc<Fonts>, base_dir: Option<PathBuf>) -> Options {
+    let mut o = Options {
+        fonts,
+        ..Options::default()
+    };
+    if let Some((w, h)) = args.paper.or(cfg.paper) {
+        o.page_width = w;
+        o.page_height = h;
+    }
+    if let Some(s) = args.font_size.or(cfg.font_size) {
+        o.font_size = s;
+    }
+    if let Some(m) = args.margin.or(cfg.margin) {
+        o.margin = m * MM;
+    }
+    o.page_numbers = args.page_numbers.or(cfg.page_numbers).unwrap_or(true);
+    o.title = args.title.clone();
+    o.base_dir = if args.images { base_dir } else { None };
+    // Keep a sensible text column no matter what margin and paper were chosen.
+    let max_margin = (o.page_width.min(o.page_height) - 12.0 * o.font_size) / 2.0;
+    o.margin = o.margin.min(max_margin.max(0.0));
+    o
 }
 
 /// Write via a temporary sibling file and rename, so a failed run never
@@ -175,7 +230,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
-fn convert_one(input: &str, args: &Args) -> Result<(), String> {
+fn convert_one(input: &str, args: &Args, cache: &mut ConfigCache) -> Result<(), String> {
     let (source, base_dir, default_out) = if input == "-" {
         let mut buf = Vec::new();
         std::io::stdin()
@@ -200,8 +255,13 @@ fn convert_one(input: &str, args: &Args) -> Result<(), String> {
     };
     let text = String::from_utf8_lossy(&source);
 
-    let mut options = args.options.clone();
-    options.base_dir = if args.images { base_dir } else { None };
+    let config_path = match &args.config {
+        ConfigChoice::Ignore => None,
+        ConfigChoice::File(p) => Some(p.clone()),
+        ConfigChoice::Nearest => base_dir.as_deref().and_then(config::find),
+    };
+    let (cfg, fonts) = load_config(config_path, cache, args.quiet)?;
+    let options = build_options(args, &cfg, fonts, base_dir);
 
     let converted = match std::panic::catch_unwind(|| sundowner::convert(&text, &options)) {
         Ok(c) => c,
@@ -250,9 +310,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let mut cache = ConfigCache::new();
     let mut failed = false;
     for input in &args.inputs {
-        if let Err(e) = convert_one(input, &args) {
+        if let Err(e) = convert_one(input, &args, &mut cache) {
             eprintln!("sundowner: {e}");
             failed = true;
         }

@@ -1,15 +1,17 @@
 //! Page layout: turns the parsed document into positioned text runs, rules,
 //! boxes and images on fixed-size pages.
 
-use crate::encoding;
+use crate::chars;
+use crate::fonts::{FaceId, Fonts};
 use crate::image::{self, Image};
 use crate::inline::{self, Inline, Style};
 use crate::markdown::{Align, Block, Document};
-use crate::metrics;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 const LINE_SPACING: f32 = 1.4;
 const TEXT: Color = (0.11, 0.11, 0.12);
@@ -26,12 +28,13 @@ pub struct Options {
     pub page_height: f32,
     pub margin: f32,
     pub font_size: f32,
-    pub serif: bool,
     pub page_numbers: bool,
     /// Directory that relative image paths are resolved against. `None`
     /// disables loading local images.
     pub base_dir: Option<PathBuf>,
     pub title: Option<String>,
+    /// Fonts and fallback chains used to set text.
+    pub fonts: Arc<Fonts>,
 }
 
 impl Default for Options {
@@ -41,94 +44,20 @@ impl Default for Options {
             page_height: 841.89,
             margin: 56.7,
             font_size: 11.0,
-            serif: false,
             page_numbers: true,
             base_dir: None,
             title: None,
+            fonts: Fonts::builtin(),
         }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Font {
-    Regular,
-    Bold,
-    Italic,
-    BoldItalic,
-    Mono,
-    MonoBold,
-    MonoItalic,
-    MonoBoldItalic,
-}
-
-impl Font {
-    pub const ALL: [Font; 8] = [
-        Font::Regular,
-        Font::Bold,
-        Font::Italic,
-        Font::BoldItalic,
-        Font::Mono,
-        Font::MonoBold,
-        Font::MonoItalic,
-        Font::MonoBoldItalic,
-    ];
-
-    fn for_style(s: Style) -> Font {
-        let i = (s.bold as usize) | (s.italic as usize) << 1 | (s.code as usize) << 2;
-        [
-            Font::Regular,
-            Font::Bold,
-            Font::Italic,
-            Font::BoldItalic,
-            Font::Mono,
-            Font::MonoBold,
-            Font::MonoItalic,
-            Font::MonoBoldItalic,
-        ][i]
-    }
-
-    pub fn id(self) -> usize {
-        self as usize + 1
-    }
-
-    pub fn base_name(self, serif: bool) -> &'static str {
-        match (self, serif) {
-            (Font::Regular, false) => "Helvetica",
-            (Font::Bold, false) => "Helvetica-Bold",
-            (Font::Italic, false) => "Helvetica-Oblique",
-            (Font::BoldItalic, false) => "Helvetica-BoldOblique",
-            (Font::Regular, true) => "Times-Roman",
-            (Font::Bold, true) => "Times-Bold",
-            (Font::Italic, true) => "Times-Italic",
-            (Font::BoldItalic, true) => "Times-BoldItalic",
-            (Font::Mono, _) => "Courier",
-            (Font::MonoBold, _) => "Courier-Bold",
-            (Font::MonoItalic, _) => "Courier-Oblique",
-            (Font::MonoBoldItalic, _) => "Courier-BoldOblique",
-        }
-    }
-
-    fn widths(self, serif: bool) -> Option<&'static [u16; 256]> {
-        Some(match (self, serif) {
-            (Font::Regular, false) => &metrics::HELVETICA,
-            (Font::Bold, false) => &metrics::HELVETICA_BOLD,
-            (Font::Italic, false) => &metrics::HELVETICA_OBLIQUE,
-            (Font::BoldItalic, false) => &metrics::HELVETICA_BOLD_OBLIQUE,
-            (Font::Regular, true) => &metrics::TIMES_ROMAN,
-            (Font::Bold, true) => &metrics::TIMES_BOLD,
-            (Font::Italic, true) => &metrics::TIMES_ITALIC,
-            (Font::BoldItalic, true) => &metrics::TIMES_BOLD_ITALIC,
-            _ => return None,
-        })
     }
 }
 
 /// A run of text in a single font, size, color and link.
 #[derive(Clone)]
 struct Frag {
-    font: Font,
+    face: FaceId,
     size: f32,
-    text: Vec<u8>,
+    glyphs: Vec<u16>,
     width: f32,
     color: Color,
     code: bool,
@@ -185,10 +114,14 @@ pub struct Output {
     pub anchors: HashMap<String, (usize, f32)>,
     pub title: Option<String>,
     pub warnings: Vec<String>,
+    pub fonts: Arc<Fonts>,
+    /// Glyphs used per face (index = [`FaceId`]), with the character each
+    /// glyph represents, for font subsetting and the ToUnicode map.
+    pub used: Vec<BTreeMap<u16, char>>,
 }
 
 enum MarkerKind {
-    Text(Vec<u8>),
+    Text(String),
     Check(bool),
 }
 
@@ -223,6 +156,8 @@ struct Layout<'a> {
     anchors: HashMap<String, (usize, f32)>,
     slug_counts: HashMap<String, usize>,
     warnings: Vec<String>,
+    used: RefCell<Vec<BTreeMap<u16, char>>>,
+    missing: RefCell<BTreeSet<char>>,
 }
 
 pub fn layout(doc: &Document, o: &Options) -> Output {
@@ -241,6 +176,8 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         anchors: HashMap::new(),
         slug_counts: HashMap::new(),
         warnings: Vec::new(),
+        used: RefCell::new(vec![BTreeMap::new(); o.fonts.faces.len()]),
+        missing: RefCell::new(BTreeSet::new()),
     };
     let ctx = Ctx {
         x: o.margin,
@@ -257,6 +194,21 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         .title
         .clone()
         .or_else(|| l.headings.iter().find(|h| h.level == 1).map(|h| h.title.clone()));
+    let missing = l.missing.take();
+    if !missing.is_empty() {
+        let shown: Vec<String> = missing
+            .iter()
+            .take(12)
+            .map(|c| format!("'{c}' (U+{:04X})", *c as u32))
+            .collect();
+        l.warnings.push(format!(
+            "{} character(s) have no glyph in any configured font and are shown as boxes: {}{} \
+             (add a [fallback] font that covers them to .sundowner)",
+            missing.len(),
+            shown.join(", "),
+            if missing.len() > 12 { ", ..." } else { "" }
+        ));
+    }
     Output {
         pages: l.pages,
         images: l.images,
@@ -264,6 +216,8 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         anchors: l.anchors,
         title,
         warnings: l.warnings,
+        fonts: o.fonts.clone(),
+        used: l.used.into_inner(),
     }
 }
 
@@ -293,16 +247,23 @@ fn nums(out: &mut Vec<u8>, vs: &[f32]) {
     }
 }
 
-fn pdf_text(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.push(b'(');
-    for &b in bytes {
-        if matches!(b, b'(' | b')' | b'\\') {
-            out.push(b'\\');
-        }
-        out.push(b);
+/// Append a text object drawing `glyphs` (2-byte glyph IDs, Identity-H).
+fn glyph_ops(ops: &mut Vec<u8>, face: FaceId, size: f32, x: f32, y: f32, c: Color, glyphs: &[u16]) {
+    ops.extend_from_slice(b"BT ");
+    nums(ops, &[c.0, c.1, c.2]);
+    let _ = write!(ops, "rg /F{face} ");
+    num(ops, size);
+    ops.extend_from_slice(b" Tf ");
+    nums(ops, &[x, y]);
+    ops.extend_from_slice(b"Td <");
+    for g in glyphs {
+        let _ = write!(ops, "{g:04X}");
     }
-    out.push(b')');
+    ops.extend_from_slice(b"> Tj ET\n");
 }
+
+/// Glyph runs for a piece of text: `(face, glyphs, width)`.
+type Runs = Vec<(FaceId, Vec<u16>, f32)>;
 
 pub fn slugify(s: &str) -> String {
     let mut out = String::new();
@@ -317,12 +278,74 @@ pub fn slugify(s: &str) -> String {
 }
 
 impl Layout<'_> {
-    fn text_width(&self, font: Font, bytes: &[u8], size: f32) -> f32 {
-        let units: u32 = match font.widths(self.o.serif) {
-            Some(w) => bytes.iter().map(|&b| w[b as usize] as u32).sum(),
-            None => bytes.len() as u32 * 600,
+    fn fonts(&self) -> &Fonts {
+        &self.o.fonts
+    }
+
+    /// Map text to glyphs, choosing a font per character from the fallback
+    /// chain. Consecutive glyphs from the same face form one run.
+    fn shape(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> Runs {
+        let mut runs = Vec::new();
+        for c in text.chars() {
+            self.shape_char(c, mono, bold, italic, size, &mut runs, true);
+        }
+        runs
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn shape_char(
+        &self,
+        c: char,
+        mono: bool,
+        bold: bool,
+        italic: bool,
+        size: f32,
+        runs: &mut Runs,
+        subst: bool,
+    ) {
+        if chars::is_invisible(c) {
+            return;
+        }
+        let c = if chars::is_space_like(c) { ' ' } else { c };
+        let (face, gid) = match self.fonts().resolve(c, mono, bold, italic) {
+            Some(found) => found,
+            None => {
+                if let Some(s) = chars::substitute(c).filter(|_| subst) {
+                    for sc in s.chars() {
+                        self.shape_char(sc, mono, bold, italic, size, runs, false);
+                    }
+                    return;
+                }
+                if c != ' ' {
+                    self.missing.borrow_mut().insert(c);
+                }
+                (self.fonts().primary(mono, bold, italic), 0)
+            }
         };
-        units as f32 * size / 1000.0
+        self.used.borrow_mut()[face].entry(gid).or_insert(c);
+        let w = self.fonts().width(face, gid, size);
+        match runs.last_mut() {
+            Some((f, g, width)) if *f == face => {
+                g.push(gid);
+                *width += w;
+            }
+            _ => runs.push((face, vec![gid], w)),
+        }
+    }
+
+    fn measure(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> f32 {
+        self.shape(text, mono, bold, italic, size)
+            .iter()
+            .map(|r| r.2)
+            .sum()
+    }
+
+    fn show_runs(&mut self, runs: &Runs, size: f32, x: f32, y: f32, c: Color) {
+        let mut x = x;
+        for (face, glyphs, w) in runs {
+            glyph_ops(&mut self.page().ops, *face, size, x, y, c, glyphs);
+            x += w;
+        }
     }
 
     fn top(&self) -> f32 {
@@ -384,81 +407,87 @@ impl Layout<'_> {
         ops.extend_from_slice(b"l S\n");
     }
 
-    fn show_text(&mut self, font: Font, size: f32, x: f32, y: f32, c: Color, text: &[u8]) {
-        let ops = &mut self.page().ops;
-        ops.extend_from_slice(b"BT ");
-        nums(ops, &[c.0, c.1, c.2]);
-        let _ = write!(ops, "rg /F{} ", font.id());
-        num(ops, size);
-        ops.extend_from_slice(b" Tf ");
-        nums(ops, &[x, y]);
-        ops.extend_from_slice(b"Td ");
-        pdf_text(ops, text);
-        ops.extend_from_slice(b" Tj ET\n");
-    }
-
     // ------------------------------------------------------------ inline text
 
     fn tokenize(&self, inlines: &[Inline], size: f32, color: Color, force_bold: bool) -> Vec<Tok> {
         let mut toks = Vec::new();
         let mut word: Vec<Frag> = Vec::new();
+        let end_word = |word: &mut Vec<Frag>, toks: &mut Vec<Tok>| {
+            if !word.is_empty() {
+                toks.push(Tok::Word(std::mem::take(word)));
+            }
+        };
         for item in inlines {
             match item {
                 Inline::Text { text, style, link } => {
                     let mut style = *style;
                     style.bold |= force_bold;
-                    let font = Font::for_style(style);
-                    let fsize = if style.code { size * 0.9 } else { size };
+                    let (mono, bold, italic) = (style.code, style.bold, style.italic);
+                    let fsize = if mono { size * 0.9 } else { size };
                     let fcolor = if link.is_some() { LINK } else { color };
                     let link: Option<Rc<str>> = link.as_deref().map(Rc::from);
-                    let space = self.text_width(font, b" ", fsize);
-                    let bytes = encoding::encode(text);
-                    for (k, part) in bytes.split(|&b| b == b' ').enumerate() {
-                        if k > 0 {
-                            if !word.is_empty() {
-                                toks.push(Tok::Word(std::mem::take(&mut word)));
+                    let space = match self.measure(" ", mono, bold, italic, fsize) {
+                        w if w > 0.0 => w,
+                        _ => fsize * 0.25,
+                    };
+                    let mut seg = String::new();
+                    let flush = |seg: &mut String, word: &mut Vec<Frag>| {
+                        if seg.is_empty() {
+                            return;
+                        }
+                        for (face, glyphs, w) in self.shape(seg, mono, bold, italic, fsize) {
+                            match word.last_mut() {
+                                Some(f)
+                                    if f.face == face
+                                        && f.size == fsize
+                                        && f.code == mono
+                                        && f.strike == style.strike
+                                        && f.link == link
+                                        && f.color == fcolor =>
+                                {
+                                    f.glyphs.extend_from_slice(&glyphs);
+                                    f.width += w;
+                                }
+                                _ => word.push(Frag {
+                                    face,
+                                    size: fsize,
+                                    glyphs,
+                                    width: w,
+                                    color: fcolor,
+                                    code: mono,
+                                    strike: style.strike,
+                                    link: link.clone(),
+                                }),
                             }
-                            if style.code || !matches!(toks.last(), Some(Tok::Space(_))) {
+                        }
+                        seg.clear();
+                    };
+                    for c in text.chars() {
+                        if c == ' ' || chars::is_space_like(c) {
+                            flush(&mut seg, &mut word);
+                            end_word(&mut word, &mut toks);
+                            if mono || !matches!(toks.last(), Some(Tok::Space(_))) {
                                 toks.push(Tok::Space(space));
                             }
-                        }
-                        if part.is_empty() {
-                            continue;
-                        }
-                        let w = self.text_width(font, part, fsize);
-                        match word.last_mut() {
-                            Some(f)
-                                if f.font == font
-                                    && f.code == style.code
-                                    && f.strike == style.strike
-                                    && f.link == link =>
-                            {
-                                f.text.extend_from_slice(part);
-                                f.width += w;
-                            }
-                            _ => word.push(Frag {
-                                font,
-                                size: fsize,
-                                text: part.to_vec(),
-                                width: w,
-                                color: fcolor,
-                                code: style.code,
-                                strike: style.strike,
-                                link: link.clone(),
-                            }),
+                        } else if chars::breaks_anywhere(c) {
+                            // A line may break before and after this character.
+                            flush(&mut seg, &mut word);
+                            end_word(&mut word, &mut toks);
+                            seg.push(c);
+                            flush(&mut seg, &mut word);
+                            end_word(&mut word, &mut toks);
+                        } else {
+                            seg.push(c);
                         }
                     }
+                    flush(&mut seg, &mut word);
                 }
                 Inline::Break => {
-                    if !word.is_empty() {
-                        toks.push(Tok::Word(std::mem::take(&mut word)));
-                    }
+                    end_word(&mut word, &mut toks);
                     toks.push(Tok::Break);
                 }
                 Inline::Image { alt, src } => {
-                    if !word.is_empty() {
-                        toks.push(Tok::Word(std::mem::take(&mut word)));
-                    }
+                    end_word(&mut word, &mut toks);
                     toks.push(Tok::Image {
                         alt: alt.clone(),
                         src: src.clone(),
@@ -466,9 +495,7 @@ impl Layout<'_> {
                 }
             }
         }
-        if !word.is_empty() {
-            toks.push(Tok::Word(word));
-        }
+        end_word(&mut word, &mut toks);
         toks
     }
 
@@ -533,12 +560,12 @@ impl Layout<'_> {
                             let mut start = 0;
                             let mut x = line.width;
                             let mut acc = 0.0;
-                            for (k, &b) in f.text.iter().enumerate() {
-                                let cw = self.text_width(f.font, &[b], f.size);
+                            for (k, &g) in f.glyphs.iter().enumerate() {
+                                let cw = self.fonts().width(f.face, g, f.size);
                                 if x + acc + cw > max_w && (x + acc) > 0.0 {
                                     if k > start {
                                         let piece = Frag {
-                                            text: f.text[start..k].to_vec(),
+                                            glyphs: f.glyphs[start..k].to_vec(),
                                             width: acc,
                                             ..f.clone()
                                         };
@@ -557,9 +584,9 @@ impl Layout<'_> {
                                 }
                                 acc += cw;
                             }
-                            if start < f.text.len() {
+                            if start < f.glyphs.len() {
                                 let piece = Frag {
-                                    text: f.text[start..].to_vec(),
+                                    glyphs: f.glyphs[start..].to_vec(),
                                     width: acc,
                                     ..f
                                 };
@@ -609,7 +636,15 @@ impl Layout<'_> {
         }
         for (fx, f) in &line.frags {
             let fx = x + fx;
-            self.show_text(f.font, f.size, fx, baseline, f.color, &f.text);
+            glyph_ops(
+                &mut self.page().ops,
+                f.face,
+                f.size,
+                fx,
+                baseline,
+                f.color,
+                &f.glyphs,
+            );
             if f.strike {
                 let sy = baseline + f.size * 0.3;
                 self.stroke_line(fx, sy, fx + f.width, sy, f.size * 0.06, f.color);
@@ -646,8 +681,9 @@ impl Layout<'_> {
         let Some(m) = self.marker.take() else { return };
         match m.kind {
             MarkerKind::Text(t) => {
-                let w = self.text_width(Font::Regular, &t, m.size);
-                self.show_text(Font::Regular, m.size, m.right - w, baseline, m.color, &t);
+                let runs = self.shape(&t, false, false, false, m.size);
+                let w: f32 = runs.iter().map(|r| r.2).sum();
+                self.show_runs(&runs, m.size, m.right - w, baseline, m.color);
             }
             MarkerKind::Check(checked) => {
                 let s = m.size * 0.72;
@@ -866,8 +902,7 @@ impl Layout<'_> {
         let size = fs * 0.85;
         let lh = size * 1.35;
         let pad = fs * 0.6;
-        let char_w = size * 0.6;
-        let max_chars = (((ctx.w - 2.0 * pad) / char_w).floor() as usize).max(1);
+        let avail = (ctx.w - 2.0 * pad).max(size);
 
         self.ensure(pad + lh);
         let top_y = self.y;
@@ -877,12 +912,27 @@ impl Layout<'_> {
         let empty: [String; 1] = [String::new()];
         let lines = if lines.is_empty() { &empty[..] } else { lines };
         for line in lines {
-            let bytes = encoding::encode(line);
-            let chunks: Vec<&[u8]> = if bytes.is_empty() {
-                vec![&[][..]]
-            } else {
-                bytes.chunks(max_chars).collect()
-            };
+            // Wrap long lines at the glyph that would overflow the box.
+            let mut chunks: Vec<Runs> = vec![Vec::new()];
+            let mut x = 0.0;
+            for (face, glyphs, _) in self.shape(line, true, false, false, size) {
+                for g in glyphs {
+                    let w = self.fonts().width(face, g, size);
+                    if x + w > avail && x > 0.0 {
+                        chunks.push(Vec::new());
+                        x = 0.0;
+                    }
+                    let chunk = chunks.last_mut().expect("chunks is never empty");
+                    match chunk.last_mut() {
+                        Some((f, gs, cw)) if *f == face => {
+                            gs.push(g);
+                            *cw += w;
+                        }
+                        _ => chunk.push((face, vec![g], w)),
+                    }
+                    x += w;
+                }
+            }
             for chunk in chunks {
                 if self.y - lh < self.bottom() {
                     self.new_page();
@@ -890,9 +940,7 @@ impl Layout<'_> {
                 self.at_top = false;
                 self.fill_rect(ctx.x, self.y - lh, ctx.w, lh + 0.3, CODE_BG);
                 let baseline = self.y - lh / 2.0 - size * 0.26;
-                if !chunk.is_empty() {
-                    self.show_text(Font::Mono, size, ctx.x + pad, baseline, ctx.color, chunk);
-                }
+                self.show_runs(&chunk, size, ctx.x + pad, baseline, ctx.color);
                 self.y -= lh;
             }
         }
@@ -936,16 +984,15 @@ impl Layout<'_> {
         let fs = self.o.font_size;
         let last = start.saturating_add(items.len() as u64);
         let indent = if ordered {
-            let widest = format!("{last}.");
-            self.text_width(Font::Regular, widest.as_bytes(), fs) + fs * 0.6
+            self.measure(&format!("{last}."), false, false, false, fs) + fs * 0.6
         } else {
             fs * 1.5
         }
         .max(fs * 1.5);
-        let bullet: &[u8] = match ctx.list_depth % 3 {
-            0 => &[0x95],
-            1 => &[0x96],
-            _ => &[0xB7],
+        let bullet = match ctx.list_depth % 3 {
+            0 => "\u{2022}",
+            1 => "\u{2013}",
+            _ => "\u{00B7}",
         };
         let child = Ctx {
             x: ctx.x + indent,
@@ -957,10 +1004,8 @@ impl Layout<'_> {
         for (k, item) in items.iter().enumerate() {
             let kind = match item.task {
                 Some(c) => MarkerKind::Check(c),
-                None if ordered => {
-                    MarkerKind::Text(format!("{}.", start.saturating_add(k as u64)).into_bytes())
-                }
-                None => MarkerKind::Text(bullet.to_vec()),
+                None if ordered => MarkerKind::Text(format!("{}.", start.saturating_add(k as u64))),
+                None => MarkerKind::Text(bullet.to_string()),
             };
             self.marker = Some(Marker {
                 kind,
@@ -1102,20 +1147,13 @@ impl Layout<'_> {
         let size = (self.o.font_size * 0.8).max(6.0);
         let y = (self.o.margin * 0.5 - size * 0.3).max(size * 0.5);
         for i in 0..total {
-            let label = format!("{}", i + 1);
-            let w = self.text_width(Font::Regular, label.as_bytes(), size);
-            let x = (self.o.page_width - w) / 2.0;
-            let mut ops = std::mem::take(&mut self.pages[i].ops);
-            ops.extend_from_slice(b"BT ");
-            nums(&mut ops, &[MUTED.0, MUTED.1, MUTED.2]);
-            let _ = write!(ops, "rg /F{} ", Font::Regular.id());
-            num(&mut ops, size);
-            ops.extend_from_slice(b" Tf ");
-            nums(&mut ops, &[x, y]);
-            ops.extend_from_slice(b"Td ");
-            pdf_text(&mut ops, label.as_bytes());
-            ops.extend_from_slice(b" Tj ET\n");
-            self.pages[i].ops = ops;
+            let runs = self.shape(&(i + 1).to_string(), false, false, false, size);
+            let w: f32 = runs.iter().map(|r| r.2).sum();
+            let mut x = (self.o.page_width - w) / 2.0;
+            for (face, glyphs, gw) in &runs {
+                glyph_ops(&mut self.pages[i].ops, *face, size, x, y, MUTED, glyphs);
+                x += gw;
+            }
         }
     }
 }

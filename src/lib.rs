@@ -1,14 +1,16 @@
 //! sundowner: a dependency-free Markdown to PDF converter.
 #![forbid(unsafe_code)]
 
-pub mod encoding;
+pub mod chars;
+pub mod config;
 pub mod flate;
+pub mod fonts;
 pub mod image;
 pub mod inline;
 pub mod layout;
 pub mod markdown;
-mod metrics;
 pub mod pdf;
+pub mod ttf;
 
 pub use layout::Options;
 
@@ -23,7 +25,7 @@ pub struct Converted {
 pub fn convert(markdown: &str, options: &Options) -> Converted {
     let doc = markdown::parse(markdown);
     let out = layout::layout(&doc, options);
-    let pdf = pdf::write(&out, options.page_width, options.page_height, options.serif);
+    let pdf = pdf::write(&out, options.page_width, options.page_height);
     Converted {
         pdf,
         warnings: out.warnings,

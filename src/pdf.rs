@@ -1,7 +1,9 @@
 //! PDF 1.4 file serialization.
 
 use crate::flate;
-use crate::layout::{Font, Output, Target};
+use crate::layout::{Output, Target};
+use crate::ttf::Face;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
 struct Writer {
@@ -76,7 +78,7 @@ fn n(v: f32) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-pub fn write(doc: &Output, page_w: f32, page_h: f32, serif: bool) -> Vec<u8> {
+pub fn write(doc: &Output, page_w: f32, page_h: f32) -> Vec<u8> {
     let mut w = Writer {
         out: Vec::new(),
         offsets: vec![0],
@@ -87,7 +89,15 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32, serif: bool) -> Vec<u8> {
     let pages_id = w.alloc();
     let info = w.alloc();
     let resources = w.alloc();
-    let fonts: Vec<usize> = Font::ALL.iter().map(|_| w.alloc()).collect();
+    // Five objects per embedded face: Type0 font, CIDFont, descriptor,
+    // font file and ToUnicode map.
+    let fonts: Vec<(usize, [usize; 5])> = doc
+        .used
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| !u.is_empty())
+        .map(|(face, _)| (face, [w.alloc(), w.alloc(), w.alloc(), w.alloc(), w.alloc()]))
+        .collect();
     let images: Vec<(usize, Option<usize>)> = doc
         .images
         .iter()
@@ -102,19 +112,12 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32, serif: bool) -> Vec<u8> {
     let outline_ids: Vec<usize> = doc.headings.iter().map(|_| w.alloc()).collect();
 
     // Fonts and resources.
-    for (font, &id) in Font::ALL.iter().zip(&fonts) {
-        let enc = "/Encoding /WinAnsiEncoding";
-        w.obj(
-            id,
-            &format!(
-                "<< /Type /Font /Subtype /Type1 /BaseFont /{} {enc} >>",
-                font.base_name(serif)
-            ),
-        );
+    for &(face, ids) in &fonts {
+        write_font(&mut w, &doc.fonts.faces[face], &doc.used[face], ids);
     }
     let mut res = String::from("<< /ProcSet [/PDF /Text /ImageB /ImageC /ImageI] /Font <<");
-    for (font, id) in Font::ALL.iter().zip(&fonts) {
-        res.push_str(&format!(" /F{} {id} 0 R", font.id()));
+    for (face, ids) in &fonts {
+        res.push_str(&format!(" /F{face} {} 0 R", ids[0]));
     }
     res.push_str(" >>");
     if !images.is_empty() {
@@ -306,6 +309,122 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32, serif: bool) -> Vec<u8> {
         "trailer\n<< /Size {size} /Root {catalog} 0 R /Info {info} 0 R >>\nstartxref\n{xref}\n%%EOF\n"
     );
     w.out
+}
+
+/// Embed one face as a subset Type0/CIDFontType2 font with Identity-H
+/// encoding: content streams address glyphs by their 2-byte glyph ID.
+fn write_font(w: &mut Writer, face: &Face, used: &BTreeMap<u16, char>, ids: [usize; 5]) {
+    let [type0, cid, desc, file, tounicode] = ids;
+    let gids: BTreeSet<u16> = used.keys().copied().collect();
+
+    // Subset fonts are named with a tag derived from their contents, so the
+    // same input always produces the same output.
+    let name = if face.no_subset {
+        face.postscript_name.clone()
+    } else {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in face
+            .postscript_name
+            .bytes()
+            .chain(gids.iter().flat_map(|g| g.to_be_bytes()))
+        {
+            h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+        let tag: String = (0..6)
+            .map(|i| (b'A' + ((h >> (i * 8)) % 26) as u8) as char)
+            .collect();
+        format!("{tag}+{}", face.postscript_name)
+    };
+
+    let mut widths = String::new();
+    let mut run: Vec<u16> = Vec::new();
+    let flush = |run: &mut Vec<u16>, widths: &mut String| {
+        if let Some(&first) = run.first() {
+            let ws: Vec<String> = run.iter().map(|&g| n(face.advance_1000(g))).collect();
+            widths.push_str(&format!("{first} [{}] ", ws.join(" ")));
+        }
+        run.clear();
+    };
+    for &g in &gids {
+        if run.last().is_some_and(|&l| l + 1 != g) {
+            flush(&mut run, &mut widths);
+        }
+        run.push(g);
+    }
+    flush(&mut run, &mut widths);
+
+    let mut flags = 4; // symbolic: glyphs are addressed by ID, not a standard encoding
+    if face.fixed_pitch {
+        flags |= 1;
+    }
+    if face.italic {
+        flags |= 64;
+    }
+    let b = face.bbox;
+    w.obj(
+        type0,
+        &format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /{name} /Encoding /Identity-H \
+             /DescendantFonts [{cid} 0 R] /ToUnicode {tounicode} 0 R >>"
+        ),
+    );
+    w.obj(
+        cid,
+        &format!(
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /{name} \
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+             /FontDescriptor {desc} 0 R /CIDToGIDMap /Identity /DW 1000 /W [{widths}] >>"
+        ),
+    );
+    w.obj(
+        desc,
+        &format!(
+            "<< /Type /FontDescriptor /FontName /{name} /Flags {flags} /FontBBox [{} {} {} {}] \
+             /ItalicAngle {} /Ascent {} /Descent {} /CapHeight {} /StemV 80 /FontFile2 {file} 0 R >>",
+            n(face.scale_1000(b[0])),
+            n(face.scale_1000(b[1])),
+            n(face.scale_1000(b[2])),
+            n(face.scale_1000(b[3])),
+            n(face.italic_angle),
+            n(face.scale_1000(face.ascent)),
+            n(face.scale_1000(face.descent)),
+            n(face.scale_1000(face.cap_height)),
+        ),
+    );
+    let font_data = face.subset(&gids);
+    let compressed = flate::zlib_compress(&font_data);
+    w.stream(
+        file,
+        &format!("/Filter /FlateDecode /Length1 {}", font_data.len()),
+        &compressed,
+    );
+
+    let mut cmap = String::from(
+        "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+         /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+         /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+         1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
+    );
+    let entries: Vec<(&u16, &char)> = used.iter().filter(|(&g, _)| g != 0).collect();
+    for chunk in entries.chunks(100) {
+        cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
+        for (g, c) in chunk {
+            let mut buf = [0u16; 2];
+            let hex: String = c
+                .encode_utf16(&mut buf)
+                .iter()
+                .map(|u| format!("{u:04X}"))
+                .collect();
+            cmap.push_str(&format!("<{g:04X}> <{hex}>\n"));
+        }
+        cmap.push_str("endbfchar\n");
+    }
+    cmap.push_str("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+    w.stream(
+        tounicode,
+        "/Filter /FlateDecode",
+        &flate::zlib_compress(cmap.as_bytes()),
+    );
 }
 
 #[cfg(test)]

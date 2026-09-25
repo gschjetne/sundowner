@@ -57,3 +57,10 @@ Some text with a footnote-like [reference link][ref] and a missing image
 ![nothing](missing.png).
 
 [ref]: https://commonmark.org "CommonMark"
+
+## Unicode
+
+Greek: Καλημέρα κόσμε. Cyrillic: Съешь же ещё этих мягких французских булок.
+Latin Extended: Łódź, Ștefan, Øresund, Ærøskøbing, İstanbul.
+Typography: “quotes”, ‘single’, en–dash, em—dash, ellipsis…, €100, № 5, ½ ¾.
+Not covered by the bundled fonts: 日本語 and 🎉.
