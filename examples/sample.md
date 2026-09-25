@@ -64,3 +64,12 @@ Greek: Καλημέρα κόσμε. Cyrillic: Съешь же ещё этих м
 Latin Extended: Łódź, Ștefan, Øresund, Ærøskøbing, İstanbul.
 Typography: “quotes”, ‘single’, en–dash, em—dash, ellipsis…, €100, № 5, ½ ¾.
 Not covered by the bundled fonts: 日本語 and 🎉.
+
+Code in every script and style: `Latin`, `Ελληνικά`, `Кириллица`,
+*`κώδικας`*, **`код`** and ***`Łódź`***.
+
+```python
+# Ελληνικά και кириллица σε κώδικα
+def καλημέρα(имя: str) -> str:
+    return f"Καλημέρα, {имя}! Zażółć gęślą jaźń."
+```

@@ -60,7 +60,7 @@ pub struct Bundled {
     pub data: &'static [u8],
 }
 
-pub const BUNDLED: [Bundled; 6] = [
+pub const BUNDLED: [Bundled; 8] = [
     Bundled {
         file: "Alegreya-Regular.ttf",
         data: include_bytes!("../fonts/Alegreya-Regular.ttf"),
@@ -78,12 +78,20 @@ pub const BUNDLED: [Bundled; 6] = [
         data: include_bytes!("../fonts/Alegreya-BoldItalic.ttf"),
     },
     Bundled {
-        file: "IBMPlexMono-Regular.ttf",
-        data: include_bytes!("../fonts/IBMPlexMono-Regular.ttf"),
+        file: "RobotoMono-Regular.ttf",
+        data: include_bytes!("../fonts/RobotoMono-Regular.ttf"),
     },
     Bundled {
-        file: "IBMPlexMono-Bold.ttf",
-        data: include_bytes!("../fonts/IBMPlexMono-Bold.ttf"),
+        file: "RobotoMono-Bold.ttf",
+        data: include_bytes!("../fonts/RobotoMono-Bold.ttf"),
+    },
+    Bundled {
+        file: "RobotoMono-Italic.ttf",
+        data: include_bytes!("../fonts/RobotoMono-Italic.ttf"),
+    },
+    Bundled {
+        file: "RobotoMono-BoldItalic.ttf",
+        data: include_bytes!("../fonts/RobotoMono-BoldItalic.ttf"),
     },
 ];
 
@@ -92,12 +100,13 @@ pub const BUNDLED: [Bundled; 6] = [
 pub const FONT_LICENSES: [(&str, &str); 2] = [
     (
         "Alegreya (Regular, Bold, Italic, Bold Italic; static instances generated from the variable \
-         font, see fonts/build.py)",
+         fonts, see fonts/build.py)",
         include_str!("../fonts/OFL-Alegreya.txt"),
     ),
     (
-        "IBM Plex Mono (Regular, Bold; unmodified)",
-        include_str!("../fonts/OFL-IBMPlexMono.txt"),
+        "Roboto Mono (Regular, Bold, Italic, Bold Italic; static instances generated from the \
+         variable fonts, see fonts/build.py)",
+        include_str!("../fonts/OFL-RobotoMono.txt"),
     ),
 ];
 
@@ -123,7 +132,7 @@ pub struct FontSpec {
 const MAX_FONT_FILE: u64 = 512 << 20;
 
 impl Fonts {
-    /// The bundled fonts only: Alegreya for text, IBM Plex Mono for code.
+    /// The bundled fonts only: Alegreya for text, Roboto Mono for code.
     pub fn builtin() -> Arc<Fonts> {
         static BUILTIN: OnceLock<Arc<Fonts>> = OnceLock::new();
         BUILTIN
@@ -134,7 +143,7 @@ impl Fonts {
     /// Load the configured fonts. The chains are:
     ///
     /// - body: body family (default Alegreya), fallbacks, bundled families
-    /// - code: code family (default IBM Plex Mono), fallbacks, body family,
+    /// - code: code family (default Roboto Mono), fallbacks, body family,
     ///   bundled families
     ///
     /// The bundled fonts are always the final fallback.
@@ -156,8 +165,8 @@ impl Fonts {
         let mono = Family {
             regular: bundled(4, &mut faces)?,
             bold: Some(bundled(5, &mut faces)?),
-            italic: None,
-            bold_italic: None,
+            italic: Some(bundled(6, &mut faces)?),
+            bold_italic: Some(bundled(7, &mut faces)?),
         };
 
         let mut warnings = Vec::new();
@@ -269,10 +278,9 @@ mod tests {
         let (face, _) = f.resolve('a', false, false, false).unwrap();
         assert!(f.faces[face].postscript_name.contains("Alegreya"));
         let (face, _) = f.resolve('a', true, false, false).unwrap();
-        assert!(f.faces[face].postscript_name.contains("Plex"));
-        // Italic code has no italic face: the upright face is used, never a fake.
+        assert!(f.faces[face].postscript_name.contains("RobotoMono"));
         let (face, _) = f.resolve('a', true, false, true).unwrap();
-        assert!(!f.faces[face].italic);
+        assert!(f.faces[face].italic && f.faces[face].postscript_name.contains("RobotoMono"));
         let (face, _) = f.resolve('a', false, true, true).unwrap();
         assert!(f.faces[face].italic);
         assert!(f.resolve('中', false, false, false).is_none());
@@ -299,7 +307,7 @@ mod tests {
             ..Default::default()
         };
         let f = Fonts::load(&spec).unwrap();
-        assert_eq!(f.faces.len(), 7);
+        assert_eq!(f.faces.len(), 9);
         assert_eq!(
             f.resolve('x', false, false, false).unwrap().0,
             0,
@@ -308,16 +316,16 @@ mod tests {
         assert_eq!(
             f.resolve('x', true, false, false).unwrap().0,
             4,
-            "bundled IBM Plex Mono"
+            "bundled Roboto Mono"
         );
-        assert_eq!(f.body[1].regular, 6, "the fallback is next in line");
+        assert_eq!(f.body[1].regular, 8, "the fallback is next in line");
     }
 
     #[test]
     fn user_body_family_replaces_alegreya() {
         let spec = FontSpec {
             body: Some(FamilySpec {
-                regular: bundled_path("IBMPlexMono-Regular.ttf"),
+                regular: bundled_path("RobotoMono-Regular.ttf"),
                 ..Default::default()
             }),
             ..Default::default()
@@ -325,7 +333,7 @@ mod tests {
         let f = Fonts::load(&spec).unwrap();
         let (face, _) = f.resolve('x', false, true, true).unwrap();
         assert_eq!(
-            face, 6,
+            face, 8,
             "no bold italic in the user family: its regular face, never a fake"
         );
         assert_eq!(
@@ -333,6 +341,28 @@ mod tests {
             4,
             "bundled fonts remain the last fallback"
         );
+    }
+
+    /// Every bundled face must cover Latin (Basic, Latin-1 and Extended-A),
+    /// modern Greek and Cyrillic, so no style or code falls back to boxes.
+    #[test]
+    fn bundled_fonts_cover_latin_greek_cyrillic() {
+        let f = Fonts::builtin();
+        let latin = (0x20..=0x7E)
+            .chain(0xA0..=0x17F)
+            .filter(|&c| c != 0xAD && c != 0x149);
+        let greek = (0x384..=0x3CE).filter(|c| ![0x38B, 0x38D, 0x3A2].contains(c));
+        let cyrillic = 0x400..=0x45F;
+        let wanted: Vec<char> = latin
+            .chain(greek)
+            .chain(cyrillic)
+            .filter_map(char::from_u32)
+            .collect();
+        assert_eq!(f.faces.len(), BUNDLED.len());
+        for (face, b) in f.faces.iter().zip(&BUNDLED) {
+            let missing: String = wanted.iter().filter(|&&c| face.glyph(c).is_none()).collect();
+            assert!(missing.is_empty(), "{} lacks {missing:?}", b.file);
+        }
     }
 
     #[test]
