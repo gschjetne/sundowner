@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Regenerate the fonts bundled into the sundowner binary.
 
-Sources are pinned to a google/fonts commit. Alegreya is published only as
-variable fonts, so static Regular (wght=400) and Bold (wght=700) instances are
-generated with fontTools. Alegreya's OFL declares no Reserved Font Name, so
-these Modified Versions may keep the name; they remain under the OFL (see
-OFL-Alegreya.txt). IBM Plex Mono reserves the name "Plex", so its files are
-shipped byte-for-byte unmodified.
+Sources are pinned to a google/fonts commit. Alegreya and Roboto Mono are
+published only as variable fonts, so static Regular (wght=400) and Bold
+(wght=700) instances of the upright and italic fonts are generated with
+fontTools. Neither font's OFL declares a Reserved Font Name, so these
+Modified Versions may keep their names; they remain under the OFL (see
+OFL-Alegreya.txt and OFL-RobotoMono.txt).
 
 Usage: pip install fonttools==4.66.0 && python3 fonts/build.py
 """
@@ -29,8 +29,10 @@ def fetch(path):
 
 
 def instance(src, weight, dest):
-    font = TTFont(io.BytesIO(fetch(src)))
+    # Keep the source timestamp so rebuilding gives identical files.
+    font = TTFont(io.BytesIO(fetch(src)), recalcTimestamp=False)
     static = instancer.instantiateVariableFont(font, {"wght": weight}, updateFontNames=True)
+    static.recalcTimestamp = False
     static.save(OUT / dest)
 
 
@@ -40,9 +42,11 @@ instance("alegreya/Alegreya-Italic%5Bwght%5D.ttf", 400, "Alegreya-Italic.ttf")
 instance("alegreya/Alegreya-Italic%5Bwght%5D.ttf", 700, "Alegreya-BoldItalic.ttf")
 (OUT / "OFL-Alegreya.txt").write_bytes(fetch("alegreya/OFL.txt"))
 
-for name in ["IBMPlexMono-Regular.ttf", "IBMPlexMono-Bold.ttf"]:
-    (OUT / name).write_bytes(fetch(f"ibmplexmono/{name}"))
-(OUT / "OFL-IBMPlexMono.txt").write_bytes(fetch("ibmplexmono/OFL.txt"))
+instance("robotomono/RobotoMono%5Bwght%5D.ttf", 400, "RobotoMono-Regular.ttf")
+instance("robotomono/RobotoMono%5Bwght%5D.ttf", 700, "RobotoMono-Bold.ttf")
+instance("robotomono/RobotoMono-Italic%5Bwght%5D.ttf", 400, "RobotoMono-Italic.ttf")
+instance("robotomono/RobotoMono-Italic%5Bwght%5D.ttf", 700, "RobotoMono-BoldItalic.ttf")
+(OUT / "OFL-RobotoMono.txt").write_bytes(fetch("robotomono/OFL.txt"))
 
 for f in sorted(OUT.glob("*.ttf")):
     print(hashlib.sha256(f.read_bytes()).hexdigest(), f.name)
