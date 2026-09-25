@@ -1,16 +1,17 @@
 //! Golden layout tests: check what text is drawn, in which font, where, and
 //! which links and bookmarks are produced for small known documents.
 
+use sundowner::fonts::Fonts;
 use sundowner::layout::{self, Options, Output, Target};
 use sundowner::markdown;
 
-/// One `show_text` call: font number, position and decoded (WinAnsi) text.
+/// One text-showing operation: face, position and the text it draws.
 #[derive(Debug)]
 struct Run {
-    font: usize,
+    face: usize,
     x: f32,
     y: f32,
-    text: Vec<u8>,
+    text: String,
 }
 
 fn render(src: &str) -> Output {
@@ -24,34 +25,36 @@ fn render(src: &str) -> Output {
     )
 }
 
-/// Parse the `BT r g b rg /Fn size Tf x y Td (text) Tj ET` runs of a page.
+/// Parse the `BT r g b rg /Fn size Tf x y Td <glyphs> Tj ET` runs of a page,
+/// mapping glyph IDs back to characters.
 fn runs(out: &Output, page: usize) -> Vec<Run> {
     let ops = &out.pages[page].ops;
     let mut result = Vec::new();
     let mut i = 0;
     while let Some(p) = find(ops, i, b"BT ") {
         let end = find(ops, p, b" Tj ET\n").expect("unterminated text object");
-        let obj = &ops[p..end];
-        let f = find(obj, 0, b"/F").unwrap() + 2;
-        let tokens: Vec<&[u8]> = obj[f..].splitn(6, |&b| b == b' ').collect();
-        let num = |t: &[u8]| std::str::from_utf8(t).unwrap().parse::<f32>().unwrap();
-        let font = num(tokens[0]) as usize;
-        let (x, y) = (num(tokens[3]), num(tokens[4]));
-        let lit = &obj[find(obj, 0, b"(").unwrap() + 1..obj.len() - 1];
-        let mut text = Vec::new();
-        let mut k = 0;
-        while k < lit.len() {
-            if lit[k] == b'\\' {
-                k += 1;
-            }
-            text.push(lit[k]);
-            k += 1;
-        }
-        result.push(Run { font, x, y, text });
+        let obj = std::str::from_utf8(&ops[p..end]).unwrap();
+        let f = obj.find("/F").unwrap() + 2;
+        let tokens: Vec<&str> = obj[f..].split(' ').collect();
+        let face: usize = tokens[0].parse().unwrap();
+        let (x, y) = (tokens[3].parse().unwrap(), tokens[4].parse().unwrap());
+        let hex = &obj[obj.find('<').unwrap() + 1..obj.find('>').unwrap()];
+        let text = (0..hex.len() / 4)
+            .map(|k| u16::from_str_radix(&hex[4 * k..4 * k + 4], 16).unwrap())
+            .map(|g| out.used[face].get(&g).copied().unwrap_or('\u{FFFD}'))
+            .collect();
+        result.push(Run { face, x, y, text });
         i = end;
     }
     result
 }
+
+/// Face IDs of the bundled fonts, in load order.
+const REGULAR: usize = 0;
+const BOLD: usize = 1;
+const ITALIC: usize = 2;
+const BOLD_ITALIC: usize = 3;
+const MONO: usize = 4;
 
 fn find(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
     hay.get(from..)?
@@ -62,7 +65,7 @@ fn find(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 
 fn run<'a>(runs: &'a [Run], text: &str) -> &'a Run {
     runs.iter()
-        .find(|r| r.text == text.as_bytes())
+        .find(|r| r.text == text)
         .unwrap_or_else(|| panic!("no run {text:?} in {runs:?}"))
 }
 
@@ -76,9 +79,9 @@ fn headings_make_outline_and_anchors() {
     }
     assert_eq!(out.title.as_deref(), Some("Alpha"));
     let r = runs(&out, 0);
-    // Headings are bold (F2), body text regular (F1), and flow downwards.
-    assert_eq!(run(&r, "Alpha").font, 2);
-    assert_eq!(run(&r, "text").font, 1);
+    // Headings are bold, body text regular, and they flow downwards.
+    assert_eq!(run(&r, "Alpha").face, BOLD);
+    assert_eq!(run(&r, "text").face, REGULAR);
     assert!(run(&r, "Alpha").y > run(&r, "text").y);
     assert!(run(&r, "text").y > run(&r, "Gamma").y);
 }
@@ -86,11 +89,11 @@ fn headings_make_outline_and_anchors() {
 #[test]
 fn inline_styles_use_the_right_fonts() {
     let r = runs(&render("plain **bold** *italic* ***both*** `code`"), 0);
-    assert_eq!(run(&r, "plain").font, 1);
-    assert_eq!(run(&r, "bold").font, 2);
-    assert_eq!(run(&r, "italic").font, 3);
-    assert_eq!(run(&r, "both").font, 4);
-    assert_eq!(run(&r, "code").font, 5);
+    assert_eq!(run(&r, "plain").face, REGULAR);
+    assert_eq!(run(&r, "bold").face, BOLD);
+    assert_eq!(run(&r, "italic").face, ITALIC);
+    assert_eq!(run(&r, "both").face, BOLD_ITALIC);
+    assert_eq!(run(&r, "code").face, MONO);
     // Words on one line share a baseline and advance left to right.
     assert_eq!(run(&r, "plain").y, run(&r, "code").y);
     assert!(run(&r, "plain").x < run(&r, "bold").x && run(&r, "bold").x < run(&r, "code").x);
@@ -103,10 +106,10 @@ fn nested_lists_are_indented_with_markers() {
     assert!(one.x < two.x && two.x < three.x);
     assert_eq!(one.x, four.x);
     assert!(one.y > two.y && two.y > three.y && three.y > four.y);
-    // Bullet (0x95) for level one, en dash for level two, "1." for the ordered list.
-    let bullet = r.iter().find(|x| x.text == [0x95]).unwrap();
+    // Bullet for level one, en dash for level two, "1." for the ordered list.
+    let bullet = run(&r, "\u{2022}");
     assert!(bullet.x < one.x && bullet.y == one.y);
-    let dash = r.iter().find(|x| x.text == [0x96]).unwrap();
+    let dash = run(&r, "\u{2013}");
     assert!(dash.x < two.x && dash.y == two.y);
     let n = run(&r, "1.");
     assert!(n.x < three.x && n.y == three.y);
@@ -116,12 +119,19 @@ fn nested_lists_are_indented_with_markers() {
 fn tables_align_columns() {
     let out = render("| Left | Right |\n|:-----|------:|\n| a | 1 |\n| bb | 22222 |\n");
     let r = runs(&out, 0);
-    assert_eq!(run(&r, "Left").font, 2, "header is bold");
-    assert_eq!(run(&r, "a").font, 1);
+    assert_eq!(run(&r, "Left").face, BOLD, "header is bold");
+    assert_eq!(run(&r, "a").face, REGULAR);
     // Left column shares its left edge; right column shares its right edge.
     assert_eq!(run(&r, "a").x, run(&r, "bb").x);
     assert_eq!(run(&r, "Left").x, run(&r, "a").x);
-    let w = |s: &str| s.len() as f32 * 556.0 * 11.0 * 0.92 / 1000.0; // Helvetica digits
+    // Right-aligned cells end at the same x. Measure with the font's own
+    // advance widths.
+    let fonts = Fonts::builtin();
+    let w = |s: &str| -> f32 {
+        s.chars()
+            .map(|c| fonts.width(REGULAR, fonts.faces[REGULAR].glyph(c).unwrap(), 11.0 * 0.92))
+            .sum()
+    };
     let right_edge = |s: &str| run(&r, s).x + w(s);
     assert!((right_edge("1") - right_edge("22222")).abs() < 0.05);
     // Rows go down the page.
@@ -162,4 +172,46 @@ fn long_documents_break_pages() {
             assert!(r.y > 50.0 && r.y < 842.0 - 50.0, "text outside margins: {r:?}");
         }
     }
+}
+
+#[test]
+fn every_script_in_the_bundled_fonts_uses_real_glyphs() {
+    let out = render("Καλημέρα Съешь Łódź “q” € `код`");
+    let r = runs(&out, 0);
+    assert_eq!(run(&r, "Καλημέρα").face, REGULAR);
+    assert_eq!(run(&r, "Съешь").face, REGULAR);
+    assert_eq!(run(&r, "Łódź").face, REGULAR);
+    assert_eq!(run(&r, "код").face, MONO);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+}
+
+#[test]
+fn uncovered_characters_warn_and_use_notdef() {
+    let out = render("日本 🎉");
+    assert_eq!(out.warnings.len(), 1);
+    assert!(out.warnings[0].contains("U+65E5") && out.warnings[0].contains("U+1F389"));
+    let r = runs(&out, 0);
+    assert!(r.iter().all(|x| x.face == REGULAR));
+    // The glyph is .notdef (ID 0), which maps back to the first missing character.
+    assert!(out.used[REGULAR].contains_key(&0));
+}
+
+#[test]
+fn fonts_are_embedded_subsets_with_unicode_maps() {
+    let pdf = sundowner::convert("Hello **bold** `code`", &Options::default()).pdf;
+    let text = String::from_utf8_lossy(&pdf);
+    assert_eq!(
+        text.matches("/Subtype /Type0").count(),
+        3,
+        "regular, bold and mono"
+    );
+    assert_eq!(text.matches("/FontFile2").count(), 3);
+    assert_eq!(text.matches("/ToUnicode").count(), 3);
+    assert!(!text.contains("/Type1"), "no base-14 fonts");
+    assert!(text.contains("+AlegreyaRoman-Regular") && text.contains("+IBMPlexMono-Regular"));
+    // Same input, same bytes.
+    assert_eq!(
+        pdf,
+        sundowner::convert("Hello **bold** `code`", &Options::default()).pdf
+    );
 }
