@@ -8,7 +8,8 @@
 use crate::bidi_table::{self as table, JoiningType};
 use crate::gsub::mask;
 
-/// The joining type of a character.
+/// The joining type of a character. (`JOINING` starts at U+0000, so every
+/// code point is in a range.)
 pub fn joining_type(c: char) -> JoiningType {
     let cp = c as u32;
     let i = table::JOINING.partition_point(|&r| r >> 3 <= cp) - 1;
@@ -99,6 +100,13 @@ mod tests {
 
     fn forms_of(s: &str, before: bool, after: bool) -> Vec<u16> {
         forms(&s.chars().collect::<Vec<_>>(), before, after)
+    }
+
+    #[test]
+    fn joining_table_starts_at_zero() {
+        assert_eq!(table::JOINING[0] >> 3, 0);
+        assert_eq!(joining_type('\0'), JoiningType::U);
+        assert_eq!(joining_type(char::MAX), JoiningType::U);
     }
 
     #[test]

@@ -298,27 +298,56 @@ struct Layout<'a> {
     shape_cache: RefCell<HashMap<(String, u8, u32), Runs>>,
 }
 
+impl<'a> Layout<'a> {
+    fn new(o: &'a Options, refs: &'a HashMap<String, String>) -> Layout<'a> {
+        Layout {
+            o,
+            refs,
+            pages: vec![Page::default()],
+            y: o.page_height - o.margin,
+            at_top: true,
+            pending_gap: 0.0,
+            marker: None,
+            images: Vec::new(),
+            image_cache: HashMap::new(),
+            image_bytes: 0,
+            headings: Vec::new(),
+            anchors: HashMap::new(),
+            slug_counts: HashMap::new(),
+            warnings: Vec::new(),
+            used: RefCell::new(vec![BTreeMap::new(); o.fonts.faces.len()]),
+            missing: RefCell::new(BTreeSet::new()),
+            kern_cache: RefCell::new(HashMap::new()),
+            shape_cache: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+/// A glyph from [`shape_text`]: its ID, advance, and x and y offsets.
+pub type ShapedGlyph = (u16, f32, f32, f32);
+
+/// Shape a piece of text in one style and direction the way layout does
+/// (font fallback, normalization, Arabic joining, GSUB and GPOS), and
+/// return its runs: the face, and for each glyph its ID, advance and x and
+/// y offsets in 1/1000 em. Right-to-left runs are in logical order with
+/// HarfBuzz's right-to-left positions. For tests and tools.
+pub fn shape_text(
+    text: &str,
+    bold: bool,
+    italic: bool,
+    rtl: bool,
+    o: &Options,
+) -> Vec<(FaceId, Vec<ShapedGlyph>)> {
+    let refs = HashMap::new();
+    let l = Layout::new(o, &refs);
+    l.shape_dir(text, false, bold, italic, 1000.0, rtl)
+        .into_iter()
+        .map(|(face, glyphs, _)| (face, glyphs.iter().map(|g| (g.id, g.adv, g.dx, g.dy)).collect()))
+        .collect()
+}
+
 pub fn layout(doc: &Document, o: &Options) -> Output {
-    let mut l = Layout {
-        o,
-        refs: &doc.refs,
-        pages: vec![Page::default()],
-        y: o.page_height - o.margin,
-        at_top: true,
-        pending_gap: 0.0,
-        marker: None,
-        images: Vec::new(),
-        image_cache: HashMap::new(),
-        image_bytes: 0,
-        headings: Vec::new(),
-        anchors: HashMap::new(),
-        slug_counts: HashMap::new(),
-        warnings: Vec::new(),
-        used: RefCell::new(vec![BTreeMap::new(); o.fonts.faces.len()]),
-        missing: RefCell::new(BTreeSet::new()),
-        kern_cache: RefCell::new(HashMap::new()),
-        shape_cache: RefCell::new(HashMap::new()),
-    };
+    let mut l = Layout::new(o, &doc.refs);
     let ctx = Ctx {
         x: o.margin,
         w: o.page_width - 2.0 * o.margin,
@@ -830,6 +859,8 @@ impl Layout<'_> {
                 .collect();
             fallback_marks(font, &ids, &marks, &classes)
         };
+        // Every right-to-left run goes this way: `right_to_left` expects
+        // HarfBuzz's right-to-left positions.
         if rtl || font.needs_positioning(script) {
             // Everything the font's GPOS table does, as HarfBuzz does it.
             let ids: Vec<u16> = glyphs.iter().map(|g| g.id).collect();
@@ -2062,6 +2093,11 @@ fn blocks_rtl(blocks: &[Block]) -> bool {
 /// positioned as HarfBuzz positions right-to-left text, into visual order.
 /// HarfBuzz's positions are made for exactly this: reversed, the glyphs
 /// are drawn left to right like any others.
+///
+/// This relies on every right-to-left run having been positioned by
+/// [`crate::position`] (see `shape_run`, which sends every right-to-left
+/// run there, Hebrew as much as Arabic): the pairwise kerning and mark
+/// attachment of left-to-right runs position glyphs differently.
 fn right_to_left(glyphs: &[G]) -> Vec<G> {
     glyphs.iter().rev().copied().collect()
 }

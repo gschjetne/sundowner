@@ -74,3 +74,48 @@ fn matches_harfbuzz() {
     // Lam-alef.
     assert_eq!(shape("لا"), [(2513, 302, 0, 0), (2518, 340, 0, 0)]);
 }
+
+/// Every word of `tests/data/arabic-words.txt`, in every style, shaped the
+/// way layout shapes text, against HarfBuzz (`tools/gen_harfbuzz.py`).
+#[test]
+fn every_word_matches_harfbuzz_in_every_style() {
+    let options = sundowner::Options::default();
+    let data = include_str!("data/arabic-harfbuzz.txt");
+    let (mut cases, mut failures) = (0, Vec::new());
+    for line in data.lines().filter(|l| !l.starts_with('#')) {
+        let mut fields = line.split('\t');
+        let (style, word) = (fields.next().unwrap(), fields.next().unwrap());
+        let expected: Vec<(u16, i32, i32, i32)> = fields
+            .map(|g| {
+                let v: Vec<i32> = g.split(':').map(|x| x.parse().unwrap()).collect();
+                (v[0] as u16, v[1], v[2], v[3])
+            })
+            .collect();
+        let (bold, italic) = (style.contains("Bold"), style.contains("Italic"));
+        let rtl = !word.chars().all(|c| ('\u{660}'..='\u{669}').contains(&c));
+        let runs = sundowner::layout::shape_text(word, bold, italic, rtl, &options);
+        let faces: Vec<&str> = runs
+            .iter()
+            .map(|r| options.fonts.faces[r.0].postscript_name.as_str())
+            .collect();
+        // Amiri's units per em are 1000, so 1/1000 em are font units.
+        let got: Vec<(u16, i32, i32, i32)> = runs
+            .iter()
+            .flat_map(|r| &r.1)
+            .map(|&(id, adv, dx, dy)| (id, adv.round() as i32, dx.round() as i32, dy.round() as i32))
+            .collect();
+        cases += 1;
+        if got != expected || faces.iter().any(|f| *f != format!("Amiri-{style}")) {
+            failures.push(format!(
+                "{style} {word}: {faces:?}\n  got      {got:?}\n  expected {expected:?}"
+            ));
+        }
+    }
+    assert!(cases >= 600, "only {cases} cases");
+    assert!(
+        failures.is_empty(),
+        "{} of {cases} differ:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
