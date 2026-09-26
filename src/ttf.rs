@@ -184,16 +184,7 @@ impl Face {
         let postscript_name = table(b"name")
             .and_then(postscript_name)
             .unwrap_or_else(|| "Embedded".into());
-        let variable_default_weight = table(b"fvar").map(|fvar| {
-            let axes = u16_at(fvar, 4).unwrap_or(0) as usize;
-            let count = u16_at(fvar, 8).unwrap_or(0) as usize;
-            let size = u16_at(fvar, 10).unwrap_or(20) as usize;
-            (0..count)
-                .map(|k| axes + k * size)
-                .find(|&a| fvar.get(a..a + 4) == Some(b"wght"))
-                .and_then(|a| u32_at(fvar, a + 8))
-                .map_or(400.0, |v| (v as i32 as f32 / 65536.0).round())
-        });
+        let variable_default_weight = table(b"fvar").map(fvar_default_weight);
         let kerning = Kerning::parse(table(b"GPOS"), table(b"GDEF"), table(b"kern"));
         let cmap = parse_cmap(req(b"cmap")?, num_glyphs)?;
         if cmap.is_empty() {
@@ -396,6 +387,9 @@ impl Face {
         out_tables.insert(*b"glyf", glyf);
         out_tables.insert(*b"loca", loca);
         out_tables.insert(*b"hmtx", hmtx);
+        // No cmap: PDF content addresses glyphs by ID (Identity-H with
+        // CIDToGIDMap /Identity), and the ToUnicode map provides text
+        // extraction, so the character map is not needed in the subset.
         write_sfnt(&out_tables)
     }
 }
@@ -448,6 +442,23 @@ fn write_sfnt(tables: &BTreeMap<[u8; 4], Vec<u8>>) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Default value of the `wght` axis of a variable font (400 if it has none).
+///
+/// `fvar` header: majorVersion, minorVersion, axesArrayOffset (offset 4),
+/// reserved, axisCount (8), axisSize (10), instanceCount, instanceSize.
+/// Each VariationAxisRecord: axisTag, minValue, defaultValue (+8), maxValue
+/// as 16.16 fixed-point numbers, then flags and axisNameID.
+fn fvar_default_weight(fvar: &[u8]) -> f32 {
+    let axes = u16_at(fvar, 4).unwrap_or(0) as usize;
+    let count = u16_at(fvar, 8).unwrap_or(0) as usize;
+    let size = u16_at(fvar, 10).unwrap_or(20) as usize;
+    (0..count)
+        .map(|k| axes + k * size)
+        .find(|&a| fvar.get(a..a + 4) == Some(b"wght"))
+        .and_then(|a| u32_at(fvar, a + 8))
+        .map_or(400.0, |v| (v as i32 as f32 / 65536.0).round())
 }
 
 fn postscript_name(name: &[u8]) -> Option<String> {
@@ -639,6 +650,33 @@ mod tests {
         // A monospace font has no kerning.
         let mono = Face::parse(Cow::Borrowed(include_bytes!("../fonts/Cousine-Regular.ttf")), 0).unwrap();
         assert_eq!(mono.kern(mono.glyph('A').unwrap(), mono.glyph('V').unwrap()), 0);
+    }
+
+    #[test]
+    fn fvar_default_weight_follows_the_spec_layout() {
+        // Header with the axis array at offset 16 and 20-byte axis records;
+        // `wght` is the second axis to exercise the walk.
+        let fixed = |v: f32| ((v * 65536.0) as i32).to_be_bytes();
+        let mut t = Vec::new();
+        for v in [1u16, 0, 16, 2, 2, 20, 0, 8] {
+            t.extend_from_slice(&v.to_be_bytes());
+        }
+        for (tag, min, def, max) in [(b"wdth", 75.0, 100.0, 100.0), (b"wght", 100.0, 350.0, 900.0)] {
+            t.extend_from_slice(tag);
+            for v in [min, def, max] {
+                t.extend_from_slice(&fixed(v));
+            }
+            t.extend_from_slice(&[0, 0, 1, 0]); // flags, axisNameID
+        }
+        assert_eq!(fvar_default_weight(&t), 350.0);
+        // Only a width axis: treated as regular weight.
+        let mut w = t[..36].to_vec();
+        w[9] = 1;
+        assert_eq!(fvar_default_weight(&w), 400.0);
+        // Truncated tables never panic.
+        for n in 0..t.len() {
+            let _ = fvar_default_weight(&t[..n]);
+        }
     }
 
     #[test]

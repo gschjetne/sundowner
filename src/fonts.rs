@@ -353,11 +353,23 @@ mod tests {
             .filter(|&c| c != 0xAD && c != 0x149);
         let greek = (0x384..=0x3CE).filter(|c| ![0x38B, 0x38D, 0x3A2].contains(c));
         let cyrillic = 0x400..=0x45F;
+        // Greek Extended (polytonic), minus its unassigned code points.
+        const UNASSIGNED: [u32; 22] = [
+            0x1F16, 0x1F17, 0x1F1E, 0x1F1F, 0x1F46, 0x1F47, 0x1F4E, 0x1F4F, 0x1F58, 0x1F5A, 0x1F5C, 0x1F5E,
+            0x1F7E, 0x1F7F, 0x1FB5, 0x1FC5, 0x1FD4, 0x1FD5, 0x1FDC, 0x1FF0, 0x1FF1, 0x1FF5,
+        ];
+        let polytonic = (0x1F00..=0x1FFE).filter(|c| !UNASSIGNED.contains(c));
         let wanted: Vec<char> = latin
             .chain(greek)
             .chain(cyrillic)
+            .chain(polytonic)
             .filter_map(char::from_u32)
             .collect();
+        assert_eq!(
+            wanted.len(),
+            317 + 72 + 96 + 233,
+            "Latin, Greek, Cyrillic, polytonic"
+        );
         assert_eq!(f.faces.len(), BUNDLED.len());
         for (face, b) in f.faces.iter().zip(&BUNDLED) {
             let missing: String = wanted.iter().filter(|&&c| face.glyph(c).is_none()).collect();

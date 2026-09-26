@@ -46,6 +46,9 @@ Eastern European), modern and polytonic Greek, and Cyrillic; a test enforces
 this. To use other fonts, or to cover other scripts and emoji,
 create a `.sundowner` file. sundowner uses the nearest one in the input
 file's directory or any parent directory, or the file given with `--config`.
+The search goes all the way up, so a `.sundowner` in your home directory
+(or in `/`) applies to every document below it that has no closer one; use
+`--no-config` to ignore configuration files.
 
 ```ini
 # Page settings (same meaning as the command-line options)
@@ -136,7 +139,8 @@ and `#anchor` links become clickable; other links are shown as plain text.
   OpenType `kern` feature (GPOS pair adjustment). Fonts without GPOS
   kerning fall back to the legacy `kern` table. Kerning is included when
   measuring text, so line breaks account for it. It applies within a word
-  in one font, not across spaces or font changes.
+  in one font, not across spaces or font changes. As the OpenType spec
+  prescribes, adjustments from all of the font's kerning lookups add up.
 - **Compact output.** Content streams are compressed with a small built-in
   DEFLATE encoder (LZ77 with short hash chains and the fixed Huffman code).
   This is simple and fast but compresses less than zlib or gzip at their
