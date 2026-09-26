@@ -6,6 +6,7 @@
 //! font-size = 11
 //! margin = 20
 //! page-numbers = true
+//! simplified-chinese = false
 //!
 //! # Replace the bundled Alegreya for body text and headings
 //! [body]
@@ -58,6 +59,14 @@ pub fn parse_number(what: &str, v: &str, lo: f32, hi: f32) -> Result<f32, String
 }
 
 /// Paper size name or `WIDTHxHEIGHT` in millimetres, returned in points.
+fn parse_bool(key: &str, v: &str) -> Result<bool, String> {
+    match v {
+        "true" | "yes" | "on" => Ok(true),
+        "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("{key}: expected true or false, got '{v}'")),
+    }
+}
+
 pub fn parse_paper(v: &str) -> Result<(f32, f32), String> {
     let (w, h) = match v.trim().to_ascii_lowercase().as_str() {
         "a4" => (210.0, 297.0),
@@ -146,17 +155,8 @@ pub fn parse(text: &str, base: &Path) -> Result<Config, String> {
                     cfg.font_size = Some(parse_number("font-size", value, 4.0, 72.0).map_err(err)?)
                 }
                 "margin" => cfg.margin = Some(parse_number("margin", value, 0.0, 100.0).map_err(err)?),
-                "page-numbers" => {
-                    cfg.page_numbers = Some(match value {
-                        "true" | "yes" | "on" => true,
-                        "false" | "no" | "off" => false,
-                        _ => {
-                            return Err(err(format!(
-                                "page-numbers: expected true or false, got '{value}'"
-                            )))
-                        }
-                    })
-                }
+                "page-numbers" => cfg.page_numbers = Some(parse_bool(key, value).map_err(err)?),
+                "simplified-chinese" => cfg.fonts.simplified_chinese = parse_bool(key, value).map_err(err)?,
                 _ => return Err(err(format!("unknown setting '{key}'"))),
             },
             Section::Body | Section::Mono | Section::Fallback => {
@@ -218,6 +218,26 @@ fn font_path(base: &Path, value: &str) -> Result<(PathBuf, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simplified_chinese_setting() {
+        let base = Path::new("/cfg");
+        assert!(!parse("", base).unwrap().fonts.simplified_chinese);
+        assert!(
+            parse("simplified-chinese = true", base)
+                .unwrap()
+                .fonts
+                .simplified_chinese
+        );
+        assert!(
+            !parse("simplified-chinese = off", base)
+                .unwrap()
+                .fonts
+                .simplified_chinese
+        );
+        let e = parse("simplified-chinese = maybe", base).unwrap_err();
+        assert!(e.contains("line 1: simplified-chinese"), "{e}");
+    }
 
     #[test]
     fn parses_full_config() {

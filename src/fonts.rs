@@ -124,7 +124,9 @@ pub const BUNDLED: &[Bundled] = bundled!(
     silk!("Amiri-Regular.ttf"),
     silk!("Amiri-Bold.ttf"),
     silk!("Amiri-Italic.ttf"),
-    silk!("Amiri-BoldItalic.ttf")
+    silk!("Amiri-BoldItalic.ttf"),
+    silk!("NotoSerifTC-Regular.ttf"),
+    silk!("NotoSerifTC-Bold.ttf")
 );
 
 /// Number of bundled fonts in the base set (Alegreya and Cousine).
@@ -141,6 +143,10 @@ type TierFamily = (&'static str, bool);
 /// ones come before Cousine, so Hebrew is not set in Cousine. The others
 /// come after it, so the symbols, box drawing characters and Latin letters
 /// that Cousine has keep coming from it (and do not unpack a large font).
+///
+/// Chinese characters are set in traditional forms (Noto Serif TC) by
+/// default, with Noto Serif SC for the simplified characters TC lacks;
+/// [`FontSpec::simplified_chinese`] swaps the two.
 #[cfg(not(feature = "silk"))]
 const TIER_FAMILIES: &[TierFamily] = &[];
 #[cfg(feature = "silk")]
@@ -149,6 +155,7 @@ const TIER_FAMILIES: &[TierFamily] = &[
     ("silk/NotoSerifHebrew", true),
     ("silk/NotoSerifArmenian", true),
     ("silk/Amiri", false),
+    ("silk/NotoSerifTC", false),
     ("silk/NotoSerifSC", false),
     ("silk/GowunBatang", false),
 ];
@@ -197,6 +204,11 @@ pub const FONT_LICENSES: &[(&str, &str)] = &[
     (
         "Noto Serif SC (Regular, Bold; static instances generated from the variable font)",
         include_str!("../fonts/silk/OFL-NotoSerifSC.txt"),
+    ),
+    #[cfg(feature = "silk")]
+    (
+        "Noto Serif TC (Regular, Bold; static instances generated from the variable font)",
+        include_str!("../fonts/silk/OFL-NotoSerifTC.txt"),
     ),
     #[cfg(feature = "silk")]
     (
@@ -267,6 +279,9 @@ pub struct FontSpec {
     pub body: Option<FamilySpec>,
     pub mono: Option<FamilySpec>,
     pub fallbacks: Vec<FamilySpec>,
+    /// Set Chinese characters in their simplified (mainland China) forms
+    /// rather than the traditional ones (silk build only).
+    pub simplified_chinese: bool,
 }
 
 /// Largest font file that will be loaded.
@@ -275,9 +290,20 @@ const MAX_FONT_FILE: u64 = 512 << 20;
 impl Fonts {
     /// The bundled fonts only: Alegreya for text, Cousine for code.
     pub fn builtin() -> Arc<Fonts> {
-        static BUILTIN: OnceLock<Arc<Fonts>> = OnceLock::new();
-        BUILTIN
-            .get_or_init(|| Arc::new(Fonts::load(&FontSpec::default()).expect("bundled fonts are valid")))
+        Fonts::builtin_with(false)
+    }
+
+    /// The bundled fonts only, with simplified or traditional Chinese.
+    pub fn builtin_with(simplified_chinese: bool) -> Arc<Fonts> {
+        static BUILTIN: [OnceLock<Arc<Fonts>>; 2] = [OnceLock::new(), OnceLock::new()];
+        BUILTIN[simplified_chinese as usize]
+            .get_or_init(|| {
+                let spec = FontSpec {
+                    simplified_chinese,
+                    ..FontSpec::default()
+                };
+                Arc::new(Fonts::load(&spec).expect("bundled fonts are valid"))
+            })
             .clone()
     }
 
@@ -318,10 +344,16 @@ impl Fonts {
                 let file = format!("{name}-{style}.ttf");
                 BUNDLED.iter().position(|b| b.file == file)
             };
+            let simplified = spec.simplified_chinese;
             TIER_FAMILIES
                 .iter()
                 .filter(move |f| f.1 == before_mono)
-                .map(move |&(name, _)| Family {
+                .map(move |&(name, _)| match name {
+                    "silk/NotoSerifTC" if simplified => "silk/NotoSerifSC",
+                    "silk/NotoSerifSC" if simplified => "silk/NotoSerifTC",
+                    _ => name,
+                })
+                .map(move |name| Family {
                     regular: face(name, "Regular").expect("the regular face of a tier family is bundled"),
                     bold: face(name, "Bold"),
                     italic: face(name, "Italic"),
@@ -603,12 +635,10 @@ mod tests {
                 '\u{60C}', '\u{61B}', '\u{61F}', '\u{67E}', '\u{686}', '\u{698}', '\u{6AF}', '\u{6CC}',
             ])
             .collect();
-        let cases: [(&str, &[char], &str); 7] = [
+        let cases: [(&str, &[char], &str); 5] = [
             ("Hebrew", &hebrew, "FrankRuhlLibre"),
             ("cantillation", &chars(0x591..=0x5AF), "NotoSerifHebrew"),
             ("Armenian", &armenian, "NotoSerifArmenian"),
-            ("Han", &han, "NotoSerifSC"),
-            ("kana", &kana, "NotoSerifSC"),
             ("Hangul", &chars(0xAC00..=0xD7A3), "GowunBatang"),
             ("Arabic", &arabic, "Amiri"),
         ];
@@ -631,6 +661,37 @@ mod tests {
                         "{what}: U+{:04X} set in {name}",
                         c as u32
                     );
+                }
+            }
+        }
+        // Chinese characters and kana: traditional forms (Noto Serif TC)
+        // by default and simplified ones (Noto Serif SC) on request, each
+        // font falling back on the other for the characters it lacks.
+        for simplified in [false, true] {
+            let f = Fonts::builtin_with(simplified);
+            let (first, second) = if simplified {
+                ("NotoSerifSC", "NotoSerifTC")
+            } else {
+                ("NotoSerifTC", "NotoSerifSC")
+            };
+            for bold in [false, true] {
+                let style = if bold { "Bold" } else { "Regular" };
+                let face_of = |family: &str| {
+                    (0..f.faces.len())
+                        .find(|&i| f.faces[i].postscript_name == format!("{family}-{style}"))
+                        .unwrap()
+                };
+                let (first_face, second_face) = (face_of(first), face_of(second));
+                for &c in han.iter().chain(&kana) {
+                    let (face, _) = f
+                        .resolve(c, false, bold, false)
+                        .unwrap_or_else(|| panic!("U+{:04X} not covered", c as u32));
+                    let expected = if f.faces[first_face].glyph(c).is_some() {
+                        first_face
+                    } else {
+                        second_face
+                    };
+                    assert_eq!(face, expected, "U+{:04X}, simplified: {simplified}", c as u32);
                 }
             }
         }

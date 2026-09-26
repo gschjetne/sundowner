@@ -10,7 +10,7 @@ use std::path::Path;
 mod flate;
 
 /// The fonts of the `silk` tier, in `fonts/silk/`.
-const SILK: [&str; 14] = [
+const SILK: [&str; 16] = [
     "FrankRuhlLibre-Regular.ttf",
     "FrankRuhlLibre-Bold.ttf",
     "NotoSerifHebrew-Regular.ttf",
@@ -25,6 +25,8 @@ const SILK: [&str; 14] = [
     "Amiri-Bold.ttf",
     "Amiri-Italic.ttf",
     "Amiri-BoldItalic.ttf",
+    "NotoSerifTC-Regular.ttf",
+    "NotoSerifTC-Bold.ttf",
 ];
 
 fn main() {

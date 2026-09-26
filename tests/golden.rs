@@ -472,11 +472,11 @@ fn silk_sets_each_script_in_its_family() {
     hebrew.sort();
     assert_eq!(hebrew, ["FrankRuhlLibre-Bold", "FrankRuhlLibre-Regular"]);
     assert_eq!(name(run(&r, "Հայերեն")), "NotoSerifArmenian-Regular");
-    assert_eq!(name(run(&r, "ひらがな")), "NotoSerifSC-Regular");
+    assert_eq!(name(run(&r, "ひらがな")), "NotoSerifTC-Regular");
     assert_eq!(name(run(&r, "한국어")), "GowunBatang-Regular");
     let mut han: Vec<String> = r.iter().filter(|x| x.text == "中文").map(name).collect();
     han.sort();
-    assert_eq!(han, ["NotoSerifSC-Bold", "NotoSerifSC-Regular"]);
+    assert_eq!(han, ["NotoSerifTC-Bold", "NotoSerifTC-Regular"]);
     // Cantillation marks, which Frank Ruhl Libre lacks, come from Noto
     // Serif Hebrew together with their letter.
     let out = render("בָּרָ֣א");
@@ -531,4 +531,35 @@ fn arabic_is_joined_and_set_in_amiri() {
     // Right to left and flush right, with Arabic-Indic digits left to right.
     let l = lines(&render("العدد ١٢٣"))[0].replace(' ', "");
     assert_eq!(l, format!("١٢٣{}", logical("العدد")));
+}
+
+/// Chinese characters are set in traditional forms by default, with
+/// simplified characters that the traditional font lacks from the
+/// simplified one, and all in simplified forms on request.
+#[cfg(feature = "silk")]
+#[test]
+fn chinese_is_traditional_unless_simplified_is_asked_for() {
+    // 中 and 国 are in both fonts, 这 and 们 only in the simplified one.
+    let src = "中国 这们";
+    let fonts = |out: &Output, text: &str| -> Vec<String> {
+        runs(out, 0)
+            .iter()
+            .filter(|x| x.text == text)
+            .map(|x| name_of(out, x))
+            .collect()
+    };
+    let out = render(src);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert_eq!(fonts(&out, "中国"), ["NotoSerifTC-Regular"]);
+    assert_eq!(fonts(&out, "这们"), ["NotoSerifSC-Regular"]);
+    let out = layout::layout(
+        &markdown::parse(src),
+        &Options {
+            page_numbers: false,
+            fonts: Fonts::builtin_with(true),
+            ..Options::default()
+        },
+    );
+    assert_eq!(fonts(&out, "中国"), ["NotoSerifSC-Regular"]);
+    assert_eq!(fonts(&out, "这们"), ["NotoSerifSC-Regular"]);
 }

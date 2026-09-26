@@ -34,8 +34,15 @@ def fetch(path):
 
 
 def instance(src, weight, dest, width=None):
-    # Keep the source timestamp so rebuilding gives identical files.
-    font = TTFont(io.BytesIO(fetch(src)), recalcTimestamp=False)
+    # Keep the source timestamp so rebuilding gives identical files, and
+    # always use fontTools' own table packer: with uharfbuzz installed it
+    # would otherwise use HarfBuzz's, which lays out GSUB and GPOS
+    # differently.
+    font = TTFont(
+        io.BytesIO(fetch(src)),
+        recalcTimestamp=False,
+        cfg={"fontTools.ttLib.tables.otBase:USE_HARFBUZZ_REPACKER": False},
+    )
     axes = {"wght": weight}
     if width is not None:
         axes["wdth"] = width
