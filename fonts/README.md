@@ -14,12 +14,13 @@ stores them compressed.
 | `silk/NotoSerifHebrew-Regular.ttf`, `silk/NotoSerifHebrew-Bold.ttf` | [Noto Serif Hebrew](https://github.com/notofonts/hebrew) by The Noto Project Authors | SIL OFL 1.1, [`silk/OFL-NotoSerifHebrew.txt`](silk/OFL-NotoSerifHebrew.txt) | Static instances (`wght` 400 and 700, `wdth` 100) generated from the upstream variable font. No other changes. |
 | `silk/NotoSerifArmenian-Regular.ttf`, `silk/NotoSerifArmenian-Bold.ttf` | [Noto Serif Armenian](https://github.com/notofonts/armenian) by The Noto Project Authors | SIL OFL 1.1, [`silk/OFL-NotoSerifArmenian.txt`](silk/OFL-NotoSerifArmenian.txt) | Static instances (`wght` 400 and 700, `wdth` 100) generated from the upstream variable font. No other changes. |
 | `silk/NotoSerifSC-Regular.ttf`, `silk/NotoSerifSC-Bold.ttf` | [Noto Serif SC](https://github.com/notofonts/noto-cjk) by Google | SIL OFL 1.1, [`silk/OFL-NotoSerifSC.txt`](silk/OFL-NotoSerifSC.txt) | Static instances (`wght` 400 and 700) generated from the upstream variable font. No other changes. |
+| `silk/Amiri-Regular.ttf`, `silk/Amiri-Bold.ttf`, `silk/Amiri-Italic.ttf`, `silk/Amiri-BoldItalic.ttf` | [Amiri](https://github.com/aliftype/amiri) by Khaled Hosny and Sebastian Kosch | SIL OFL 1.1, [`silk/OFL-Amiri.txt`](silk/OFL-Amiri.txt) | None: the files are byte-for-byte upstream. |
 | `silk/GowunBatang-Regular.ttf`, `silk/GowunBatang-Bold.ttf` | [Gowun Batang](https://github.com/yangheeryu/Gowun-Batang) by Yanghee Ryu | SIL OFL 1.1, [`silk/OFL-GowunBatang.txt`](silk/OFL-GowunBatang.txt) | None: the files are byte-for-byte upstream. |
 
 Alegreya and Cousine cover Latin (Basic Latin, Latin-1 and Latin Extended-A),
 modern and polytonic Greek, and Cyrillic. The silk fonts add Hebrew
-(Frank Ruhl Libre, with Noto Serif Hebrew for cantillation marks),
-Armenian, Chinese characters and Japanese kana (Noto Serif SC), and Korean
+(Frank Ruhl Libre, with Noto Serif Hebrew for cantillation marks), Arabic
+(Amiri), Armenian, Chinese characters and Japanese kana (Noto Serif SC), and Korean
 Hangul (Gowun Batang).
 
 `build.py` regenerates every file here from a pinned
@@ -36,7 +37,7 @@ reproducible: the output must match [`SHA256SUMS`](SHA256SUMS)
   Ruhl Libre, Noto Serif Hebrew, Noto Serif Armenian and Noto Serif SC
   declare no Reserved Font Name, so the generated static instances, which
   are Modified Versions, may keep their names (OFL condition 3). The
-  Cousine and Gowun Batang files are not modified.
+  Cousine, Gowun Batang and Amiri files are not modified.
 - **Modified Versions stay under the OFL.** The static instances remain
   under the OFL (condition 5). They are not sold by themselves; they are
   bundled with software (condition 1).
@@ -65,3 +66,5 @@ reproducible: the output must match [`SHA256SUMS`](SHA256SUMS)
   `ofl/notoserifhebrew/`, `ofl/notoserifarmenian/` and `ofl/notoserifsc/`
   at the same commit (with `wdth` 100 where the font has a width axis), and
   Gowun Batang Regular and Bold, unmodified, from `ofl/gowunbatang/`.
+- 2026-09-26: Added Amiri Regular, Bold, Italic and Bold Italic to
+  `silk/`, unmodified, from `ofl/amiri/` at the same commit.

@@ -9,6 +9,7 @@ use crate::gpos::{Attachment, MarkPositioning};
 use crate::gsub::{Glyph, Gsub, Script};
 use crate::kern::Kerning;
 use crate::otl::Gdef;
+use crate::position::{self, Pos, Positioning};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -36,6 +37,7 @@ pub struct Face {
     kerning: Kerning,
     gsub: Gsub,
     marks: MarkPositioning,
+    positioning: Positioning,
     gdef: Gdef,
 }
 
@@ -194,6 +196,7 @@ impl Face {
         let kerning = Kerning::parse(table(b"GPOS"), table(b"GDEF"), table(b"kern"));
         let gsub = Gsub::parse(table(b"GSUB"), table(b"GDEF"), num_glyphs);
         let marks = MarkPositioning::parse(table(b"GPOS"));
+        let positioning = Positioning::parse(table(b"GPOS"));
         let gdef = Gdef::parse(table(b"GDEF"));
         let cmap = parse_cmap(req(b"cmap")?, num_glyphs)?;
         if cmap.is_empty() {
@@ -217,6 +220,7 @@ impl Face {
             postscript_name,
             variable_default_weight,
             kerning,
+            positioning,
             gsub,
             marks,
             gdef,
@@ -259,11 +263,74 @@ impl Face {
         &self,
         script: Script,
         glyphs: &[u16],
+        components: &[u8],
         is_mark: &dyn Fn(usize) -> bool,
     ) -> Vec<Option<Attachment>> {
         let t = |tag: &[u8; 4]| self.table(tag).unwrap_or(&[]);
-        self.marks
-            .apply(t(b"GPOS"), t(b"GDEF"), &self.gdef, script, glyphs, is_mark)
+        self.marks.apply(
+            t(b"GPOS"),
+            t(b"GDEF"),
+            &self.gdef,
+            script,
+            glyphs,
+            components,
+            is_mark,
+        )
+    }
+
+    /// Whether text in `script` needs [`Face::position`]: the font has
+    /// cursive, single or contextual positioning for it.
+    pub fn needs_positioning(&self, script: Script) -> bool {
+        self.positioning.is_complex(script)
+    }
+
+    /// Position a run of glyphs in logical order with all of the font's
+    /// GPOS lookups for `script` (or its legacy `kern` table), placing
+    /// marks by `fallback` attachments if the font does not position them.
+    /// Returns HarfBuzz's positions in font units: see [`crate::position`].
+    pub fn position(
+        &self,
+        script: Script,
+        glyphs: &[u16],
+        components: &[u8],
+        is_mark: &dyn Fn(usize) -> bool,
+        rtl: bool,
+        fallback: Option<&[Option<Attachment>]>,
+    ) -> Vec<Pos> {
+        let t = |tag: &[u8; 4]| self.table(tag).unwrap_or(&[]);
+        let mut pos: Vec<Pos> = glyphs
+            .iter()
+            .map(|&g| Pos::advance(self.advance(g) as i32))
+            .collect();
+        self.positioning.apply(
+            t(b"GPOS"),
+            t(b"GDEF"),
+            &self.gdef,
+            script,
+            glyphs,
+            components,
+            is_mark,
+            rtl,
+            &mut pos,
+        );
+        // The legacy kern table, between glyphs that are not marks, split
+        // between the two as HarfBuzz does.
+        let bases: Vec<usize> = (0..glyphs.len()).filter(|&i| !is_mark(i)).collect();
+        for w in bases.windows(2) {
+            let (i, j) = (w[0], w[1]);
+            let Some(k) = self.kerning.legacy(t(b"kern"), glyphs[i], glyphs[j]) else {
+                break;
+            };
+            let (k1, k2) = (k >> 1, k - (k >> 1));
+            pos[i].x_advance += k1;
+            pos[j].x_advance += k2;
+            pos[j].x_offset += k2;
+        }
+        if let Some(a) = fallback {
+            position::attach_fallback(&mut pos, a);
+        }
+        position::finish(&mut pos, is_mark, rtl);
+        pos
     }
 
     /// The bounding box of a glyph's outline, `[x_min, y_min, x_max, y_max]`
@@ -716,6 +783,8 @@ mod tests {
                 .map(|(k, c)| Glyph {
                     id: f.glyph(c).unwrap(),
                     cluster: k as u32,
+                    mask: crate::gsub::mask::GLOBAL,
+                    component: 0,
                 })
                 .collect();
             f.substitute(Script::Latin, &mut g);
@@ -764,6 +833,8 @@ mod tests {
                 .map(|k| Glyph {
                     id: (rand() % 1200) as u16 | if round % 2 == 0 { 0 } else { 300 },
                     cluster: k,
+                    mask: crate::gsub::mask::GLOBAL,
+                    component: 0,
                 })
                 .collect();
             for script in Script::ALL {

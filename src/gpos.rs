@@ -47,6 +47,7 @@ impl MarkPositioning {
 
     /// Attach the marks among `glyphs`. `is_mark` says which glyphs are
     /// marks; `gpos` and `gdef` are the table data.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &self,
         gpos: &[u8],
@@ -54,6 +55,7 @@ impl MarkPositioning {
         gdef: &Gdef,
         script: Script,
         glyphs: &[u16],
+        components: &[u8],
         is_mark: &dyn Fn(usize) -> bool,
     ) -> Vec<Option<Attachment>> {
         let mut out = vec![None; glyphs.len()];
@@ -67,7 +69,7 @@ impl MarkPositioning {
                     continue;
                 }
                 for &st in &l.subtables {
-                    if let Some(a) = attach(gpos, l.kind, st, glyphs, i, is_mark, &skips) {
+                    if let Some(a) = attach(gpos, l.kind, st, glyphs, components, i, is_mark, &skips) {
                         out[i] = Some(a);
                         break;
                     }
@@ -145,7 +147,7 @@ fn parse_lookup(t: &[u8], list: usize, i: usize, budget: &mut Budget) -> Option<
     })
 }
 
-fn anchor(t: &[u8], at: usize) -> Option<(i32, i32)> {
+pub(crate) fn anchor(t: &[u8], at: usize) -> Option<(i32, i32)> {
     if !(1..=3).contains(&u16_at(t, at)?) {
         return None;
     }
@@ -153,11 +155,18 @@ fn anchor(t: &[u8], at: usize) -> Option<(i32, i32)> {
 }
 
 /// Try one mark attachment subtable for the mark at `i`.
-fn attach(
+///
+/// `components` numbers the glyphs that a multiple substitution produced
+/// (1, 2, ...; 0 for other glyphs): as in HarfBuzz, a mark goes on the
+/// first glyph of such a sequence rather than on a later one that the
+/// lookup does not cover.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach(
     t: &[u8],
     kind: u16,
     st: usize,
     glyphs: &[u16],
+    components: &[u8],
     i: usize,
     is_mark: &dyn Fn(usize) -> bool,
     skips: &dyn Fn(u16) -> bool,
@@ -181,9 +190,17 @@ fn attach(
     let second_array = st + u16_at(t, st + 10)? as usize;
     let (parent, anchor_at) = match kind {
         // Mark-to-base and mark-to-ligature: the nearest preceding glyph
-        // that is not a mark.
+        // that is not a mark (for mark-to-base, skipping later glyphs of a
+        // multiple substitution that the lookup does not cover).
         4 | 5 => {
-            let j = (0..i).rev().find(|&j| !is_mark(j))?;
+            let later_component = |j: usize| {
+                let c = components.get(j).copied().unwrap_or(0);
+                c > 1 && j > 0 && !is_mark(j - 1) && components.get(j - 1).is_some_and(|&p| p + 1 == c)
+            };
+            let j = (0..i).rev().find(|&j| {
+                !is_mark(j)
+                    && (kind != 4 || !later_component(j) || coverage(t, second_cov, glyphs[j]).is_some())
+            })?;
             let idx = coverage(t, second_cov, glyphs[j])?;
             if idx >= u16_at(t, second_array)? as usize {
                 return None;

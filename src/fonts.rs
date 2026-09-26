@@ -120,17 +120,37 @@ pub const BUNDLED: &[Bundled] = bundled!(
     silk!("NotoSerifSC-Regular.ttf"),
     silk!("NotoSerifSC-Bold.ttf"),
     silk!("GowunBatang-Regular.ttf"),
-    silk!("GowunBatang-Bold.ttf")
+    silk!("GowunBatang-Bold.ttf"),
+    silk!("Amiri-Regular.ttf"),
+    silk!("Amiri-Bold.ttf"),
+    silk!("Amiri-Italic.ttf"),
+    silk!("Amiri-BoldItalic.ttf")
 );
 
 /// Number of bundled fonts in the base set (Alegreya and Cousine).
+#[cfg(test)]
 const BASE_FONTS: usize = 8;
 
-/// Number of families of the tier that come before Cousine in the fallback
-/// chains: the Hebrew and Armenian ones, so Hebrew is not set in Cousine.
-/// The CJK fonts come after it, so the symbols and box drawing characters
-/// that Cousine has keep coming from it (and do not unpack a CJK font).
-const TIER_BEFORE_MONO: usize = if cfg!(feature = "silk") { 3 } else { 0 };
+/// A family of the tier: its regular, bold, italic and bold italic faces
+/// (indices into [`BUNDLED`]), and whether it comes before Cousine in the
+/// fallback chains.
+type TierFamily = (usize, Option<usize>, Option<usize>, Option<usize>, bool);
+
+/// The families of the tier, in fallback order. The Hebrew and Armenian
+/// ones come before Cousine, so Hebrew is not set in Cousine. The others
+/// come after it, so the symbols, box drawing characters and Latin letters
+/// that Cousine has keep coming from it (and do not unpack a large font).
+#[cfg(not(feature = "silk"))]
+const TIER_FAMILIES: &[TierFamily] = &[];
+#[cfg(feature = "silk")]
+const TIER_FAMILIES: &[TierFamily] = &[
+    (8, Some(9), None, None, true),            // Frank Ruhl Libre
+    (10, Some(11), None, None, true),          // Noto Serif Hebrew
+    (12, Some(13), None, None, true),          // Noto Serif Armenian
+    (18, Some(19), Some(20), Some(21), false), // Amiri
+    (14, Some(15), None, None, false),         // Noto Serif SC
+    (16, Some(17), None, None, false),         // Gowun Batang
+];
 
 /// The bytes of a bundled font, inflated on first use and kept for the
 /// rest of the run.
@@ -181,6 +201,11 @@ pub const FONT_LICENSES: &[(&str, &str)] = &[
     (
         "Gowun Batang (Regular, Bold; unmodified)",
         include_str!("../fonts/silk/OFL-GowunBatang.txt"),
+    ),
+    #[cfg(feature = "silk")]
+    (
+        "Amiri (Regular, Bold, Italic, Bold Italic; unmodified)",
+        include_str!("../fonts/silk/OFL-Amiri.txt"),
     ),
 ];
 
@@ -262,7 +287,7 @@ impl Fonts {
     ///   bundled families
     ///
     /// The bundled families are Alegreya, the tier's Hebrew and Armenian
-    /// families, Cousine, and the tier's CJK families.
+    /// families, Cousine, and the tier's Arabic and CJK families.
     ///
     /// The bundled fonts are always the final fallback.
     pub fn load(spec: &FontSpec) -> Result<Fonts, String> {
@@ -287,16 +312,16 @@ impl Fonts {
             italic: Some(6),
             bold_italic: Some(7),
         };
-        // The families of the tier: regular and bold, no italics.
-        let tier: Vec<Family> = (BASE_FONTS..BUNDLED.len())
-            .step_by(2)
-            .map(|i| Family {
-                regular: i,
-                bold: Some(i + 1),
-                italic: None,
-                bold_italic: None,
-            })
-            .collect();
+        let tier = |before_mono: bool| {
+            TIER_FAMILIES.iter().filter(move |f| f.4 == before_mono).map(
+                |&(regular, bold, italic, bold_italic, _)| Family {
+                    regular,
+                    bold,
+                    italic,
+                    bold_italic,
+                },
+            )
+        };
 
         let mut warnings = Vec::new();
         let mut load_family = |f: &FamilySpec, what: &str, faces: &mut Faces| -> Result<Family, String> {
@@ -343,12 +368,11 @@ impl Fonts {
         let chain = |first: Family| -> Vec<Family> {
             let mut out: Vec<Family> = Vec::new();
             let families = [first].into_iter().chain(fallbacks.iter().copied());
-            let (alphabets, cjk) = tier.split_at(TIER_BEFORE_MONO);
             for f in families
                 .chain([main_body, serif])
-                .chain(alphabets.iter().copied())
+                .chain(tier(true))
                 .chain([mono])
-                .chain(cjk.iter().copied())
+                .chain(tier(false))
             {
                 if !out.contains(&f) {
                     out.push(f);
@@ -565,13 +589,22 @@ mod tests {
             let (face, _) = f.resolve(c, false, false, false).unwrap();
             assert_eq!(face, 4, "{c}");
         }
-        let cases: [(&str, &[char], &str); 6] = [
+        let arabic: Vec<char> = chars(0x621..=0x63A)
+            .into_iter()
+            .chain(chars(0x641..=0x655))
+            .chain(chars(0x660..=0x66C))
+            .chain([
+                '\u{60C}', '\u{61B}', '\u{61F}', '\u{67E}', '\u{686}', '\u{698}', '\u{6AF}', '\u{6CC}',
+            ])
+            .collect();
+        let cases: [(&str, &[char], &str); 7] = [
             ("Hebrew", &hebrew, "FrankRuhlLibre"),
             ("cantillation", &chars(0x591..=0x5AF), "NotoSerifHebrew"),
             ("Armenian", &armenian, "NotoSerifArmenian"),
             ("Han", &han, "NotoSerifSC"),
             ("kana", &kana, "NotoSerifSC"),
             ("Hangul", &chars(0xAC00..=0xD7A3), "GowunBatang"),
+            ("Arabic", &arabic, "Amiri"),
         ];
         for (what, cs, family) in cases {
             for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
@@ -580,8 +613,15 @@ mod tests {
                         .resolve(c, false, bold, italic)
                         .unwrap_or_else(|| panic!("{what}: U+{:04X} not covered", c as u32));
                     let name = &f.faces[face].postscript_name;
+                    // Only Amiri has italics.
+                    let style = match (bold, italic && family == "Amiri") {
+                        (true, true) => "-BoldItalic",
+                        (true, false) => "-Bold",
+                        (false, true) => "-Italic",
+                        (false, false) => "-Regular",
+                    };
                     assert!(
-                        name.starts_with(family) && name.ends_with(if bold { "-Bold" } else { "-Regular" }),
+                        name.starts_with(family) && name.ends_with(style),
                         "{what}: U+{:04X} set in {name}",
                         c as u32
                     );
