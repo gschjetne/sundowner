@@ -132,6 +132,11 @@ and `#anchor` links become clickable; other links are shown as plain text.
   - A one-word document is about 3 KB.
   - Subset names are derived from their contents, so identical input gives
     byte-identical output.
+- **Kerning.** Pairs of adjacent glyphs are kerned using the font's
+  OpenType `kern` feature (GPOS pair adjustment). Fonts without GPOS
+  kerning fall back to the legacy `kern` table. Kerning is included when
+  measuring text, so line breaks account for it. It applies within a word
+  in one font, not across spaces or font changes.
 - **Compact output.** Content streams are compressed with a small built-in
   DEFLATE encoder (LZ77 with short hash chains and the fixed Huffman code).
   This is simple and fast but compresses less than zlib or gzip at their
@@ -161,10 +166,10 @@ and `#anchor` links become clickable; other links are shown as plain text.
 
 ## Limitations
 
-- **No text shaping.** Each character maps to one glyph. There is no kerning
-  or ligatures, no contextual forms, and no right-to-left layout. Latin,
-  Greek, Cyrillic and CJK render correctly. Arabic, Hebrew and Indic scripts
-  do not.
+- **Limited text shaping.** Each character maps to one glyph. Pair kerning
+  is applied (see above), but there are no ligatures, no contextual forms,
+  no mark positioning and no right-to-left layout. Latin, Greek, Cyrillic
+  and CJK render correctly. Arabic, Hebrew and Indic scripts do not.
 - **Line breaking** happens at spaces, and between any two CJK characters.
   It does not implement the full Unicode line-breaking rules.
 - **Combining marks** are drawn as separate glyphs. They are not composed

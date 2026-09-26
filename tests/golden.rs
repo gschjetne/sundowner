@@ -32,13 +32,18 @@ fn runs(out: &Output, page: usize) -> Vec<Run> {
     let mut result = Vec::new();
     let mut i = 0;
     while let Some(p) = find(ops, i, b"BT ") {
-        let end = find(ops, p, b" Tj ET\n").expect("unterminated text object");
+        let end = find(ops, p, b" ET\n").expect("unterminated text object");
         let obj = std::str::from_utf8(&ops[p..end]).unwrap();
         let f = obj.find("/F").unwrap() + 2;
         let tokens: Vec<&str> = obj[f..].split(' ').collect();
         let face: usize = tokens[0].parse().unwrap();
         let (x, y) = (tokens[3].parse().unwrap(), tokens[4].parse().unwrap());
-        let hex = &obj[obj.find('<').unwrap() + 1..obj.find('>').unwrap()];
+        // `<hex> Tj`, or `[<hex> kern <hex> ...] TJ` with kerning.
+        let shown = &obj[obj.find('<').unwrap()..=obj.rfind('>').unwrap()];
+        let hex: String = shown
+            .split('<')
+            .filter_map(|part| part.split('>').next())
+            .collect();
         let text = (0..hex.len() / 4)
             .map(|k| u16::from_str_radix(&hex[4 * k..4 * k + 4], 16).unwrap())
             .map(|g| out.used[face].get(&g).copied().unwrap_or('\u{FFFD}'))
@@ -221,4 +226,33 @@ fn fonts_are_embedded_subsets_with_unicode_maps() {
         pdf,
         sundowner::convert("Hello **bold** `code`", &Options::default()).pdf
     );
+}
+
+#[test]
+fn kerning_is_applied_and_measured() {
+    let out = render("AVATAR Tolstoy");
+    let ops = String::from_utf8_lossy(&out.pages[0].ops);
+    // AVATAR kerns A-V (-42), V-A, A-T, T-A: shown with a TJ array.
+    assert!(ops.contains("[<"), "{ops}");
+    assert!(ops.contains(">42<"), "A-V kerning of -42/1000 em: {ops}");
+    let r = runs(&out, 0);
+    // The next word starts where the kerned word ends plus a space, so the
+    // measured width includes the kerning.
+    let fonts = Fonts::builtin();
+    let face = &fonts.faces[REGULAR];
+    let advance = |s: &str| -> f32 {
+        s.chars()
+            .map(|c| fonts.width(REGULAR, face.glyph(c).unwrap(), 11.0))
+            .sum()
+    };
+    let gap = run(&r, "Tolstoy").x - run(&r, "AVATAR").x;
+    let unkerned = advance("AVATAR ");
+    assert!(gap < unkerned - 1.0, "kerned {gap} vs unkerned {unkerned}");
+}
+
+#[test]
+fn monospace_code_is_never_kerned() {
+    let out = render("`AVATAR To`");
+    let ops = String::from_utf8_lossy(&out.pages[0].ops);
+    assert!(!ops.contains("TJ"), "{ops}");
 }

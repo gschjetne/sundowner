@@ -7,6 +7,7 @@ pub mod flate;
 pub mod fonts;
 pub mod image;
 pub mod inline;
+pub mod kern;
 pub mod layout;
 pub mod markdown;
 pub mod pdf;

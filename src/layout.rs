@@ -158,6 +158,9 @@ struct Layout<'a> {
     warnings: Vec<String>,
     used: RefCell<Vec<BTreeMap<u16, char>>>,
     missing: RefCell<BTreeSet<char>>,
+    /// Kerning per glyph pair in 1/1000 em. Text repeats the same pairs
+    /// constantly, so this avoids most GPOS lookups.
+    kern_cache: RefCell<HashMap<(FaceId, u16, u16), f32>>,
 }
 
 pub fn layout(doc: &Document, o: &Options) -> Output {
@@ -178,6 +181,7 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         warnings: Vec::new(),
         used: RefCell::new(vec![BTreeMap::new(); o.fonts.faces.len()]),
         missing: RefCell::new(BTreeSet::new()),
+        kern_cache: RefCell::new(HashMap::new()),
     };
     let ctx = Ctx {
         x: o.margin,
@@ -248,18 +252,43 @@ fn nums(out: &mut Vec<u8>, vs: &[f32]) {
 }
 
 /// Append a text object drawing `glyphs` (2-byte glyph IDs, Identity-H).
-fn glyph_ops(ops: &mut Vec<u8>, face: FaceId, size: f32, x: f32, y: f32, c: Color, glyphs: &[u16]) {
+/// Kerning adjustments go into a `TJ` array, in thousandths of an em
+/// (positive values move the next glyph left).
+#[allow(clippy::too_many_arguments)]
+fn glyph_ops(
+    ops: &mut Vec<u8>,
+    face: FaceId,
+    size: f32,
+    x: f32,
+    y: f32,
+    c: Color,
+    glyphs: &[u16],
+    kerns: &[f32],
+) {
     ops.extend_from_slice(b"BT ");
     nums(ops, &[c.0, c.1, c.2]);
     let _ = write!(ops, "rg /F{face} ");
     num(ops, size);
     ops.extend_from_slice(b" Tf ");
     nums(ops, &[x, y]);
-    ops.extend_from_slice(b"Td <");
-    for g in glyphs {
+    if kerns.iter().all(|&k| k == 0.0) {
+        ops.extend_from_slice(b"Td <");
+        for g in glyphs {
+            let _ = write!(ops, "{g:04X}");
+        }
+        ops.extend_from_slice(b"> Tj ET\n");
+        return;
+    }
+    ops.extend_from_slice(b"Td [<");
+    for (i, g) in glyphs.iter().enumerate() {
+        if let Some(&k) = i.checked_sub(1).and_then(|p| kerns.get(p)).filter(|&&k| k != 0.0) {
+            ops.push(b'>');
+            num(ops, -k);
+            ops.push(b'<');
+        }
         let _ = write!(ops, "{g:04X}");
     }
-    ops.extend_from_slice(b"> Tj ET\n");
+    ops.extend_from_slice(b">] TJ ET\n");
 }
 
 /// Glyph runs for a piece of text: `(face, glyphs, width)`.
@@ -326,11 +355,36 @@ impl Layout<'_> {
         let w = self.fonts().width(face, gid, size);
         match runs.last_mut() {
             Some((f, g, width)) if *f == face => {
+                if let Some(&prev) = g.last() {
+                    *width += self.kern(face, prev, gid, size);
+                }
                 g.push(gid);
                 *width += w;
             }
             _ => runs.push((face, vec![gid], w)),
         }
+    }
+
+    /// Kerning between two glyphs of a face, in 1/1000 em.
+    fn kern_1000(&self, face: FaceId, left: u16, right: u16) -> f32 {
+        *self
+            .kern_cache
+            .borrow_mut()
+            .entry((face, left, right))
+            .or_insert_with(|| self.o.fonts.faces[face].kern_1000(left, right))
+    }
+
+    /// Kerning between two glyphs of a face, in points.
+    fn kern(&self, face: FaceId, left: u16, right: u16, size: f32) -> f32 {
+        self.kern_1000(face, left, right) * size / 1000.0
+    }
+
+    /// Kerning before each glyph after the first, for [`glyph_ops`].
+    fn kerns(&self, face: FaceId, glyphs: &[u16]) -> Vec<f32> {
+        glyphs
+            .windows(2)
+            .map(|p| self.kern_1000(face, p[0], p[1]))
+            .collect()
     }
 
     fn measure(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> f32 {
@@ -343,7 +397,8 @@ impl Layout<'_> {
     fn show_runs(&mut self, runs: &Runs, size: f32, x: f32, y: f32, c: Color) {
         let mut x = x;
         for (face, glyphs, w) in runs {
-            glyph_ops(&mut self.page().ops, *face, size, x, y, c, glyphs);
+            let kerns = self.kerns(*face, glyphs);
+            glyph_ops(&mut self.page().ops, *face, size, x, y, c, glyphs, &kerns);
             x += w;
         }
     }
@@ -445,6 +500,9 @@ impl Layout<'_> {
                                         && f.link == link
                                         && f.color == fcolor =>
                                 {
+                                    if let (Some(&l), Some(&r)) = (f.glyphs.last(), glyphs.first()) {
+                                        f.width += self.kern(face, l, r, fsize);
+                                    }
                                     f.glyphs.extend_from_slice(&glyphs);
                                     f.width += w;
                                 }
@@ -561,7 +619,10 @@ impl Layout<'_> {
                             let mut x = line.width;
                             let mut acc = 0.0;
                             for (k, &g) in f.glyphs.iter().enumerate() {
-                                let cw = self.fonts().width(f.face, g, f.size);
+                                let mut cw = self.fonts().width(f.face, g, f.size);
+                                if k > start {
+                                    cw += self.kern(f.face, f.glyphs[k - 1], g, f.size);
+                                }
                                 if x + acc + cw > max_w && (x + acc) > 0.0 {
                                     if k > start {
                                         let piece = Frag {
@@ -636,6 +697,7 @@ impl Layout<'_> {
         }
         for (fx, f) in &line.frags {
             let fx = x + fx;
+            let kerns = self.kerns(f.face, &f.glyphs);
             glyph_ops(
                 &mut self.page().ops,
                 f.face,
@@ -644,6 +706,7 @@ impl Layout<'_> {
                 baseline,
                 f.color,
                 &f.glyphs,
+                &kerns,
             );
             if f.strike {
                 let sy = baseline + f.size * 0.3;
@@ -925,6 +988,11 @@ impl Layout<'_> {
                     let chunk = chunks.last_mut().expect("chunks is never empty");
                     match chunk.last_mut() {
                         Some((f, gs, cw)) if *f == face => {
+                            if let Some(&prev) = gs.last() {
+                                let k = self.kern(face, prev, g, size);
+                                *cw += k;
+                                x += k;
+                            }
                             gs.push(g);
                             *cw += w;
                         }
@@ -1151,7 +1219,8 @@ impl Layout<'_> {
             let w: f32 = runs.iter().map(|r| r.2).sum();
             let mut x = (self.o.page_width - w) / 2.0;
             for (face, glyphs, gw) in &runs {
-                glyph_ops(&mut self.pages[i].ops, *face, size, x, y, MUTED, glyphs);
+                let kerns = self.kerns(*face, glyphs);
+                glyph_ops(&mut self.pages[i].ops, *face, size, x, y, MUTED, glyphs, &kerns);
                 x += gw;
             }
         }
