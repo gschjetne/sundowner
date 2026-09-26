@@ -59,6 +59,13 @@ impl Kerning {
     }
 
     /// Adjustment of the advance between `left` and `right`, in font units.
+    ///
+    /// As OpenType specifies, every lookup of the feature is applied in
+    /// lookup-list order and their adjustments accumulate (HarfBuzz does the
+    /// same); within one lookup only the first subtable that matches the
+    /// pair applies. Fonts that split kerning across lookups therefore get
+    /// the sum, and fonts with the same pair in several lookups get what the
+    /// font designer specified, not a single value.
     pub fn pair(&self, gpos: &[u8], gdef: &[u8], kern: &[u8], left: u16, right: u16) -> i32 {
         if let Some((off, n)) = self.legacy {
             return legacy_pair(kern, off, n, left, right).unwrap_or(0) as i32;
