@@ -95,7 +95,8 @@ fn decompose_full(c: char, out: &mut Vec<char>) {
 /// HarfBuzz's "modified combining class", by which it orders marks for
 /// shaping: the canonical combining class, except that Hebrew points are
 /// ordered the way fonts expect them (shin and sin dots first, then
-/// dagesh, rafe and the vowels, meteg last).
+/// dagesh, rafe and the vowels, meteg last), and Arabic shadda goes before
+/// the vowel marks.
 pub fn shaping_class(c: char) -> u8 {
     match ccc(c) {
         10 => 22, // sheva
@@ -114,6 +115,13 @@ pub fn shaping_class(c: char) -> u8 {
         23 => 13, // rafe
         24 => 10, // shin dot
         25 => 11, // sin dot
+        27 => 28, // fathatan
+        28 => 29, // dammatan
+        29 => 30, // kasratan
+        30 => 31, // fatha
+        31 => 32, // damma
+        32 => 33, // kasra
+        33 => 27, // shadda
         cc => cc,
     }
 }
@@ -149,6 +157,63 @@ fn reorder_hebrew(s: &mut [char]) {
             s.swap(i - 1, i);
             break;
         }
+    }
+}
+
+/// Arabic marks that modify the letter itself (hamza above and below,
+/// small high and low letters) rather than being vowels.
+fn modifier_mark(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x654
+            | 0x655
+            | 0x658
+            | 0x6DC
+            | 0x6E3
+            | 0x6E7
+            | 0x6E8
+            | 0x8CA
+            | 0x8CB
+            | 0x8CD
+            | 0x8CE
+            | 0x8CF
+            | 0x8D3
+            | 0x8F3
+    )
+}
+
+/// HarfBuzz's Arabic mark reordering, after sorting by [`shaping_class`]:
+/// modifier marks ([`modifier_mark`]) above or below go first, next to
+/// the letter they modify, so it can compose with them.
+fn reorder_arabic(s: &mut [char]) {
+    let Some(mut start) = s.iter().position(|&c| shaping_class(c) != 0) else {
+        return;
+    };
+    let end = s[start..]
+        .iter()
+        .position(|&c| shaping_class(c) == 0)
+        .map_or(s.len(), |k| start + k);
+    let mut i = start;
+    for cc in [220, 230] {
+        while i < end && shaping_class(s[i]) < cc {
+            i += 1;
+        }
+        if i == end {
+            break;
+        }
+        if shaping_class(s[i]) > cc {
+            continue;
+        }
+        let mut j = i;
+        while j < end && shaping_class(s[j]) == cc && modifier_mark(s[j]) {
+            j += 1;
+        }
+        if i == j {
+            continue;
+        }
+        s[start..j].rotate_right(j - i);
+        start += j - i;
+        i = j;
     }
 }
 
@@ -269,6 +334,7 @@ pub fn for_font(
         if run.len() <= MAX_REORDER + 1 {
             reorder(run, shaping_class);
             reorder_hebrew(run);
+            reorder_arabic(run);
         }
         let mut tail = out.split_off(start);
         recompose(&mut tail, true, hebrew_forms, shaping_class, &has);
@@ -361,6 +427,10 @@ mod tests {
             run("\u{5D0}\u{5B7}\u{5B0}\u{5BD}", &all).0,
             "\u{5D0}\u{5B7}\u{5BD}\u{5B0}"
         );
+        // Arabic: shadda before the vowel, and hamza above next to the
+        // alef, which composes with it: alef, fatha, hamza -> أ, fatha.
+        assert_eq!(run("\u{628}\u{64E}\u{651}", &all).0, "\u{628}\u{651}\u{64E}");
+        assert_eq!(run("\u{627}\u{64E}\u{654}", &all).0, "\u{623}\u{64E}");
         // Presentation forms only when asked for.
         let mut out = Vec::new();
         assert!(for_font(&s("\u{5E9}\u{5BC}\u{5C1}"), all, true, &mut out));

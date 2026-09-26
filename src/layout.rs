@@ -1,11 +1,12 @@
 //! Page layout: turns the parsed document into positioned text runs, rules,
 //! boxes and images on fixed-size pages.
 
+use crate::arabic;
 use crate::bidi;
 use crate::chars;
 use crate::fonts::{FaceId, Fonts};
 use crate::gpos::Attachment;
-use crate::gsub::{Glyph, Script};
+use crate::gsub::{mask, Glyph, Script};
 use crate::image::{self, Image};
 use crate::inline::{self, Inline, Style};
 use crate::linebreak::{self, Break};
@@ -461,6 +462,27 @@ fn glyph_ops(
     ops.extend_from_slice(b" ET\n");
 }
 
+/// Whether the text before and after a piece of text joins to it
+/// cursively (Arabic letters joined across a style change).
+#[derive(Clone, Copy, Default)]
+struct Joins {
+    before: bool,
+    after: bool,
+}
+
+impl Joins {
+    /// How `text[range]` joins to the rest of `text`.
+    fn of(text: &[char], range: std::ops::Range<usize>) -> Joins {
+        if !arabic::needs_joining(&text[range.clone()]) {
+            return Joins::default();
+        }
+        Joins {
+            before: arabic::neighbour(text, range.start, false).is_some_and(arabic::joins_forward),
+            after: arabic::neighbour(text, range.end, true).is_some_and(arabic::joins_backward),
+        }
+    }
+}
+
 /// Glyph runs for a piece of text: `(face, glyphs, width)`.
 type Runs = Vec<(FaceId, Vec<G>, f32)>;
 
@@ -497,15 +519,37 @@ impl Layout<'_> {
     /// gets mirrored characters (UAX #9 rule L4), such as `)` for `(`; its
     /// glyphs stay in logical order.
     fn shape_dir(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32, rtl: bool) -> Runs {
+        self.shape_joined(text, mono, bold, italic, size, rtl, Joins::default())
+    }
+
+    /// [`Layout::shape_dir`] for text that may be part of a longer run of
+    /// cursively joined (Arabic) text: `joins` says whether the text around
+    /// it joins to it.
+    #[allow(clippy::too_many_arguments)]
+    fn shape_joined(
+        &self,
+        text: &str,
+        mono: bool,
+        bold: bool,
+        italic: bool,
+        size: f32,
+        rtl: bool,
+        joins: Joins,
+    ) -> Runs {
         let key = (
             text.to_string(),
-            mono as u8 | (bold as u8) << 1 | (italic as u8) << 2 | (rtl as u8) << 3,
+            mono as u8
+                | (bold as u8) << 1
+                | (italic as u8) << 2
+                | (rtl as u8) << 3
+                | (joins.before as u8) << 4
+                | (joins.after as u8) << 5,
             size.to_bits(),
         );
         if let Some(runs) = self.shape_cache.borrow().get(&key) {
             return runs.clone();
         }
-        let runs = self.shape_uncached(text, mono, bold, italic, size, rtl);
+        let runs = self.shape_uncached(text, mono, bold, italic, size, rtl, joins);
         let mut cache = self.shape_cache.borrow_mut();
         if cache.len() >= SHAPE_CACHE_SIZE {
             cache.clear();
@@ -514,23 +558,97 @@ impl Layout<'_> {
         runs
     }
 
-    fn shape_uncached(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32, rtl: bool) -> Runs {
-        let chars: Vec<char> = text
-            .chars()
-            .filter(|&c| !chars::is_invisible(c))
-            .map(|c| if chars::is_space_like(c) { ' ' } else { c })
-            .map(|c| if rtl { bidi::mirror(c).unwrap_or(c) } else { c })
-            .collect();
+    #[allow(clippy::too_many_arguments)]
+    fn shape_uncached(
+        &self,
+        text: &str,
+        mono: bool,
+        bold: bool,
+        italic: bool,
+        size: f32,
+        rtl: bool,
+        joins: Joins,
+    ) -> Runs {
+        // The features each character gets: Arabic positional forms (from
+        // the text with its joiners and non-joiners, before they are
+        // dropped), and `rtlm` for right-to-left characters that were not
+        // mirrored.
+        let raw: Vec<char> = text.chars().collect();
+        let forms = if arabic::needs_joining(&raw) {
+            arabic::forms(&raw, joins.before, joins.after)
+        } else {
+            vec![0; raw.len()]
+        };
+        let mut chars = Vec::with_capacity(raw.len());
+        let mut masks = Vec::with_capacity(raw.len());
+        for (&c, form) in raw.iter().zip(forms) {
+            if chars::is_invisible(c) {
+                continue;
+            }
+            let c = if chars::is_space_like(c) { ' ' } else { c };
+            let mirrored = if rtl { bidi::mirror(c) } else { None };
+            chars.push(mirrored.unwrap_or(c));
+            let rtlm = if rtl && mirrored.is_none() { mask::RTLM } else { 0 };
+            masks.push(mask::GLOBAL | form | rtlm);
+        }
         // Each base character is resolved together with the combining marks
-        // that follow it, so they end up in one font.
+        // that follow it, so they end up in one font. The first item of a
+        // cluster gets its character's features.
+        //
+        // Punctuation, digits and other characters shared by all scripts
+        // take the font of the Hebrew, Arabic, Armenian or CJK text around
+        // them, if it has them (the text before them, or else after them),
+        // rather than the first font of the chain.
+        let own_font = |s: Option<Script>| {
+            matches!(
+                s,
+                Some(
+                    Script::Hebrew
+                        | Script::Arabic
+                        | Script::Armenian
+                        | Script::Han
+                        | Script::Kana
+                        | Script::Hangul
+                )
+            )
+        };
+        let mut context: Option<FaceId> = None;
+        // The next character with a script, from each position on.
+        let mut next_letter: Vec<Option<char>> = vec![None; chars.len() + 1];
+        for k in (0..chars.len()).rev() {
+            next_letter[k] = if Script::of(chars[k]).is_some() {
+                Some(chars[k])
+            } else {
+                next_letter[k + 1]
+            };
+        }
         let mut items: Vec<(FaceId, u16, char)> = Vec::new();
+        let mut item_masks: Vec<u16> = Vec::new();
         let mut i = 0;
         while i < chars.len() {
             let mut j = i + 1;
             while j < chars.len() && j - i <= MAX_CLUSTER && normalize::is_mark(chars[j]) {
                 j += 1;
             }
-            self.resolve_cluster(&chars[i..j], mono, bold, italic, &mut items);
+            let script = Script::of(chars[i]);
+            let preferred = match script {
+                _ if mono => None,
+                Some(_) => None,
+                None => context.or_else(|| {
+                    let next = next_letter[j]?;
+                    if !own_font(Script::of(next)) {
+                        return None;
+                    }
+                    self.fonts().resolve(next, mono, bold, italic).map(|r| r.0)
+                }),
+            };
+            let first = items.len();
+            self.resolve_cluster(&chars[i..j], mono, bold, italic, preferred, &mut items);
+            if script.is_some() {
+                context = own_font(script).then(|| items.get(first).map(|x| x.0)).flatten();
+            }
+            let rest = masks[i] & (mask::GLOBAL | mask::RTLM);
+            item_masks.extend((first..items.len()).map(|k| if k == first { masks[i] } else { rest }));
             i = j;
         }
         let mut runs = Vec::new();
@@ -549,7 +667,14 @@ impl Layout<'_> {
                 script = script.or(s);
                 end += 1;
             }
-            runs.push(self.shape_run(face, &items[start..end], script.unwrap_or(Script::Other), size));
+            runs.push(self.shape_run(
+                face,
+                &items[start..end],
+                &item_masks[start..end],
+                script.unwrap_or(Script::Other),
+                size,
+                rtl,
+            ));
             start = end;
         }
         runs
@@ -560,22 +685,33 @@ impl Layout<'_> {
     /// (composing marks into precomposed characters the font has, or
     /// decomposing characters it lacks), sets it; if none does, each
     /// character is resolved on its own.
+    ///
+    /// A `preferred` face is tried first.
     fn resolve_cluster(
         &self,
         cluster: &[char],
         mono: bool,
         bold: bool,
         italic: bool,
+        preferred: Option<FaceId>,
         items: &mut Vec<(FaceId, u16, char)>,
     ) {
+        let hebrew = cluster.iter().any(|&c| Script::of(c) == Some(Script::Hebrew));
+        let mut norm = Vec::new();
+        if let Some(face) = preferred {
+            let f = &self.fonts().faces[face];
+            let forms = hebrew && !f.positions_marks(Script::Hebrew);
+            if normalize::for_font(cluster, |c| f.glyph(c).is_some(), forms, &mut norm) {
+                items.extend(norm.iter().map(|&c| (face, f.glyph(c).unwrap_or(0), c)));
+                return;
+            }
+        }
         if let [c] = cluster {
             if let Some((face, gid)) = self.fonts().resolve(*c, mono, bold, italic) {
                 items.push((face, gid, *c));
                 return;
             }
         }
-        let mut norm = Vec::new();
-        let hebrew = cluster.iter().any(|&c| Script::of(c) == Some(Script::Hebrew));
         for face in self.fonts().candidates(mono, bold, italic) {
             let f = &self.fonts().faces[face];
             norm.clear();
@@ -623,21 +759,28 @@ impl Layout<'_> {
     }
 
     /// Substitute and position the glyphs of characters set in one face,
-    /// and record the text each resulting glyph stands for.
+    /// and record the text each resulting glyph stands for. Right-to-left
+    /// runs keep their glyphs in logical order, positioned as HarfBuzz
+    /// positions right-to-left text (see [`right_to_left`]).
     fn shape_run(
         &self,
         face: FaceId,
         items: &[(FaceId, u16, char)],
+        masks: &[u16],
         script: Script,
         size: f32,
+        rtl: bool,
     ) -> (FaceId, Vec<G>, f32) {
         let font = &self.fonts().faces[face];
         let mut glyphs: Vec<Glyph> = items
             .iter()
+            .zip(masks)
             .enumerate()
-            .map(|(k, &(_, id, _))| Glyph {
+            .map(|(k, (&(_, id, _), &mask))| Glyph {
                 id,
                 cluster: k as u32,
+                mask,
+                component: 0,
             })
             .collect();
         font.substitute(script, &mut glyphs);
@@ -676,6 +819,37 @@ impl Layout<'_> {
                 None => normalize::is_mark(source(g)),
             })
             .collect();
+        let fallback = || -> Vec<Option<Attachment>> {
+            let ids: Vec<u16> = glyphs.iter().map(|g| g.id).collect();
+            let classes: Vec<u8> = glyphs
+                .iter()
+                .map(|g| match source(g) {
+                    c if normalize::is_mark(c) => normalize::ccc(c),
+                    _ => 230,
+                })
+                .collect();
+            fallback_marks(font, &ids, &marks, &classes)
+        };
+        if rtl || font.needs_positioning(script) {
+            // Everything the font's GPOS table does, as HarfBuzz does it.
+            let ids: Vec<u16> = glyphs.iter().map(|g| g.id).collect();
+            let fallback = (marks.contains(&true) && !font.positions_marks(script)).then(fallback);
+            let components: Vec<u8> = glyphs.iter().map(|g| g.component).collect();
+            let pos = font.position(script, &ids, &components, &|k| marks[k], rtl, fallback.as_deref());
+            let scale = 1000.0 / font.units_per_em as f32;
+            let out: Vec<G> = ids
+                .iter()
+                .zip(pos)
+                .map(|(&id, p)| G {
+                    id,
+                    adv: p.x_advance as f32 * scale,
+                    dx: p.x_offset as f32 * scale,
+                    dy: p.y_offset as f32 * scale,
+                })
+                .collect();
+            let width = out.iter().map(|g| g.adv).sum::<f32>() * size / 1000.0;
+            return (face, out, width);
+        }
         let mut out: Vec<G> = glyphs
             .iter()
             .zip(&marks)
@@ -700,16 +874,10 @@ impl Layout<'_> {
         if marks.iter().any(|&m| m) {
             let ids: Vec<u16> = out.iter().map(|g| g.id).collect();
             let attachments = if font.positions_marks(script) {
-                font.attach_marks(script, &ids, &|k| marks[k])
+                let components: Vec<u8> = glyphs.iter().map(|g| g.component).collect();
+                font.attach_marks(script, &ids, &components, &|k| marks[k])
             } else {
-                let classes: Vec<u8> = glyphs
-                    .iter()
-                    .map(|g| match source(g) {
-                        c if normalize::is_mark(c) => normalize::ccc(c),
-                        _ => 230,
-                    })
-                    .collect();
-                fallback_marks(font, &ids, &marks, &classes)
+                fallback()
             };
             let scale = 1000.0 / font.units_per_em as f32;
             let mut pens = Vec::with_capacity(out.len());
@@ -747,10 +915,19 @@ impl Layout<'_> {
             return;
         }
         f.glyphs[b].adv += k;
-        // Marks after the base are placed relative to the pen, which the
-        // kerning just moved; keep them where they were.
-        for g in &mut f.glyphs[b + 1..] {
-            g.dx -= k;
+        if f.level % 2 == 1 {
+            // Right to left (see `right_to_left`), the glyph keeps its
+            // place and the next one moves; so do the marks after it.
+            f.glyphs[b].dx += k;
+            for g in &mut f.glyphs[b + 1..] {
+                g.dx += k;
+            }
+        } else {
+            // Marks after the base are placed relative to the pen, which
+            // the kerning just moved; keep them where they were.
+            for g in &mut f.glyphs[b + 1..] {
+                g.dx -= k;
+            }
         }
         f.width += k * f.size / 1000.0;
     }
@@ -794,7 +971,8 @@ impl Layout<'_> {
                 j += 1;
             }
             let seg: String = chars[i..j].iter().collect();
-            for (f, g, w) in self.shape_dir(&seg, mono, bold, italic, size, level % 2 == 1) {
+            let joins = Joins::of(&chars, i..j);
+            for (f, g, w) in self.shape_joined(&seg, mono, bold, italic, size, level % 2 == 1, joins) {
                 out.push((level, f, g, w));
             }
             i = j;
@@ -814,8 +992,7 @@ impl Layout<'_> {
                 if level % 2 == 0 {
                     return (face, glyphs, w);
                 }
-                let font = &self.o.fonts.faces[face];
-                (face, right_to_left(&glyphs, |g| font.advance_1000(g)), w)
+                (face, right_to_left(&glyphs), w)
             })
             .collect()
     }
@@ -1050,7 +1227,9 @@ impl Layout<'_> {
                     let seg: String = text[i..j].iter().collect();
                     let (mono, bold, italic) = (st.style.code, st.style.bold, st.style.italic);
                     let level = levels[i];
-                    for (face, glyphs, w) in self.shape_dir(&seg, mono, bold, italic, st.size, level % 2 == 1)
+                    let joins = Joins::of(&text, i..j);
+                    for (face, glyphs, w) in
+                        self.shape_joined(&seg, mono, bold, italic, st.size, level % 2 == 1, joins)
                     {
                         if glyphs.is_empty() {
                             continue;
@@ -1337,8 +1516,7 @@ impl Layout<'_> {
         for k in bidi::visual_order(&levels) {
             let Some(mut f) = slots[k].take() else { continue };
             if f.level % 2 == 1 {
-                let font = &self.o.fonts.faces[f.face];
-                f.glyphs = right_to_left(&f.glyphs, |g| font.advance_1000(g));
+                f.glyphs = right_to_left(&f.glyphs);
             }
             let w = f.width;
             out.push((x, f));
@@ -1880,60 +2058,12 @@ fn blocks_rtl(blocks: &[Block]) -> bool {
     first(blocks, &text_rtl) == Some(true)
 }
 
-/// Turn the glyphs of a right-to-left run from logical order, positioned as
-/// if the run were left-to-right, into visual order. Each base glyph gets
-/// the span it has in logical order, measured from the right end instead
-/// of the left, so kerning stays between the same glyphs; the marks after
-/// a base (glyphs without advance) keep their offsets from it. `natural`
-/// gives a glyph's advance without kerning.
-fn right_to_left(glyphs: &[G], natural: impl Fn(u16) -> f32) -> Vec<G> {
-    let total: f32 = glyphs.iter().map(|g| g.adv).sum();
-    let mut pens = Vec::with_capacity(glyphs.len());
-    let mut pen = 0.0;
-    for g in glyphs {
-        pens.push(pen);
-        pen += g.adv;
-    }
-    // Clusters of a base and its marks, and where each base goes.
-    let mut clusters = Vec::new();
-    let mut k = 0;
-    while k < glyphs.len() {
-        let start = k;
-        k += 1;
-        while k < glyphs.len() && glyphs[k].adv == 0.0 {
-            k += 1;
-        }
-        let base = &glyphs[start];
-        let width = if base.adv == 0.0 { 0.0 } else { natural(base.id) };
-        clusters.push((start..k, total - pens[start] - width));
-    }
-    clusters.reverse();
-    let mut out = Vec::with_capacity(glyphs.len());
-    let mut pen = 0.0;
-    for (c, (range, x)) in clusters.iter().enumerate() {
-        let next = clusters.get(c + 1).map_or(total, |n| n.1);
-        let b = range.start;
-        let base = glyphs[b];
-        let adv = next - pen;
-        out.push(G {
-            id: base.id,
-            adv,
-            dx: x + base.dx - pen,
-            dy: base.dy,
-        });
-        let after = pen + adv;
-        for m in b + 1..range.end {
-            let g = glyphs[m];
-            out.push(G {
-                id: g.id,
-                adv: 0.0,
-                dx: x + pens[m] - pens[b] + g.dx - after,
-                dy: g.dy,
-            });
-        }
-        pen = after;
-    }
-    out
+/// Put the glyphs of a right-to-left run, which are in logical order and
+/// positioned as HarfBuzz positions right-to-left text, into visual order.
+/// HarfBuzz's positions are made for exactly this: reversed, the glyphs
+/// are drawn left to right like any others.
+fn right_to_left(glyphs: &[G]) -> Vec<G> {
+    glyphs.iter().rev().copied().collect()
 }
 
 /// Place marks on their bases for a font without mark positioning data,
@@ -2080,30 +2210,6 @@ mod tests {
         assert!(acute[1] + a1.dy > base[3]);
         assert!(dia[1] + a2.dy > acute[3] + a1.dy);
         assert!(dot[3] + a3.dy < base[1]);
-    }
-
-    #[test]
-    fn right_to_left_runs_keep_kerning_and_marks() {
-        // Logical order: A (500 wide, kerned by -20 against B), a mark
-        // centred on A, then B (600 wide).
-        let g = |id, adv, dx| G { id, adv, dx, dy: 0.0 };
-        let logical = [g(1, 480.0, 0.0), g(2, 0.0, -250.0), g(3, 600.0, 0.0)];
-        let natural = |id: u16| if id == 1 { 500.0 } else { 600.0 };
-        let visual = right_to_left(&logical, natural);
-        // Drawn positions: pen plus offset.
-        let mut pen = 0.0;
-        let placed: Vec<(u16, f32)> = visual
-            .iter()
-            .map(|g| {
-                let at = (g.id, pen + g.dx);
-                pen += g.adv;
-                at
-            })
-            .collect();
-        // B on the left, A 20 closer to it than its width, the mark where it
-        // was relative to A; the total width is unchanged.
-        assert_eq!(placed, [(3, 0.0), (1, 580.0), (2, 810.0)]);
-        assert_eq!(pen, 1080.0);
     }
 
     #[test]

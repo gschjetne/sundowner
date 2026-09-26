@@ -1,9 +1,12 @@
 //! Glyph substitution from the OpenType GSUB table: ligatures, contextual
 //! alternates and the other substitutions a font applies by default.
 //!
-//! The features applied are those HarfBuzz enables by default for the
-//! scripts that need no script-specific shaping (Latin, Greek, Cyrillic,
-//! Armenian, Hebrew, Chinese, Japanese and Korean): `rvrn`, `ccmp`, `locl`, `rlig`, `liga`, `clig`,
+//! Arabic gets HarfBuzz's Arabic features in its stages, with the
+//! positional forms applied only to the letters in each form (see
+//! [`crate::arabic`] and [`mask`]). Other scripts get the features HarfBuzz
+//! enables by default for the scripts that need no script-specific shaping
+//! (Latin, Greek, Cyrillic, Armenian, Hebrew, Chinese, Japanese and
+//! Korean): `rvrn`, `ccmp`, `locl`, `rlig`, `liga`, `clig`,
 //! `calt` and `rclt`, taken from the default language system of the text's
 //! script. Their lookups are applied in lookup-list order, each one over the
 //! whole glyph sequence, as the OpenType specification prescribes. All
@@ -18,7 +21,7 @@
 //! can be mapped to glyphs. Work is bounded: malformed or hostile fonts can
 //! neither loop forever nor grow the glyph sequence without limit.
 
-use crate::otl::{self, coverage, u16_at, u32_at, Budget, Gdef, Scripts};
+use crate::otl::{self, coverage, u16_at, u32_at, Budget, Gdef, Rule, Scripts, Seq, Step};
 
 /// Features applied by default, in no particular order (lookup order decides).
 const FEATURES: [&[u8; 4]; 8] = [
@@ -42,6 +45,7 @@ pub enum Script {
     Han,
     Kana,
     Hangul,
+    Arabic,
     /// Anything else, including text without letters.
     Other,
 }
@@ -76,6 +80,17 @@ impl Script {
             0x1100..=0x11FF | 0x3131..=0x318E | 0xA960..=0xA97F | 0xAC00..=0xD7FF | 0xFFA0..=0xFFDC => {
                 Script::Hangul
             }
+            // Arabic letters and digits; its punctuation, tatweel and
+            // vowel marks are shared with other scripts.
+            0x600..=0x604 | 0x606..=0x60B | 0x60D..=0x61A | 0x61C..=0x61E | 0x620..=0x63F | 0x641..=0x64A => {
+                Script::Arabic
+            }
+            0x656..=0x66F | 0x671..=0x6DC | 0x6DE..=0x6FF | 0x750..=0x77F | 0x870..=0x88E | 0x890..=0x891 => {
+                Script::Arabic
+            }
+            0x897..=0x8E1 | 0x8E3..=0x8FF | 0xFB50..=0xFD3D | 0xFD40..=0xFDFF | 0xFE70..=0xFEFC => {
+                Script::Arabic
+            }
             _ => return None,
         })
     }
@@ -91,12 +106,13 @@ impl Script {
             Script::Han => &[b"hani", b"DFLT", b"dflt", b"latn"],
             Script::Kana => &[b"kana", b"DFLT", b"dflt", b"latn"],
             Script::Hangul => &[b"hang", b"DFLT", b"dflt", b"latn"],
+            Script::Arabic => &[b"arab", b"DFLT", b"dflt", b"latn"],
             Script::Other => &[b"DFLT", b"dflt", b"latn"],
         }
     }
 
     /// Every script, Latin first.
-    pub const ALL: [Script; 9] = [
+    pub const ALL: [Script; 10] = [
         Script::Latin,
         Script::Greek,
         Script::Cyrillic,
@@ -105,6 +121,7 @@ impl Script {
         Script::Han,
         Script::Kana,
         Script::Hangul,
+        Script::Arabic,
         Script::Other,
     ];
 
@@ -113,12 +130,51 @@ impl Script {
     }
 }
 
-/// A glyph and the index of the first character it stands for.
+/// A glyph, the index of the first character it stands for, and which
+/// features apply to it (a [`mask`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Glyph {
     pub id: u16,
     pub cluster: u32,
+    pub mask: u16,
+    /// For the glyphs a multiple substitution produced, their number in
+    /// that sequence (1, 2, ...); 0 for others. Marks attach to the first.
+    pub component: u8,
 }
+
+/// Feature masks: features that apply to some glyphs only, such as the
+/// Arabic positional forms, have their own bit; the others apply to every
+/// glyph with [`mask::GLOBAL`].
+pub mod mask {
+    pub const GLOBAL: u16 = 1;
+    /// Arabic isolated, final, medial and initial forms.
+    pub const ISOL: u16 = 2;
+    pub const FINA: u16 = 4;
+    pub const MEDI: u16 = 8;
+    pub const INIT: u16 = 16;
+    /// Right-to-left mirrored forms, for characters that were not mirrored
+    /// by character (they have no mirrored counterpart).
+    pub const RTLM: u16 = 32;
+}
+
+/// The features HarfBuzz applies to Arabic, in its stages: each stage's
+/// lookups are applied (in lookup order) before the next stage's.
+const ARABIC_STAGES: [&[(&[u8; 4], u16)]; 10] = [
+    &[(b"rvrn", mask::GLOBAL)],
+    &[(b"rtla", mask::GLOBAL), (b"rtlm", mask::RTLM)],
+    &[(b"ccmp", mask::GLOBAL), (b"locl", mask::GLOBAL)],
+    &[(b"isol", mask::ISOL)],
+    &[(b"fina", mask::FINA)],
+    &[(b"medi", mask::MEDI)],
+    &[(b"init", mask::INIT)],
+    &[(b"rlig", mask::GLOBAL)],
+    &[(b"rclt", mask::GLOBAL), (b"calt", mask::GLOBAL)],
+    &[
+        (b"liga", mask::GLOBAL),
+        (b"clig", mask::GLOBAL),
+        (b"mset", mask::GLOBAL),
+    ],
+];
 
 struct Lookup {
     kind: u16,
@@ -135,8 +191,9 @@ struct Lookup {
 #[derive(Default)]
 pub struct Gsub {
     lookups: Vec<Option<Lookup>>,
-    /// Lookup indices to apply, in order, per [`Script`].
-    plans: [Vec<u16>; Script::ALL.len()],
+    /// Lookups to apply, in order, per [`Script`], each with the mask of
+    /// the glyphs it applies to.
+    plans: [Vec<(u16, u16)>; Script::ALL.len()],
     gdef: Gdef,
 }
 
@@ -156,21 +213,20 @@ impl Gsub {
 
     fn try_parse(t: &[u8], num_glyphs: u16) -> Option<Gsub> {
         let mut budget = Budget(BUDGET);
-        let mut plans: [Vec<u16>; Script::ALL.len()] = Default::default();
+        let mut plans: [Vec<(u16, u16)>; Script::ALL.len()] = Default::default();
         // A malformed or budget-exhausting script section only loses that
         // script; Latin comes first so it survives problems in later ones.
         for s in Script::ALL {
-            plans[s.index()] =
-                otl::feature_lookups(t, Scripts::First(s.tags()), &FEATURES, &mut budget).unwrap_or_default();
+            plans[s.index()] = plan(t, s, &mut budget).unwrap_or_default();
         }
         let list = u16_at(t, 8)? as usize;
         let n = budget.take(u16_at(t, list)? as usize)?;
         let mut lookups: Vec<Option<Lookup>> =
             (0..n).map(|i| parse_lookup(t, list, i, &mut budget)).collect();
         for plan in &mut plans {
-            plan.retain(|&i| lookups.get(i as usize).is_some_and(Option::is_some));
+            plan.retain(|&(i, _)| lookups.get(i as usize).is_some_and(Option::is_some));
         }
-        let mut wanted: Vec<u16> = plans.iter().flatten().copied().collect();
+        let mut wanted: Vec<u16> = plans.iter().flatten().map(|p| p.0).collect();
         wanted.sort_unstable();
         wanted.dedup();
         for i in wanted {
@@ -208,11 +264,52 @@ impl Gsub {
         let len = cx.buf.len();
         cx.max_ops = len.saturating_mul(256).saturating_add(4096);
         cx.max_len = len.saturating_mul(16).saturating_add(64);
-        for &li in plan {
-            cx.apply_lookup(li);
+        for &(li, mask) in plan {
+            cx.apply_lookup(li, mask);
         }
         *glyphs = cx.buf;
     }
+}
+
+/// The lookups to apply for `script`, in order, with the mask of each.
+/// Scripts without script-specific shaping get all the default features in
+/// one stage; right-to-left ones add `rtla` and `rtlm`; Arabic gets the
+/// stages of [`ARABIC_STAGES`].
+fn plan(t: &[u8], script: Script, budget: &mut Budget) -> Option<Vec<(u16, u16)>> {
+    let scripts = Scripts::First(script.tags());
+    let lookups = |tag: &[u8; 4], budget: &mut Budget| {
+        otl::feature_lookups(t, Scripts::First(script.tags()), &[tag], budget)
+    };
+    let stages: &[&[(&[u8; 4], u16)]] = match script {
+        Script::Arabic => &ARABIC_STAGES,
+        Script::Hebrew => &[&[(b"rtla", mask::GLOBAL), (b"rtlm", mask::RTLM)]],
+        _ => &[],
+    };
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    if script != Script::Arabic {
+        // Everything in one stage.
+        out = otl::feature_lookups(t, scripts, &FEATURES, budget)?
+            .into_iter()
+            .map(|li| (li, mask::GLOBAL))
+            .collect();
+    }
+    for (k, stage) in stages.iter().enumerate() {
+        let start = if script == Script::Arabic || k > 0 {
+            out.len()
+        } else {
+            0
+        };
+        for &(tag, m) in stage.iter() {
+            for li in lookups(tag, budget)? {
+                match out[start..].iter_mut().find(|x| x.0 == li) {
+                    Some(x) => x.1 |= m,
+                    None => out.push((li, m)),
+                }
+            }
+        }
+        out[start..].sort_unstable_by_key(|x| x.0);
+    }
+    Some(out)
 }
 
 fn parse_lookup(t: &[u8], list: usize, i: usize, budget: &mut Budget) -> Option<Lookup> {
@@ -280,43 +377,6 @@ fn first_glyphs(t: &[u8], l: &Lookup, num_glyphs: u16, budget: &mut Budget) -> O
     Some(bits)
 }
 
-/// A sequence a contextual rule matches against: glyph IDs, classes of a
-/// class definition, or coverage tables (offsets relative to `base`).
-#[derive(Clone, Copy)]
-enum Seq {
-    Glyphs { at: usize, n: usize },
-    Classes { at: usize, n: usize, classes: usize },
-    Coverages { at: usize, n: usize, base: usize },
-}
-
-impl Seq {
-    fn len(&self) -> usize {
-        match *self {
-            Seq::Glyphs { n, .. } | Seq::Classes { n, .. } | Seq::Coverages { n, .. } => n,
-        }
-    }
-
-    fn matches(&self, t: &[u8], k: usize, g: u16) -> bool {
-        match *self {
-            Seq::Glyphs { at, .. } => u16_at(t, at + 2 * k) == Some(g),
-            Seq::Classes { at, classes, .. } => u16_at(t, at + 2 * k) == Some(otl::class_of(t, classes, g)),
-            Seq::Coverages { at, base, .. } => {
-                u16_at(t, at + 2 * k).is_some_and(|o| coverage(t, base + o as usize, g).is_some())
-            }
-        }
-    }
-}
-
-/// A contextual rule: what must precede, the rest of the input after the
-/// first glyph, what must follow, and the nested lookups to apply.
-struct Rule {
-    backtrack: Option<Seq>,
-    input: Seq,
-    lookahead: Option<Seq>,
-    records: usize,
-    nrecords: usize,
-}
-
 struct Ctx<'a> {
     t: &'a [u8],
     gdef_data: &'a [u8],
@@ -361,8 +421,9 @@ impl<'a> Ctx<'a> {
         self.ops <= self.max_ops
     }
 
-    /// Apply lookup `li` over the whole glyph sequence.
-    fn apply_lookup(&mut self, li: u16) {
+    /// Apply lookup `li` over the whole glyph sequence, starting only at
+    /// glyphs whose mask has a bit of `mask`.
+    fn apply_lookup(&mut self, li: u16, mask: u16) {
         let Some(l) = self.lookup(li) else { return };
         let starts = |g: u16| {
             l.first
@@ -372,7 +433,7 @@ impl<'a> Ctx<'a> {
         if l.kind == 8 {
             for i in (0..self.buf.len()).rev() {
                 let g = self.buf[i].id;
-                if starts(g) && !self.skips(l, g) && self.spend() {
+                if self.buf[i].mask & mask != 0 && starts(g) && !self.skips(l, g) && self.spend() {
                     self.reverse_chain(l, i);
                 }
             }
@@ -381,7 +442,7 @@ impl<'a> Ctx<'a> {
         let mut i = 0;
         while i < self.buf.len() {
             let g = self.buf[i].id;
-            if starts(g) && !self.skips(l, g) {
+            if self.buf[i].mask & mask != 0 && starts(g) && !self.skips(l, g) {
                 if !self.spend() {
                     return;
                 }
@@ -452,7 +513,7 @@ impl<'a> Ctx<'a> {
             return None;
         }
         let ids: Option<Vec<u16>> = (0..n).map(|k| u16_at(self.t, seq + 2 + 2 * k)).collect();
-        let cluster = self.buf[i].cluster;
+        let Glyph { cluster, mask, .. } = self.buf[i];
         if n == 0 {
             // Deleted: the characters go with the next glyph if there is no
             // previous one to carry them.
@@ -464,8 +525,23 @@ impl<'a> Ctx<'a> {
             }
             return Some(i);
         }
-        self.buf
-            .splice(i..=i, ids?.into_iter().map(|id| Glyph { id, cluster }));
+        let ids = ids?;
+        let component = |k: usize| {
+            if n > 1 {
+                (k + 1).min(u8::MAX as usize) as u8
+            } else {
+                0
+            }
+        };
+        self.buf.splice(
+            i..=i,
+            ids.into_iter().enumerate().map(|(k, id)| Glyph {
+                id,
+                cluster,
+                mask,
+                component: component(k),
+            }),
+        );
         Some(i + n)
     }
 
@@ -503,6 +579,7 @@ impl<'a> Ctx<'a> {
                 gl.cluster = cluster;
             }
             self.buf[i].id = id;
+            self.buf[i].component = 0;
             for &j in pos[1..].iter().rev() {
                 self.buf.remove(j);
             }
@@ -512,132 +589,15 @@ impl<'a> Ctx<'a> {
     }
 
     fn context(&mut self, l: &Lookup, st: usize, i: usize, g: u16, depth: usize) -> Option<usize> {
-        let t = self.t;
-        let chain = l.kind == 6;
-        let format = u16_at(t, st)?;
-        let rule_at = |r: usize, classes: Option<[usize; 3]>| -> Option<Rule> {
-            let seq = |at: usize, n: usize, which: usize| match classes {
-                Some(c) => Seq::Classes {
-                    at,
-                    n,
-                    classes: c[which],
-                },
-                None => Seq::Glyphs { at, n },
-            };
-            if chain {
-                let nb = u16_at(t, r)? as usize;
-                let ni = u16_at(t, r + 2 + 2 * nb)? as usize;
-                let at_i = r + 4 + 2 * nb;
-                let at_la = at_i + 2 * ni.checked_sub(1)?;
-                let nla = u16_at(t, at_la)? as usize;
-                let at_rec = at_la + 2 + 2 * nla;
-                Some(Rule {
-                    backtrack: Some(seq(r + 2, nb, 0)),
-                    input: seq(at_i, ni - 1, 1),
-                    lookahead: Some(seq(at_la + 2, nla, 2)),
-                    records: at_rec + 2,
-                    nrecords: u16_at(t, at_rec)? as usize,
-                })
+        otl::context_rules(self.t, st, l.kind == 6, g, |rule| {
+            if let Some(end) = self.try_rule(l, rule, i, depth) {
+                Step::Done(end)
+            } else if self.spend() {
+                Step::Next
             } else {
-                let ni = u16_at(t, r)? as usize;
-                let nrec = u16_at(t, r + 2)? as usize;
-                Some(Rule {
-                    backtrack: None,
-                    input: seq(r + 4, ni.checked_sub(1)?, 1),
-                    lookahead: None,
-                    records: r + 4 + 2 * (ni - 1),
-                    nrecords: nrec,
-                })
+                Step::Stop
             }
-        };
-        match format {
-            1 | 2 => {
-                let cov = coverage(t, st + u16_at(t, st + 2)? as usize, g)?;
-                let (classes, sets_at) = if format == 2 {
-                    let c = |o: usize| -> Option<usize> { Some(st + u16_at(t, st + o)? as usize) };
-                    if chain {
-                        (Some([c(4)?, c(6)?, c(8)?]), st + 10)
-                    } else {
-                        let cd = c(4)?;
-                        (Some([cd, cd, cd]), st + 6)
-                    }
-                } else {
-                    (None, st + 4)
-                };
-                let index = match classes {
-                    Some(c) => otl::class_of(t, c[1], g) as usize,
-                    None => cov,
-                };
-                if index >= u16_at(t, sets_at)? as usize {
-                    return None;
-                }
-                let set = match u16_at(t, sets_at + 2 + 2 * index)? {
-                    0 => return None,
-                    o => st + o as usize,
-                };
-                let n = u16_at(t, set)? as usize;
-                for k in 0..n {
-                    let Some(rule) = rule_at(set + u16_at(t, set + 2 + 2 * k)? as usize, classes) else {
-                        continue;
-                    };
-                    if let Some(end) = self.try_rule(l, &rule, i, depth) {
-                        return Some(end);
-                    }
-                    if !self.spend() {
-                        return None;
-                    }
-                }
-                None
-            }
-            3 => {
-                let rule = if chain {
-                    let nb = u16_at(t, st + 2)? as usize;
-                    let at_i = st + 4 + 2 * nb;
-                    let ni = u16_at(t, at_i)? as usize;
-                    let at_la = at_i + 2 + 2 * ni;
-                    let nla = u16_at(t, at_la)? as usize;
-                    let at_rec = at_la + 2 + 2 * nla;
-                    let first = u16_at(t, at_i + 2)? as usize;
-                    coverage(t, st + first, g)?;
-                    Rule {
-                        backtrack: Some(Seq::Coverages {
-                            at: st + 4,
-                            n: nb,
-                            base: st,
-                        }),
-                        input: Seq::Coverages {
-                            at: at_i + 4,
-                            n: ni.checked_sub(1)?,
-                            base: st,
-                        },
-                        lookahead: Some(Seq::Coverages {
-                            at: at_la + 2,
-                            n: nla,
-                            base: st,
-                        }),
-                        records: at_rec + 2,
-                        nrecords: u16_at(t, at_rec)? as usize,
-                    }
-                } else {
-                    let ni = u16_at(t, st + 2)? as usize;
-                    let nrec = u16_at(t, st + 4)? as usize;
-                    coverage(t, st + u16_at(t, st + 6)? as usize, g)?;
-                    Rule {
-                        backtrack: None,
-                        input: Seq::Coverages {
-                            at: st + 8,
-                            n: ni.checked_sub(1)?,
-                            base: st,
-                        },
-                        lookahead: None,
-                        records: st + 6 + 2 * ni,
-                        nrecords: nrec,
-                    }
-                };
-                self.try_rule(l, &rule, i, depth)
-            }
-            _ => None,
-        }
+        })
     }
 
     /// Match `rule` with its first input glyph at `i`; if it matches, apply
@@ -878,6 +838,8 @@ mod tests {
             .map(|(k, &id)| Glyph {
                 id,
                 cluster: k as u32,
+                mask: crate::gsub::mask::GLOBAL,
+                component: 0,
             })
             .collect();
         g.apply(t, gdef, Script::Latin, &mut buf);

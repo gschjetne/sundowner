@@ -1,6 +1,7 @@
 //! sundowner: a dependency-free Markdown to PDF converter.
 #![forbid(unsafe_code)]
 
+pub mod arabic;
 pub mod bidi;
 pub mod bidi_table;
 pub mod chars;
@@ -20,6 +21,7 @@ pub mod normalize;
 pub mod normalize_table;
 pub mod otl;
 pub mod pdf;
+pub mod position;
 pub mod ttf;
 
 pub use layout::Options;

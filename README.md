@@ -16,19 +16,23 @@ sundowner comes in two builds, which differ only in the fonts they bundle:
 | Build | Scripts | Size |
 |-------|---------|------|
 | **europa** (default) | Latin, Greek, Cyrillic: the alphabets on euro banknotes | 3.2 MB |
-| **silk** (`--features silk`) | also Hebrew, Armenian, Chinese, Japanese and Korean: the scripts along the Silk Road | 27 MB |
+| **silk** (`--features silk`) | also Hebrew, Arabic, Armenian, Chinese, Japanese and Korean: the scripts along the Silk Road | 28 MB |
 
 The silk build adds fonts in the same humanist, broad-nib spirit as
 Alegreya, as far as each writing system has one:
 [Frank Ruhl Libre](https://github.com/fontef/frankruhllibre) for Hebrew
 (with [Noto Serif Hebrew](https://github.com/notofonts/hebrew) for
 cantillation marks, which Frank Ruhl Libre lacks),
+[Amiri](https://github.com/aliftype/amiri), a revival of the Naskh of the
+Bulaq press, for Arabic (and Persian, Urdu and other languages written in
+Arabic script),
 [Noto Serif Armenian](https://github.com/notofonts/armenian),
 [Noto Serif SC](https://github.com/notofonts/noto-cjk), a Song/Mincho
 face, for Chinese characters and Japanese kana, and
 [Gowun Batang](https://github.com/yangheeryu/Gowun-Batang), a
-brush-inspired Batang, for Korean. They have regular and bold weights; as
-these scripts have no italics, italic text uses the upright font. The
+brush-inspired Batang, for Korean. Amiri has regular, bold, italic and
+bold italic; the others have regular and bold, and italic text uses the
+upright font, as these scripts have no italics. The
 silk fonts are stored compressed and only unpacked when a document uses
 them, so documents in the europa scripts are as fast, and come out the
 same, with either build.
@@ -108,14 +112,15 @@ regular = fonts/NotoEmoji-Regular.ttf
   that has a glyph for it:
   - body text: `[body]`, then the `[fallback]` fonts, then the bundled fonts:
     Alegreya, (silk: Frank Ruhl Libre, Noto Serif Hebrew, Noto Serif
-    Armenian), Cousine, (silk: Noto Serif SC, Gowun Batang)
+    Armenian), Cousine, (silk: Amiri, Noto Serif SC, Gowun Batang)
   - code: `[mono]`, then the `[fallback]` fonts, then the body font, then
     the bundled fonts
 
-  Characters that fonts share, such as spaces and punctuation, therefore
-  come from the first font: in the silk build, Chinese text gets its
-  spaces and Western punctuation from Alegreya, while ideographic
-  punctuation (`。`, `、`, `「」`) comes from Noto Serif SC.
+  Characters that all scripts share, such as punctuation and digits, come
+  from the font of the Hebrew, Arabic, Armenian or CJK text they follow
+  (or else precede) if it has them, as browsers do; otherwise, and next
+  to Latin, Greek or Cyrillic text, from the first font. Spaces always
+  come from the first font.
 
   Characters that no font covers are drawn as the font's empty box, and a
   warning lists them.
@@ -180,11 +185,23 @@ and `#anchor` links become clickable; other links are shown as plain text.
   as the algorithm prescribes. Code blocks are left-to-right, with
   right-to-left parts reordered. Table columns keep their order; cells
   without an explicit alignment follow their text's direction.
+- **Arabic shaping.** Letters join as the Unicode Standard's cursive
+  joining model prescribes (from the joining types of the Unicode
+  Character Database), across vowel marks and changes of style, with the
+  zero-width joiner and non-joiner honoured. The font's GSUB features are
+  applied in HarfBuzz's stages for Arabic: `rtla` and `rtlm`, `ccmp` and
+  `locl`, then the positional forms `isol`, `fina`, `medi` and `init`,
+  each only to the letters in that form, then `rlig`, `calt` and `rclt`,
+  and `liga`, `clig` and `mset`. Marks are ordered as HarfBuzz orders
+  them (shadda before the vowels, hamza next to its letter). With Amiri,
+  glyphs and positions match HarfBuzz, in all four styles, for Arabic,
+  Persian, Urdu and fully vocalized Quranic text.
 - **Ligatures and contextual forms.** Glyph substitutions come from the
   font's OpenType GSUB table, with the features HarfBuzz applies by default
   to scripts without script-specific shaping (Latin, Greek, Cyrillic,
-  Armenian, Hebrew, Chinese, Japanese and Korean): `ccmp`, `locl`, `rlig`, `liga`, `clig`,
-  `calt`, `rclt` and `rvrn`, from the language system of the text's script.
+  Armenian, Hebrew, Chinese, Japanese and Korean): `ccmp`, `locl`, `rlig`,
+  `liga`, `clig`, `calt`, `rclt` and `rvrn` (and `rtla` and `rtlm` for
+  Hebrew), from the language system of the text's script.
   All GSUB lookup types are supported, including chained contextual and
   reverse chained substitutions, along with the lookup flags that skip
   marks or ligatures. For the bundled fonts the result matches HarfBuzz
@@ -213,6 +230,12 @@ and `#anchor` links become clickable; other links are shown as plain text.
   measuring text, so line breaks account for it. It applies to text in one
   font, not across spaces or font changes. As the OpenType spec prescribes,
   adjustments from all of the font's kerning lookups add up.
+- **Glyph positioning.** Right-to-left text, and text in fonts that use
+  more than pair kerning and mark attachment for its script, is positioned
+  with all of the GPOS table as HarfBuzz applies it: single and pair
+  adjustment, cursive attachment (which connects Arabic letters), mark
+  attachment and contextual and chained contextual positioning, from the
+  `kern`, `mark`, `mkmk`, `curs`, `dist`, `abvm` and `blwm` features.
 - **Line breaking** follows the Unicode Line Breaking Algorithm
   ([UAX #14](https://www.unicode.org/reports/tr14/), Unicode 17.0) in full,
   and passes its official conformance test. Lines break at spaces, after
@@ -251,12 +274,13 @@ and `#anchor` links become clickable; other links are shown as plain text.
 
 ## Limitations
 
-- **No script-specific shaping.** Ligatures, contextual forms, combining
-  marks and right-to-left layout are handled (see above), but there is no
-  contextual positioning (GPOS lookup types 7 and 8) and none of the
-  shaping that Arabic, Syriac, the Indic scripts, Thai or Mongolian need.
-  Latin, Greek, Cyrillic, Armenian, Hebrew and CJK render correctly.
-  Arabic is next.
+- **Scripts.** Latin, Greek, Cyrillic, Armenian, Hebrew, Arabic and CJK
+  render correctly. There is none of the shaping that Syriac, N'Ko, the
+  Indic scripts, Thai or Mongolian need. Arabic text is not justified by
+  stretching (kashida), and letters do not take language-specific forms
+  (such as Urdu's or Sindhi's), as Markdown does not say which language
+  text is in. Fonts without OpenType Arabic features are not shaped from
+  the presentation forms.
 - **One style of Chinese characters.** The silk build bundles one Han
   font, Noto Serif SC, which covers all of CJK Unified Ideographs and
   Extension A (but little of Extension B and later), so Japanese and

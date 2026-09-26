@@ -9,8 +9,8 @@ Versions may keep their names; they remain under the OFL. Fonts published
 as static files are copied byte-for-byte.
 
 The fonts directly in fonts/ are the base set, built into every binary.
-fonts/silk/ holds the fonts of the `silk` tier (Hebrew, Armenian, Chinese,
-Japanese and Korean), built in with `cargo build --features silk`.
+fonts/silk/ holds the fonts of the `silk` tier (Hebrew, Arabic, Armenian,
+Chinese, Japanese and Korean), built in with `cargo build --features silk`.
 
 Usage: pip install fonttools==4.66.0 && python3 fonts/build.py
 """
@@ -55,7 +55,7 @@ for style in ["Regular", "Bold", "Italic", "BoldItalic"]:
     (OUT / f"Cousine-{style}.ttf").write_bytes(fetch(f"cousine/Cousine-{style}.ttf"))
 (OUT / "OFL-Cousine.txt").write_bytes(fetch("cousine/OFL.txt"))
 
-# Silk tier: Hebrew, Armenian, Chinese, Japanese and Korean.
+# Silk tier: Hebrew, Arabic, Armenian, Chinese, Japanese and Korean.
 SILK.mkdir(exist_ok=True)
 for family, src, width in [
     ("FrankRuhlLibre", "frankruhllibre/FrankRuhlLibre%5Bwght%5D.ttf", None),
@@ -70,6 +70,10 @@ for family, src, width in [
 for style in ["Regular", "Bold"]:
     (SILK / f"GowunBatang-{style}.ttf").write_bytes(fetch(f"gowunbatang/GowunBatang-{style}.ttf"))
 (SILK / "OFL-GowunBatang.txt").write_bytes(fetch("gowunbatang/OFL.txt"))
+
+for style in ["Regular", "Bold", "Italic", "BoldItalic"]:
+    (SILK / f"Amiri-{style}.ttf").write_bytes(fetch(f"amiri/Amiri-{style}.ttf"))
+(SILK / "OFL-Amiri.txt").write_bytes(fetch("amiri/OFL.txt"))
 
 for f in sorted(OUT.glob("*.ttf")) + sorted(SILK.glob("*.ttf")):
     print(hashlib.sha256(f.read_bytes()).hexdigest(), f.relative_to(OUT))

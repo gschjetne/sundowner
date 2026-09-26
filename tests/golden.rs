@@ -491,3 +491,44 @@ fn silk_sets_each_script_in_its_family() {
 fn name_of(out: &Output, run: &Run) -> String {
     out.fonts.faces[run.face].postscript_name.clone()
 }
+
+/// Arabic is set in Amiri, in all four styles, with its letters joined,
+/// also across a change of style, and with the punctuation around it.
+#[cfg(feature = "silk")]
+#[test]
+fn arabic_is_joined_and_set_in_amiri() {
+    let out = render("كتب **كتب** *كتب* ***كتب***");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let r = runs(&out, 0);
+    let mut names: Vec<String> = r
+        .iter()
+        .filter(|x| x.text == logical("كتب"))
+        .map(|x| name_of(&out, x))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["Amiri-Bold", "Amiri-BoldItalic", "Amiri-Italic", "Amiri-Regular"]
+    );
+    // Joined: none of the letters is drawn with its isolated glyph.
+    let word = r.iter().find(|x| name_of(&out, x) == "Amiri-Regular").unwrap();
+    let face = &out.fonts.faces[word.face];
+    for c in "كتب".chars() {
+        let nominal = face.glyph(c).unwrap();
+        assert!(!out.used[word.face].contains_key(&nominal), "{c} is not joined");
+    }
+    // A bold last letter still joins to the regular ones before it: it
+    // is drawn in its final form, not the isolated one.
+    let out = render("كت**ب** ب");
+    let r = runs(&out, 0);
+    let bold = r.iter().find(|x| name_of(&out, x) == "Amiri-Bold").unwrap();
+    let isolated = out.fonts.faces[bold.face].glyph('ب').unwrap();
+    assert!(!out.used[bold.face].contains_key(&isolated));
+    // Punctuation next to Arabic comes from Amiri, not Alegreya.
+    let out = render("مرحبا.");
+    let r = runs(&out, 0);
+    assert!(r.iter().all(|x| name_of(&out, x) == "Amiri-Regular"), "{r:?}");
+    // Right to left and flush right, with Arabic-Indic digits left to right.
+    let l = lines(&render("العدد ١٢٣"))[0].replace(' ', "");
+    assert_eq!(l, format!("١٢٣{}", logical("العدد")));
+}

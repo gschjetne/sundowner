@@ -231,6 +231,196 @@ pub fn feature_lookups(
     Some(lookups)
 }
 
+/// A sequence a contextual rule matches against: glyph IDs, classes of a
+/// class definition, or coverage tables (offsets relative to `base`).
+#[derive(Clone, Copy)]
+pub enum Seq {
+    Glyphs { at: usize, n: usize },
+    Classes { at: usize, n: usize, classes: usize },
+    Coverages { at: usize, n: usize, base: usize },
+}
+
+impl Seq {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> usize {
+        match *self {
+            Seq::Glyphs { n, .. } | Seq::Classes { n, .. } | Seq::Coverages { n, .. } => n,
+        }
+    }
+
+    pub fn matches(&self, t: &[u8], k: usize, g: u16) -> bool {
+        match *self {
+            Seq::Glyphs { at, .. } => u16_at(t, at + 2 * k) == Some(g),
+            Seq::Classes { at, classes, .. } => u16_at(t, at + 2 * k) == Some(class_of(t, classes, g)),
+            Seq::Coverages { at, base, .. } => {
+                u16_at(t, at + 2 * k).is_some_and(|o| coverage(t, base + o as usize, g).is_some())
+            }
+        }
+    }
+}
+
+/// A contextual rule: what must precede, the rest of the input after the
+/// first glyph, what must follow, and the nested lookups to apply.
+pub struct Rule {
+    pub backtrack: Option<Seq>,
+    pub input: Seq,
+    pub lookahead: Option<Seq>,
+    /// Offset and number of the SequenceLookupRecords.
+    pub records: usize,
+    pub nrecords: usize,
+}
+
+/// What to do after trying a contextual rule.
+pub enum Step<R> {
+    /// The rule matched; this is the result.
+    Done(R),
+    /// Try the next rule.
+    Next,
+    /// Give up on the subtable.
+    Stop,
+}
+
+/// Try the rules of a contextual (`chain` false) or chained contextual
+/// subtable at `st` of GSUB or GPOS table `t` (all three formats) for a
+/// first input glyph `g`, in order, until `f` is done with one.
+pub fn context_rules<R>(
+    t: &[u8],
+    st: usize,
+    chain: bool,
+    g: u16,
+    mut f: impl FnMut(&Rule) -> Step<R>,
+) -> Option<R> {
+    let format = u16_at(t, st)?;
+    let rule_at = |r: usize, classes: Option<[usize; 3]>| -> Option<Rule> {
+        let seq = |at: usize, n: usize, which: usize| match classes {
+            Some(c) => Seq::Classes {
+                at,
+                n,
+                classes: c[which],
+            },
+            None => Seq::Glyphs { at, n },
+        };
+        if chain {
+            let nb = u16_at(t, r)? as usize;
+            let ni = u16_at(t, r + 2 + 2 * nb)? as usize;
+            let at_i = r + 4 + 2 * nb;
+            let at_la = at_i + 2 * ni.checked_sub(1)?;
+            let nla = u16_at(t, at_la)? as usize;
+            let at_rec = at_la + 2 + 2 * nla;
+            Some(Rule {
+                backtrack: Some(seq(r + 2, nb, 0)),
+                input: seq(at_i, ni - 1, 1),
+                lookahead: Some(seq(at_la + 2, nla, 2)),
+                records: at_rec + 2,
+                nrecords: u16_at(t, at_rec)? as usize,
+            })
+        } else {
+            let ni = u16_at(t, r)? as usize;
+            let nrec = u16_at(t, r + 2)? as usize;
+            Some(Rule {
+                backtrack: None,
+                input: seq(r + 4, ni.checked_sub(1)?, 1),
+                lookahead: None,
+                records: r + 4 + 2 * (ni - 1),
+                nrecords: nrec,
+            })
+        }
+    };
+    match format {
+        1 | 2 => {
+            let cov = coverage(t, st + u16_at(t, st + 2)? as usize, g)?;
+            let (classes, sets_at) = if format == 2 {
+                let c = |o: usize| -> Option<usize> { Some(st + u16_at(t, st + o)? as usize) };
+                if chain {
+                    (Some([c(4)?, c(6)?, c(8)?]), st + 10)
+                } else {
+                    let cd = c(4)?;
+                    (Some([cd, cd, cd]), st + 6)
+                }
+            } else {
+                (None, st + 4)
+            };
+            let index = match classes {
+                Some(c) => class_of(t, c[1], g) as usize,
+                None => cov,
+            };
+            if index >= u16_at(t, sets_at)? as usize {
+                return None;
+            }
+            let set = match u16_at(t, sets_at + 2 + 2 * index)? {
+                0 => return None,
+                o => st + o as usize,
+            };
+            let n = u16_at(t, set)? as usize;
+            for k in 0..n {
+                let Some(rule) = rule_at(set + u16_at(t, set + 2 + 2 * k)? as usize, classes) else {
+                    continue;
+                };
+                match f(&rule) {
+                    Step::Done(r) => return Some(r),
+                    Step::Next => {}
+                    Step::Stop => return None,
+                }
+            }
+            None
+        }
+        3 => {
+            let rule = if chain {
+                let nb = u16_at(t, st + 2)? as usize;
+                let at_i = st + 4 + 2 * nb;
+                let ni = u16_at(t, at_i)? as usize;
+                let at_la = at_i + 2 + 2 * ni;
+                let nla = u16_at(t, at_la)? as usize;
+                let at_rec = at_la + 2 + 2 * nla;
+                let first = u16_at(t, at_i + 2)? as usize;
+                coverage(t, st + first, g)?;
+                Rule {
+                    backtrack: Some(Seq::Coverages {
+                        at: st + 4,
+                        n: nb,
+                        base: st,
+                    }),
+                    input: Seq::Coverages {
+                        at: at_i + 4,
+                        n: ni.checked_sub(1)?,
+                        base: st,
+                    },
+                    lookahead: Some(Seq::Coverages {
+                        at: at_la + 2,
+                        n: nla,
+                        base: st,
+                    }),
+                    records: at_rec + 2,
+                    nrecords: u16_at(t, at_rec)? as usize,
+                }
+            } else {
+                let ni = u16_at(t, st + 2)? as usize;
+                let nrec = u16_at(t, st + 4)? as usize;
+                coverage(t, st + u16_at(t, st + 6)? as usize, g)?;
+                Rule {
+                    backtrack: None,
+                    input: Seq::Coverages {
+                        at: st + 8,
+                        n: ni.checked_sub(1)?,
+                        base: st,
+                    },
+                    lookahead: None,
+                    records: st + 6 + 2 * ni,
+                    nrecords: nrec,
+                }
+            };
+            match f(&rule) {
+                Step::Done(r) => Some(r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Glyph properties from the GDEF table.
 #[derive(Default)]
 pub struct Gdef {

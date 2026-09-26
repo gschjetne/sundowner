@@ -48,8 +48,8 @@ const TIER: &str = "This is the europa build: Latin, Greek and Cyrillic.\n";
 #[cfg(feature = "silk")]
 const TIER: &str = "\
 This is the silk build, which also bundles Frank Ruhl Libre and Noto Serif
-Hebrew for Hebrew, Noto Serif Armenian for Armenian, Noto Serif SC for
-Chinese and Japanese, and Gowun Batang for Korean.
+Hebrew for Hebrew, Amiri for Arabic, Noto Serif Armenian for Armenian, Noto
+Serif SC for Chinese and Japanese, and Gowun Batang for Korean.
 ";
 
 const MM: f32 = 72.0 / 25.4;
