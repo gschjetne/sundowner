@@ -5,11 +5,15 @@ pub mod chars;
 pub mod config;
 pub mod flate;
 pub mod fonts;
+pub mod gsub;
 pub mod image;
 pub mod inline;
 pub mod kern;
 pub mod layout;
+pub mod linebreak;
+pub mod linebreak_table;
 pub mod markdown;
+pub mod otl;
 pub mod pdf;
 pub mod ttf;
 

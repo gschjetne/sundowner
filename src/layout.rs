@@ -3,8 +3,10 @@
 
 use crate::chars;
 use crate::fonts::{FaceId, Fonts};
+use crate::gsub::{Glyph, Script};
 use crate::image::{self, Image};
 use crate::inline::{self, Inline, Style};
+use crate::linebreak::{self, Break};
 use crate::markdown::{Align, Block, Document};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -14,6 +16,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 const LINE_SPACING: f32 = 1.4;
+/// Longest run of characters shaped as one unit.
+const MAX_RUN: usize = 1024;
+/// Most entries kept in the shaping cache.
+const SHAPE_CACHE_SIZE: usize = 20_000;
 const TEXT: Color = (0.11, 0.11, 0.12);
 const MUTED: Color = (0.4, 0.4, 0.43);
 const LINK: Color = (0.02, 0.35, 0.75);
@@ -65,11 +71,91 @@ struct Frag {
     link: Option<Rc<str>>,
 }
 
+impl Frag {
+    /// Whether glyphs in `face` and style `st` can be appended to this frag.
+    fn same_run(&self, face: FaceId, st: &TextStyle) -> bool {
+        !self.glyphs.is_empty()
+            && self.face == face
+            && self.size == st.size
+            && self.code == st.style.code
+            && self.strike == st.style.strike
+            && self.link == st.link
+            && self.color == st.color
+    }
+
+    /// Whether `next` can be drawn as a continuation of this frag.
+    fn joins(&self, next: &Frag) -> bool {
+        !self.glyphs.is_empty()
+            && !next.glyphs.is_empty()
+            && self.face == next.face
+            && self.size == next.size
+            && self.code == next.code
+            && self.strike == next.strike
+            && self.link == next.link
+            && self.color == next.color
+    }
+}
+
+/// How a piece of inline text is set.
+struct TextStyle {
+    style: Style,
+    size: f32,
+    color: Color,
+    link: Option<Rc<str>>,
+    /// Width of a space.
+    space: f32,
+}
+
+impl TextStyle {
+    fn frag(&self, glyphs: Vec<u16>, width: f32, face: FaceId) -> Frag {
+        Frag {
+            face,
+            size: self.size,
+            glyphs,
+            width,
+            color: self.color,
+            code: self.style.code,
+            strike: self.style.strike,
+            link: self.link.clone(),
+        }
+    }
+}
+
+/// What a character of a paragraph is (the index is its [`TextStyle`] or
+/// image).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Text(usize),
+    Space(usize),
+    Break,
+    Image(usize),
+}
+
+/// Text between two line break opportunities. It may contain spaces
+/// where the line must not break (as gaps: frags without glyphs).
+#[derive(Default)]
+struct Word {
+    frags: Vec<Frag>,
+    /// A hyphen to show if the line breaks after this word (it ends with a
+    /// soft hyphen).
+    hyphen: Option<Frag>,
+}
+
+impl Word {
+    fn width(&self) -> f32 {
+        self.frags.iter().map(|f| f.width).sum()
+    }
+}
+
 enum Tok {
-    Word(Vec<Frag>),
+    /// A line may break between two consecutive words, and after a space.
+    Word(Word),
     Space(f32),
     Break,
-    Image { alt: String, src: String },
+    Image {
+        alt: String,
+        src: String,
+    },
 }
 
 #[derive(Default)]
@@ -115,9 +201,11 @@ pub struct Output {
     pub title: Option<String>,
     pub warnings: Vec<String>,
     pub fonts: Arc<Fonts>,
-    /// Glyphs used per face (index = [`FaceId`]), with the character each
-    /// glyph represents, for font subsetting and the ToUnicode map.
-    pub used: Vec<BTreeMap<u16, char>>,
+    /// Glyphs used per face (index = [`FaceId`]), with the text each glyph
+    /// represents (several characters for a ligature, empty for the second
+    /// and later glyphs of a character), for font subsetting and the
+    /// ToUnicode map.
+    pub used: Vec<BTreeMap<u16, String>>,
 }
 
 enum MarkerKind {
@@ -156,11 +244,14 @@ struct Layout<'a> {
     anchors: HashMap<String, (usize, f32)>,
     slug_counts: HashMap<String, usize>,
     warnings: Vec<String>,
-    used: RefCell<Vec<BTreeMap<u16, char>>>,
+    used: RefCell<Vec<BTreeMap<u16, String>>>,
     missing: RefCell<BTreeSet<char>>,
     /// Kerning per glyph pair in 1/1000 em. Text repeats the same pairs
     /// constantly, so this avoids most GPOS lookups.
     kern_cache: RefCell<HashMap<(FaceId, u16, u16), f32>>,
+    /// Shaped text by (text, style bits, size). Documents repeat the same
+    /// words constantly, so this avoids most shaping work.
+    shape_cache: RefCell<HashMap<(String, u8, u32), Runs>>,
 }
 
 pub fn layout(doc: &Document, o: &Options) -> Output {
@@ -182,6 +273,7 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         used: RefCell::new(vec![BTreeMap::new(); o.fonts.faces.len()]),
         missing: RefCell::new(BTreeSet::new()),
         kern_cache: RefCell::new(HashMap::new()),
+        shape_cache: RefCell::new(HashMap::new()),
     };
     let ctx = Ctx {
         x: o.margin,
@@ -312,57 +404,135 @@ impl Layout<'_> {
     }
 
     /// Map text to glyphs, choosing a font per character from the fallback
-    /// chain. Consecutive glyphs from the same face form one run.
+    /// chain, then applying each font's glyph substitutions (ligatures,
+    /// contextual alternates) to the runs of consecutive characters set in
+    /// the same font and script.
     fn shape(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> Runs {
-        let mut runs = Vec::new();
+        let key = (
+            text.to_string(),
+            mono as u8 | (bold as u8) << 1 | (italic as u8) << 2,
+            size.to_bits(),
+        );
+        if let Some(runs) = self.shape_cache.borrow().get(&key) {
+            return runs.clone();
+        }
+        let runs = self.shape_uncached(text, mono, bold, italic, size);
+        let mut cache = self.shape_cache.borrow_mut();
+        if cache.len() >= SHAPE_CACHE_SIZE {
+            cache.clear();
+        }
+        cache.insert(key, runs.clone());
+        runs
+    }
+
+    fn shape_uncached(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> Runs {
+        let mut items: Vec<(FaceId, u16, char)> = Vec::new();
         for c in text.chars() {
-            self.shape_char(c, mono, bold, italic, size, &mut runs, true);
+            self.resolve_char(c, mono, bold, italic, &mut items, true);
+        }
+        let mut runs = Vec::new();
+        let mut start = 0;
+        while start < items.len() {
+            let face = items[start].0;
+            let mut script = None;
+            let mut end = start;
+            while let Some(&(f, _, c)) = items.get(end) {
+                let s = Script::of(c);
+                // Very long runs (a word thousands of letters long) are
+                // shaped in pieces to keep the work linear.
+                if f != face || (script.is_some() && s.is_some() && s != script) || end - start == MAX_RUN {
+                    break;
+                }
+                script = script.or(s);
+                end += 1;
+            }
+            runs.push(self.shape_run(face, &items[start..end], script.unwrap_or(Script::Other), size));
+            start = end;
         }
         runs
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn shape_char(
+    /// Resolve a character to a face and glyph, falling back to a plain-text
+    /// substitute (for example `->` for an arrow) when no font covers it.
+    fn resolve_char(
         &self,
         c: char,
         mono: bool,
         bold: bool,
         italic: bool,
-        size: f32,
-        runs: &mut Runs,
+        items: &mut Vec<(FaceId, u16, char)>,
         subst: bool,
     ) {
         if chars::is_invisible(c) {
             return;
         }
         let c = if chars::is_space_like(c) { ' ' } else { c };
-        let (face, gid) = match self.fonts().resolve(c, mono, bold, italic) {
-            Some(found) => found,
+        match self.fonts().resolve(c, mono, bold, italic) {
+            Some((face, gid)) => items.push((face, gid, c)),
             None => {
                 if let Some(s) = chars::substitute(c).filter(|_| subst) {
                     for sc in s.chars() {
-                        self.shape_char(sc, mono, bold, italic, size, runs, false);
+                        self.resolve_char(sc, mono, bold, italic, items, false);
                     }
                     return;
                 }
                 if c != ' ' {
                     self.missing.borrow_mut().insert(c);
                 }
-                (self.fonts().primary(mono, bold, italic), 0)
+                items.push((self.fonts().primary(mono, bold, italic), 0, c));
             }
-        };
-        self.used.borrow_mut()[face].entry(gid).or_insert(c);
-        let w = self.fonts().width(face, gid, size);
-        match runs.last_mut() {
-            Some((f, g, width)) if *f == face => {
-                if let Some(&prev) = g.last() {
-                    *width += self.kern(face, prev, gid, size);
-                }
-                g.push(gid);
-                *width += w;
-            }
-            _ => runs.push((face, vec![gid], w)),
         }
+    }
+
+    /// Substitute and measure the glyphs of characters set in one face, and
+    /// record the text each resulting glyph stands for.
+    fn shape_run(
+        &self,
+        face: FaceId,
+        items: &[(FaceId, u16, char)],
+        script: Script,
+        size: f32,
+    ) -> (FaceId, Vec<u16>, f32) {
+        let font = &self.fonts().faces[face];
+        let mut glyphs: Vec<Glyph> = items
+            .iter()
+            .enumerate()
+            .map(|(k, &(_, id, _))| Glyph {
+                id,
+                cluster: k as u32,
+            })
+            .collect();
+        font.substitute(script, &mut glyphs);
+        let mut used = self.used.borrow_mut();
+        let mut width = 0.0;
+        for (k, g) in glyphs.iter().enumerate() {
+            // The first glyph of a cluster represents all of its characters.
+            let first = k == 0 || glyphs[k - 1].cluster != g.cluster;
+            let text: String = if first {
+                let end = glyphs[k + 1..]
+                    .iter()
+                    .map(|n| n.cluster)
+                    .find(|&c| c != g.cluster)
+                    .unwrap_or(items.len() as u32);
+                items
+                    .get(g.cluster as usize..end as usize)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|i| i.2)
+                    .collect()
+            } else {
+                String::new()
+            };
+            let entry = used[face].entry(g.id).or_default();
+            if entry.is_empty() {
+                *entry = text;
+            }
+            width += self.fonts().width(face, g.id, size);
+            if k > 0 {
+                width += self.kern(face, glyphs[k - 1].id, g.id, size);
+            }
+        }
+        (face, glyphs.into_iter().map(|g| g.id).collect(), width)
     }
 
     /// Kerning between two glyphs of a face, in 1/1000 em.
@@ -464,92 +634,171 @@ impl Layout<'_> {
 
     // ------------------------------------------------------------ inline text
 
+    /// Split inline content into words, spaces and hard breaks. Words end at
+    /// the line break opportunities of the Unicode line breaking algorithm
+    /// (UAX #14), computed over the whole paragraph so that they are right
+    /// across style changes. Each piece of text between opportunities is
+    /// shaped as a unit.
     fn tokenize(&self, inlines: &[Inline], size: f32, color: Color, force_bold: bool) -> Vec<Tok> {
-        let mut toks = Vec::new();
-        let mut word: Vec<Frag> = Vec::new();
-        let end_word = |word: &mut Vec<Frag>, toks: &mut Vec<Tok>| {
-            if !word.is_empty() {
-                toks.push(Tok::Word(std::mem::take(word)));
-            }
-        };
+        // The paragraph as one character sequence. Hard breaks and images
+        // stand in as LINE SEPARATOR and OBJECT REPLACEMENT CHARACTER, which
+        // have the right line breaking classes.
+        let mut text: Vec<char> = Vec::new();
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut styles: Vec<TextStyle> = Vec::new();
+        let mut images: Vec<(&str, &str)> = Vec::new();
         for item in inlines {
             match item {
-                Inline::Text { text, style, link } => {
+                Inline::Text { text: t, style, link } => {
                     let mut style = *style;
                     style.bold |= force_bold;
                     let (mono, bold, italic) = (style.code, style.bold, style.italic);
                     let fsize = if mono { size * 0.9 } else { size };
-                    let fcolor = if link.is_some() { LINK } else { color };
-                    let link: Option<Rc<str>> = link.as_deref().map(Rc::from);
                     let space = match self.measure(" ", mono, bold, italic, fsize) {
                         w if w > 0.0 => w,
                         _ => fsize * 0.25,
                     };
-                    let mut seg = String::new();
-                    let flush = |seg: &mut String, word: &mut Vec<Frag>| {
-                        if seg.is_empty() {
-                            return;
-                        }
-                        for (face, glyphs, w) in self.shape(seg, mono, bold, italic, fsize) {
-                            match word.last_mut() {
-                                Some(f)
-                                    if f.face == face
-                                        && f.size == fsize
-                                        && f.code == mono
-                                        && f.strike == style.strike
-                                        && f.link == link
-                                        && f.color == fcolor =>
-                                {
-                                    if let (Some(&l), Some(&r)) = (f.glyphs.last(), glyphs.first()) {
-                                        f.width += self.kern(face, l, r, fsize);
-                                    }
-                                    f.glyphs.extend_from_slice(&glyphs);
-                                    f.width += w;
-                                }
-                                _ => word.push(Frag {
-                                    face,
-                                    size: fsize,
-                                    glyphs,
-                                    width: w,
-                                    color: fcolor,
-                                    code: mono,
-                                    strike: style.strike,
-                                    link: link.clone(),
-                                }),
+                    styles.push(TextStyle {
+                        style,
+                        size: fsize,
+                        color: if link.is_some() { LINK } else { color },
+                        link: link.as_deref().map(Rc::from),
+                        space,
+                    });
+                    let k = styles.len() - 1;
+                    for c in t.chars() {
+                        if chars::is_space_like(c) || c == ' ' {
+                            // Runs of spaces collapse, except in code.
+                            if !mono && slots.last().is_some_and(|s| matches!(s, Slot::Space(_))) {
+                                continue;
                             }
-                        }
-                        seg.clear();
-                    };
-                    for c in text.chars() {
-                        if c == ' ' || chars::is_space_like(c) {
-                            flush(&mut seg, &mut word);
-                            end_word(&mut word, &mut toks);
-                            if mono || !matches!(toks.last(), Some(Tok::Space(_))) {
-                                toks.push(Tok::Space(space));
-                            }
-                        } else if chars::breaks_anywhere(c) {
-                            // A line may break before and after this character.
-                            flush(&mut seg, &mut word);
-                            end_word(&mut word, &mut toks);
-                            seg.push(c);
-                            flush(&mut seg, &mut word);
-                            end_word(&mut word, &mut toks);
+                            // Tabs and newlines are ordinary spaces here.
+                            text.push(if (c as u32) < 0x20 { ' ' } else { c });
+                            slots.push(Slot::Space(k));
+                        } else if chars::is_control(c) {
+                            continue;
                         } else {
-                            seg.push(c);
+                            text.push(c);
+                            slots.push(Slot::Text(k));
                         }
                     }
-                    flush(&mut seg, &mut word);
                 }
                 Inline::Break => {
-                    end_word(&mut word, &mut toks);
-                    toks.push(Tok::Break);
+                    text.push('\u{2028}');
+                    slots.push(Slot::Break);
                 }
                 Inline::Image { alt, src } => {
+                    text.push('\u{FFFC}');
+                    slots.push(Slot::Image(images.len()));
+                    images.push((alt, src));
+                }
+            }
+        }
+        let breaks = linebreak::opportunities(&text);
+
+        let mut toks = Vec::new();
+        let mut word = Word::default();
+        // Width of the spaces since the last text.
+        let mut pending: Option<f32> = None;
+        // Whether the last word ended at an opportunity without a space, so
+        // the next one continues it on the same line if both fit.
+        let mut joined = false;
+        let end_word = |word: &mut Word, toks: &mut Vec<Tok>| {
+            if !word.frags.is_empty() {
+                toks.push(Tok::Word(std::mem::take(word)));
+            }
+        };
+        let mut i = 0;
+        while i < text.len() {
+            match slots[i] {
+                Slot::Break => {
                     end_word(&mut word, &mut toks);
+                    toks.push(Tok::Break);
+                    pending = None;
+                    joined = false;
+                    i += 1;
+                }
+                Slot::Image(k) => {
+                    end_word(&mut word, &mut toks);
+                    let (alt, src) = images[k];
                     toks.push(Tok::Image {
-                        alt: alt.clone(),
-                        src: src.clone(),
+                        alt: alt.to_string(),
+                        src: src.to_string(),
                     });
+                    pending = None;
+                    joined = false;
+                    i += 1;
+                }
+                Slot::Space(k) => {
+                    *pending.get_or_insert(0.0) += styles[k].space;
+                    i += 1;
+                }
+                Slot::Text(k) => {
+                    // A segment: text in one style up to the next space,
+                    // opportunity or ZERO WIDTH NON-JOINER (which prevents
+                    // ligatures).
+                    let mut j = i + 1;
+                    while j < text.len()
+                        && slots[j] == Slot::Text(k)
+                        && breaks[j] == Break::No
+                        && text[j - 1] != '\u{200C}'
+                    {
+                        j += 1;
+                    }
+                    let st = &styles[k];
+                    if breaks[i] != Break::No {
+                        // A soft hyphen right before the opportunity shows as
+                        // a hyphen if the line breaks there.
+                        if pending.is_none() && i > 0 && text[i - 1] == '\u{AD}' {
+                            if let Slot::Text(h) = slots[i - 1] {
+                                word.hyphen = self.hyphen(&styles[h]);
+                            }
+                        }
+                        end_word(&mut word, &mut toks);
+                        match pending.take() {
+                            Some(w) => {
+                                toks.push(Tok::Space(w));
+                                joined = false;
+                            }
+                            None => joined = matches!(toks.last(), Some(Tok::Word(_))),
+                        }
+                    } else if let Some(w) = pending.take() {
+                        // Spaces where the line must not break stay inside the word.
+                        let face = self
+                            .fonts()
+                            .primary(st.style.code, st.style.bold, st.style.italic);
+                        word.frags.push(st.frag(Vec::new(), w, face));
+                    }
+                    let seg: String = text[i..j].iter().collect();
+                    let (mono, bold, italic) = (st.style.code, st.style.bold, st.style.italic);
+                    for (face, glyphs, w) in self.shape(&seg, mono, bold, italic, st.size) {
+                        if glyphs.is_empty() {
+                            continue;
+                        }
+                        if word.frags.is_empty() && joined {
+                            // Kerning with the end of the previous word, for
+                            // when both end up on one line.
+                            if let Some(Tok::Word(prev)) = toks.last_mut() {
+                                if let Some(f) = prev.frags.last_mut().filter(|f| f.same_run(face, st)) {
+                                    if let (Some(&l), Some(&r)) = (f.glyphs.last(), glyphs.first()) {
+                                        f.width += self.kern(face, l, r, st.size);
+                                    }
+                                }
+                            }
+                        }
+                        joined = false;
+                        match word.frags.last_mut() {
+                            Some(f) if f.same_run(face, st) => {
+                                if let (Some(&l), Some(&r)) = (f.glyphs.last(), glyphs.first()) {
+                                    f.width += self.kern(face, l, r, st.size);
+                                }
+                                f.glyphs.extend_from_slice(&glyphs);
+                                f.width += w;
+                            }
+                            _ => word.frags.push(st.frag(glyphs, w, face)),
+                        }
+                    }
+                    i = j;
                 }
             }
         }
@@ -557,66 +806,108 @@ impl Layout<'_> {
         toks
     }
 
-    fn wrap(&self, toks: Vec<Tok>, max_w: f32, base_size: f32) -> Vec<Laid> {
+    /// The hyphen shown where a line breaks at a soft hyphen.
+    fn hyphen(&self, st: &TextStyle) -> Option<Frag> {
+        let (mono, bold, italic) = (st.style.code, st.style.bold, st.style.italic);
+        let runs = self.shape("-", mono, bold, italic, st.size);
+        let (face, glyphs, w) = runs.into_iter().next()?;
+        Some(st.frag(glyphs, w, face))
+    }
+
+    fn wrap(&self, toks: &[Tok], max_w: f32, base_size: f32) -> Vec<Laid> {
         let max_w = max_w.max(1.0);
         let mut out = Vec::new();
-        let mut line = Line {
+        let new_line = || Line {
             size: base_size,
             ..Line::default()
         };
+        let mut line = new_line();
         let mut space = 0.0f32;
+        // The words on the current line: token index, and the number of
+        // frags and the width of the line before the word.
+        let mut placed: Vec<(usize, usize, f32)> = Vec::new();
         let push_frag = |line: &mut Line, x: f32, f: Frag| {
             line.size = line.size.max(f.size);
             line.width = x + f.width;
             line.frags.push((x, f));
         };
-        for tok in toks {
-            match tok {
+        let mut i = 0;
+        while i < toks.len() {
+            match &toks[i] {
                 Tok::Space(w) => {
                     if !line.frags.is_empty() {
-                        space = if space > 0.0 { space + w } else { w };
+                        space += w;
                     }
                 }
                 Tok::Break => {
-                    out.push(Laid::Line(std::mem::replace(
-                        &mut line,
-                        Line {
-                            size: base_size,
-                            ..Line::default()
-                        },
-                    )));
+                    out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
+                    placed.clear();
                     space = 0.0;
                 }
                 Tok::Image { alt, src } => {
                     if !line.frags.is_empty() {
-                        out.push(Laid::Line(std::mem::replace(
-                            &mut line,
-                            Line {
-                                size: base_size,
-                                ..Line::default()
-                            },
-                        )));
+                        out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
                     }
-                    out.push(Laid::Image { alt, src });
+                    out.push(Laid::Image {
+                        alt: alt.clone(),
+                        src: src.clone(),
+                    });
+                    placed.clear();
                     space = 0.0;
                 }
-                Tok::Word(frags) => {
-                    let w: f32 = frags.iter().map(|f| f.width).sum();
+                Tok::Word(word) => {
+                    let w = word.width();
                     if !line.frags.is_empty() && line.width + space + w > max_w {
-                        out.push(Laid::Line(std::mem::replace(
-                            &mut line,
-                            Line {
-                                size: base_size,
-                                ..Line::default()
-                            },
-                        )));
+                        // Break before this word. If the last word on the line
+                        // needs a hyphen that does not fit, it moves to the
+                        // next line too.
+                        let mut restart = i;
+                        while placed.len() > 1 {
+                            let &(ti, nfrags, before) = placed.last().expect("placed is not empty");
+                            let hyphen = match &toks[ti] {
+                                Tok::Word(prev) => prev.hyphen.as_ref(),
+                                _ => None,
+                            };
+                            if hyphen.is_none_or(|h| line.width + h.width <= max_w) {
+                                break;
+                            }
+                            line.frags.truncate(nfrags);
+                            line.width = before;
+                            line.size = line.frags.iter().map(|f| f.1.size).fold(base_size, f32::max);
+                            placed.pop();
+                            restart = ti;
+                        }
+                        if let Some(&(ti, ..)) = placed.last() {
+                            if let Tok::Word(Word { hyphen: Some(h), .. }) = &toks[ti] {
+                                if let Some((_, last)) = line.frags.last_mut().filter(|(_, l)| l.joins(h)) {
+                                    if let (Some(&l), Some(&r)) = (last.glyphs.last(), h.glyphs.first()) {
+                                        let k = self.kern(h.face, l, r, h.size);
+                                        last.width += k;
+                                        line.width += k;
+                                    }
+                                }
+                                let x = line.width;
+                                push_frag(&mut line, x, h.clone());
+                            }
+                        }
+                        out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
+                        placed.clear();
                         space = 0.0;
+                        if restart != i {
+                            i = restart;
+                            continue;
+                        }
                     }
+                    placed.push((i, line.frags.len(), line.width));
                     if line.frags.is_empty() && w > max_w {
-                        // Break an overlong word at character boundaries.
-                        for f in frags {
+                        // Break an overlong word at glyph boundaries.
+                        for f in &word.frags {
                             let mut start = 0;
                             let mut x = line.width;
+                            if f.glyphs.is_empty() {
+                                push_frag(&mut line, x, f.clone());
+                                continue;
+                            }
                             let mut acc = 0.0;
                             for (k, &g) in f.glyphs.iter().enumerate() {
                                 let mut cw = self.fonts().width(f.face, g, f.size);
@@ -632,13 +923,8 @@ impl Layout<'_> {
                                         };
                                         push_frag(&mut line, x, piece);
                                     }
-                                    out.push(Laid::Line(std::mem::replace(
-                                        &mut line,
-                                        Line {
-                                            size: base_size,
-                                            ..Line::default()
-                                        },
-                                    )));
+                                    out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
+                                    placed.clear();
                                     start = k;
                                     x = 0.0;
                                     acc = 0.0;
@@ -648,8 +934,8 @@ impl Layout<'_> {
                             if start < f.glyphs.len() {
                                 let piece = Frag {
                                     glyphs: f.glyphs[start..].to_vec(),
-                                    width: acc,
-                                    ..f
+                                    width: acc + (f.width - self.frag_width(f)),
+                                    ..f.clone()
                                 };
                                 push_frag(&mut line, x, piece);
                             }
@@ -660,20 +946,33 @@ impl Layout<'_> {
                         } else {
                             line.width + space
                         };
-                        for f in frags {
-                            let fw = f.width;
-                            push_frag(&mut line, x, f);
-                            x += fw;
+                        for f in &word.frags {
+                            push_frag(&mut line, x, f.clone());
+                            x += f.width;
                         }
                     }
                     space = 0.0;
                 }
             }
+            i += 1;
         }
         if !line.frags.is_empty() {
             out.push(Laid::Line(line));
         }
         out
+    }
+
+    /// Width of a frag's glyphs with the kerning between them (without the
+    /// kerning to a following word that `Frag::width` may include).
+    fn frag_width(&self, f: &Frag) -> f32 {
+        let mut w = 0.0;
+        for (k, &g) in f.glyphs.iter().enumerate() {
+            w += self.fonts().width(f.face, g, f.size);
+            if k > 0 {
+                w += self.kern(f.face, f.glyphs[k - 1], g, f.size);
+            }
+        }
+        w
     }
 
     fn line_height(&self, line: &Line) -> f32 {
@@ -684,7 +983,20 @@ impl Layout<'_> {
     fn draw_line(&mut self, line: &Line, x: f32, lh: f32) {
         let baseline = self.y - lh / 2.0 - line.size * 0.26;
         self.draw_marker(baseline);
-        for (fx, f) in &line.frags {
+        // Words that continue each other without a space are drawn as one
+        // run; their widths already include the kerning between them.
+        let mut frags: Vec<(f32, Frag)> = Vec::with_capacity(line.frags.len());
+        for (x, f) in &line.frags {
+            if let Some((px, p)) = frags.last_mut() {
+                if p.joins(f) && (*px + p.width - x).abs() < 0.01 {
+                    p.glyphs.extend_from_slice(&f.glyphs);
+                    p.width = x + f.width - *px;
+                    continue;
+                }
+            }
+            frags.push((*x, f.clone()));
+        }
+        for (fx, f) in &frags {
             if f.code {
                 self.fill_rect(
                     x + fx - 1.5,
@@ -695,19 +1007,21 @@ impl Layout<'_> {
                 );
             }
         }
-        for (fx, f) in &line.frags {
+        for (fx, f) in &frags {
             let fx = x + fx;
-            let kerns = self.kerns(f.face, &f.glyphs);
-            glyph_ops(
-                &mut self.page().ops,
-                f.face,
-                f.size,
-                fx,
-                baseline,
-                f.color,
-                &f.glyphs,
-                &kerns,
-            );
+            if !f.glyphs.is_empty() {
+                let kerns = self.kerns(f.face, &f.glyphs);
+                glyph_ops(
+                    &mut self.page().ops,
+                    f.face,
+                    f.size,
+                    fx,
+                    baseline,
+                    f.color,
+                    &f.glyphs,
+                    &kerns,
+                );
+            }
             if f.strike {
                 let sy = baseline + f.size * 0.3;
                 self.stroke_line(fx, sy, fx + f.width, sy, f.size * 0.06, f.color);
@@ -788,7 +1102,7 @@ impl Layout<'_> {
             inlines
         };
         let toks = self.tokenize(inlines, size, ctx.color, bold);
-        for item in self.wrap(toks, ctx.w, size) {
+        for item in self.wrap(&toks, ctx.w, size) {
             match item {
                 Laid::Line(line) => {
                     let lh = self.line_height(&line);
@@ -1123,8 +1437,8 @@ impl Layout<'_> {
                 let mut total = 0.0;
                 for t in toks {
                     match t {
-                        Tok::Word(f) => {
-                            let w: f32 = f.iter().map(|f| f.width).sum();
+                        Tok::Word(word) => {
+                            let w = word.width();
                             total += w;
                             min[c] = min[c].max(w.min(ctx.w / cols as f32));
                         }
@@ -1157,7 +1471,7 @@ impl Layout<'_> {
                 .into_iter()
                 .enumerate()
                 .map(|(c, toks)| {
-                    self.wrap(toks, widths[c], size)
+                    self.wrap(&toks, widths[c], size)
                         .into_iter()
                         .filter_map(|l| if let Laid::Line(l) = l { Some(l) } else { None })
                         .collect()

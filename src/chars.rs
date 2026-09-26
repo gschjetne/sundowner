@@ -12,6 +12,12 @@ pub fn is_invisible(c: char) -> bool {
         | 0xE0100..=0xE01EF)
 }
 
+/// Control characters, which are dropped from text entirely (tabs and line
+/// feeds count as spaces instead, see [`is_space_like`]).
+pub fn is_control(c: char) -> bool {
+    matches!(c as u32, 0x00..=0x08 | 0x0B..=0x0C | 0x0E..=0x1F | 0x7F..=0x9F)
+}
+
 /// Whitespace other than the plain space that should lay out as a space.
 pub fn is_space_like(c: char) -> bool {
     matches!(
@@ -52,15 +58,6 @@ pub fn substitute(c: char) -> Option<&'static str> {
     })
 }
 
-/// Scripts written without spaces between words, where a line may break
-/// between any two characters (CJK ideographs, kana, Hangul, fullwidth forms).
-pub fn breaks_anywhere(c: char) -> bool {
-    matches!(c as u32,
-        0x1100..=0x11FF | 0x2E80..=0x2FDF | 0x3000..=0x303F | 0x3040..=0x30FF | 0x3100..=0x31FF
-        | 0x3200..=0x4DBF | 0x4E00..=0x9FFF | 0xA960..=0xA97F | 0xAC00..=0xD7FF | 0xF900..=0xFAFF
-        | 0xFE30..=0xFE4F | 0xFF00..=0xFFEF | 0x20000..=0x3FFFF)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,7 +65,7 @@ mod tests {
     #[test]
     fn classes() {
         assert!(is_invisible('\u{AD}') && is_invisible('\u{FEFF}') && !is_invisible('a'));
-        assert!(breaks_anywhere('中') && breaks_anywhere('あ') && !breaks_anywhere('a'));
+        assert!(is_control('\u{0}') && !is_control('\t') && !is_control('\n'));
         assert_eq!(substitute('\u{2192}'), Some("->"));
         assert_eq!(substitute('x'), None);
     }

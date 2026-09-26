@@ -46,7 +46,7 @@ fn runs(out: &Output, page: usize) -> Vec<Run> {
             .collect();
         let text = (0..hex.len() / 4)
             .map(|k| u16::from_str_radix(&hex[4 * k..4 * k + 4], 16).unwrap())
-            .map(|g| out.used[face].get(&g).copied().unwrap_or('\u{FFFD}'))
+            .map(|g| out.used[face].get(&g).map_or("\u{FFFD}", String::as_str))
             .collect();
         result.push(Run { face, x, y, text });
         i = end;
@@ -255,4 +255,102 @@ fn monospace_code_is_never_kerned() {
     let out = render("`AVATAR To`");
     let ops = String::from_utf8_lossy(&out.pages[0].ops);
     assert!(!ops.contains("TJ"), "{ops}");
+}
+
+fn render_narrow(src: &str, width: f32) -> Output {
+    let doc = markdown::parse(src);
+    layout::layout(
+        &doc,
+        &Options {
+            page_numbers: false,
+            page_width: width,
+            margin: 10.0,
+            ..Options::default()
+        },
+    )
+}
+
+/// The runs of a page grouped into lines (by baseline), top to bottom, each
+/// line's runs joined left to right.
+fn lines(out: &Output) -> Vec<String> {
+    let mut r = runs(out, 0);
+    r.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+    let mut lines: Vec<(f32, String)> = Vec::new();
+    for run in r {
+        match lines.last_mut() {
+            Some((y, text)) if *y == run.y => {
+                text.push(' ');
+                text.push_str(&run.text);
+            }
+            _ => lines.push((run.y, run.text)),
+        }
+    }
+    lines.into_iter().map(|l| l.1).collect()
+}
+
+#[test]
+fn ligatures_are_formed_and_map_back_to_text() {
+    let out = render("office fjord *fifty*");
+    let r = runs(&out, 0);
+    // Runs map back to the original text through the ligature glyphs...
+    assert_eq!(run(&r, "office").face, REGULAR);
+    assert_eq!(run(&r, "fjord").face, REGULAR);
+    assert_eq!(run(&r, "fifty").face, ITALIC);
+    // ...which each stand for several characters.
+    for (face, lig) in [(REGULAR, "fi"), (REGULAR, "fj"), (ITALIC, "fi")] {
+        assert!(
+            out.used[face].values().any(|t| t == lig),
+            "no {lig} ligature in {:?}",
+            out.used[face]
+        );
+    }
+    // A ZERO WIDTH NON-JOINER prevents the ligature.
+    let out = render("shelf\u{200C}ish");
+    assert!(!out.used[REGULAR].values().any(|t| t.chars().count() > 1));
+    assert_eq!(run(&runs(&out, 0), "shelfish").face, REGULAR);
+    // Code has no ligatures to begin with.
+    let out = render("`office`");
+    assert!(!out.used[MONO].values().any(|t| t.chars().count() > 1));
+}
+
+#[test]
+fn lines_break_by_the_unicode_rules() {
+    // Hyphens and dashes are break opportunities even without spaces.
+    let l = lines(&render_narrow("state-of-the-art-technology well—known", 70.0));
+    assert!(l.len() >= 3, "{l:?}");
+    assert!(l[0].ends_with('-'), "{l:?}");
+    assert_eq!(
+        l.concat().replace(' ', ""),
+        "state-of-the-art-technologywell—known"
+    );
+    // No break before closing punctuation, even after a space, nor after
+    // an opening bracket.
+    for width in [40.0, 50.0, 60.0, 70.0, 80.0] {
+        let l = lines(&render_narrow("aaa bbb ccc ! ( ddd ) eee", width));
+        for line in &l {
+            assert!(!line.starts_with('!') && !line.starts_with(')'), "{l:?}");
+            assert!(!line.ends_with('('), "{l:?}");
+        }
+    }
+    // No-break spaces keep words together.
+    let l = lines(&render_narrow("aaaaaa bbbbbb\u{A0}cccccc", 120.0));
+    assert!(l.iter().any(|x| x.contains("bbbbbb\u{A0}cccccc")), "{l:?}");
+}
+
+#[test]
+fn soft_hyphens_show_only_where_the_line_breaks() {
+    let src = "extra\u{AD}ordinarily incompre\u{AD}hensibilities";
+    let l = lines(&render(src));
+    assert_eq!(l, ["extraordinarily incomprehensibilities"]);
+    let l = lines(&render_narrow(src, 110.0));
+    assert!(l.len() >= 2, "{l:?}");
+    let hyphenated: Vec<&String> = l.iter().filter(|x| x.contains('-')).collect();
+    assert!(
+        !hyphenated.is_empty() && hyphenated.iter().all(|x| x.ends_with('-')),
+        "{l:?}"
+    );
+    assert_eq!(
+        l.concat().replace('-', ""),
+        "extraordinarily incomprehensibilities".replace(' ', "")
+    );
 }

@@ -5,6 +5,7 @@
 //! Every read is bounds-checked, so malformed fonts produce an error rather
 //! than a panic.
 
+use crate::gsub::{Glyph, Gsub, Script};
 use crate::kern::Kerning;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -31,6 +32,7 @@ pub struct Face {
     lsbs: Vec<i16>,
     cmap: HashMap<u32, u16>,
     kerning: Kerning,
+    gsub: Gsub,
 }
 
 fn u16_at(d: &[u8], i: usize) -> Option<u16> {
@@ -186,6 +188,7 @@ impl Face {
             .unwrap_or_else(|| "Embedded".into());
         let variable_default_weight = table(b"fvar").map(fvar_default_weight);
         let kerning = Kerning::parse(table(b"GPOS"), table(b"GDEF"), table(b"kern"));
+        let gsub = Gsub::parse(table(b"GSUB"), table(b"GDEF"), num_glyphs);
         let cmap = parse_cmap(req(b"cmap")?, num_glyphs)?;
         if cmap.is_empty() {
             return Err("font has no usable Unicode character map".into());
@@ -208,6 +211,7 @@ impl Face {
             postscript_name,
             variable_default_weight,
             kerning,
+            gsub,
             advances,
             lsbs,
             cmap,
@@ -217,6 +221,21 @@ impl Face {
     /// Glyph for a character, if the font has one.
     pub fn glyph(&self, c: char) -> Option<u16> {
         self.cmap.get(&(c as u32)).copied()
+    }
+
+    /// Apply the font's default glyph substitutions (ligatures, contextual
+    /// alternates, ...) for text in `script`.
+    pub fn substitute(&self, script: Script, glyphs: &mut Vec<Glyph>) {
+        if self.gsub.is_empty() {
+            return;
+        }
+        let t = |tag: &[u8; 4]| self.table(tag).unwrap_or(&[]);
+        self.gsub.apply(t(b"GSUB"), t(b"GDEF"), script, glyphs);
+    }
+
+    /// Whether the font substitutes glyphs for text in `script`.
+    pub fn has_substitutions(&self) -> bool {
+        !self.gsub.is_empty()
     }
 
     /// Kerning between two adjacent glyphs, in font units (negative moves
@@ -650,6 +669,72 @@ mod tests {
         // A monospace font has no kerning.
         let mono = Face::parse(Cow::Borrowed(include_bytes!("../fonts/Cousine-Regular.ttf")), 0).unwrap();
         assert_eq!(mono.kern(mono.glyph('A').unwrap(), mono.glyph('V').unwrap()), 0);
+    }
+
+    #[test]
+    fn gsub_ligatures() {
+        let f = Face::parse(Cow::Borrowed(ALEGREYA), 0).unwrap();
+        let shape = |s: &str| {
+            let mut g: Vec<Glyph> = s
+                .chars()
+                .enumerate()
+                .map(|(k, c)| Glyph {
+                    id: f.glyph(c).unwrap(),
+                    cluster: k as u32,
+                })
+                .collect();
+            f.substitute(Script::Latin, &mut g);
+            g
+        };
+        // Glyph IDs and clusters as HarfBuzz produces them.
+        let fi = shape("fi");
+        assert_eq!(fi.len(), 1);
+        assert_ne!(fi[0].id, f.glyph('f').unwrap());
+        let office = shape("office");
+        assert_eq!(
+            office.iter().map(|g| g.cluster).collect::<Vec<_>>(),
+            [0, 1, 2, 4, 5]
+        );
+        assert_eq!(shape("xyz").len(), 3);
+    }
+
+    #[test]
+    fn corrupt_gsub_never_panics() {
+        let f = Face::parse(Cow::Borrowed(ALEGREYA), 0).unwrap();
+        let (gsub, _) = f.tables[b"GSUB"];
+        let (gdef, gdef_len) = f.tables[b"GDEF"];
+        let mut seed = 11u64;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..200 {
+            let mut d = ALEGREYA.to_vec();
+            for _ in 0..8 {
+                let r = rand();
+                let i = if r % 4 == 0 {
+                    gdef + (r as usize >> 8) % gdef_len
+                } else {
+                    // Headers, lists and the first subtables.
+                    gsub + (r as usize >> 8) % 4096
+                };
+                d[i] = (r >> 3) as u8;
+            }
+            let Ok(face) = Face::parse(Cow::Owned(d), 0) else {
+                continue;
+            };
+            let mut g: Vec<Glyph> = (0..24)
+                .map(|k| Glyph {
+                    id: (rand() % 1200) as u16 | if round % 2 == 0 { 0 } else { 300 },
+                    cluster: k,
+                })
+                .collect();
+            for script in [Script::Latin, Script::Greek, Script::Cyrillic, Script::Other] {
+                face.substitute(script, &mut g);
+            }
+        }
     }
 
     #[test]
