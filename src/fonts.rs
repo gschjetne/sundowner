@@ -212,6 +212,9 @@ impl Faces {
 impl std::ops::Index<FaceId> for Faces {
     type Output = Face;
 
+    /// The first look at a compressed bundled face inflates and parses it:
+    /// for a CJK font, about 0.15 s and tens of MB. That is what keeps
+    /// documents that never need it fast, so it must stay lazy.
     fn index(&self, id: FaceId) -> &Face {
         match &self.0[id] {
             Slot::Ready(face) => face,

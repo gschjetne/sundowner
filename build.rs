@@ -36,7 +36,13 @@ fn main() {
             s.spawn(move || {
                 let src = Path::new("fonts/silk").join(name);
                 println!("cargo:rerun-if-changed={}", src.display());
-                let data = std::fs::read(&src).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+                let data = std::fs::read(&src).unwrap_or_else(|e| {
+                    panic!(
+                        "{}: {e}. The silk build needs the fonts in fonts/silk/; \
+                         regenerate them with fonts/build.py",
+                        src.display()
+                    )
+                });
                 let z = flate::zlib_compress(&data);
                 std::fs::write(out.join(format!("{name}.z")), z).expect("OUT_DIR is writable");
             });
