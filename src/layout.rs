@@ -1,6 +1,7 @@
 //! Page layout: turns the parsed document into positioned text runs, rules,
 //! boxes and images on fixed-size pages.
 
+use crate::bidi;
 use crate::chars;
 use crate::fonts::{FaceId, Fonts};
 use crate::gpos::Attachment;
@@ -73,12 +74,16 @@ struct G {
     dy: f32,
 }
 
-/// A run of text in a single font, size, color and link.
+/// A run of text in a single font, size, color, link and bidirectional
+/// embedding level. Glyphs are in logical order; right-to-left runs are
+/// turned around when their line is drawn.
 #[derive(Clone)]
 struct Frag {
     face: FaceId,
     size: f32,
     glyphs: Vec<G>,
+    /// Embedding level (UAX #9); odd levels are right-to-left.
+    level: u8,
     width: f32,
     color: Color,
     code: bool,
@@ -87,8 +92,9 @@ struct Frag {
 }
 
 impl Frag {
-    /// Whether glyphs in `face` and style `st` can be appended to this frag.
-    fn same_run(&self, face: FaceId, st: &TextStyle) -> bool {
+    /// Whether glyphs in `face`, style `st` and embedding level `level` can
+    /// be appended to this frag.
+    fn same_run(&self, face: FaceId, st: &TextStyle, level: u8) -> bool {
         !self.glyphs.is_empty()
             && self.face == face
             && self.size == st.size
@@ -96,6 +102,7 @@ impl Frag {
             && self.strike == st.style.strike
             && self.link == st.link
             && self.color == st.color
+            && self.level == level
     }
 
     /// A copy with only some of the glyphs.
@@ -104,6 +111,7 @@ impl Frag {
             face: self.face,
             size: self.size,
             glyphs: self.glyphs[range].to_vec(),
+            level: self.level,
             width,
             color: self.color,
             code: self.code,
@@ -122,6 +130,7 @@ impl Frag {
             && self.strike == next.strike
             && self.link == next.link
             && self.color == next.color
+            && self.level == next.level
     }
 }
 
@@ -136,11 +145,12 @@ struct TextStyle {
 }
 
 impl TextStyle {
-    fn frag(&self, glyphs: Vec<G>, width: f32, face: FaceId) -> Frag {
+    fn frag(&self, glyphs: Vec<G>, width: f32, face: FaceId, level: u8) -> Frag {
         Frag {
             face,
             size: self.size,
             glyphs,
+            level,
             width,
             color: self.color,
             code: self.style.code,
@@ -179,7 +189,8 @@ impl Word {
 enum Tok {
     /// A line may break between two consecutive words, and after a space.
     Word(Word),
-    Space(f32),
+    /// Spaces: their width and embedding level.
+    Space(f32, u8),
     Break,
     Image {
         alt: String,
@@ -244,7 +255,10 @@ enum MarkerKind {
 
 struct Marker {
     kind: MarkerKind,
-    right: f32,
+    /// Where the marker ends (left-to-right items) or starts (right-to-left
+    /// items).
+    edge: f32,
+    rtl: bool,
     size: f32,
     color: Color,
 }
@@ -450,6 +464,10 @@ fn glyph_ops(
 /// Glyph runs for a piece of text: `(face, glyphs, width)`.
 type Runs = Vec<(FaceId, Vec<G>, f32)>;
 
+/// Glyph runs in logical order with their embedding levels:
+/// `(level, face, glyphs, width)`.
+type LevelRuns = Vec<(u8, FaceId, Vec<G>, f32)>;
+
 pub fn slugify(s: &str) -> String {
     let mut out = String::new();
     for c in s.trim().chars().flat_map(char::to_lowercase) {
@@ -472,15 +490,22 @@ impl Layout<'_> {
     /// contextual alternates) to the runs of consecutive characters set in
     /// the same font and script.
     fn shape(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> Runs {
+        self.shape_dir(text, mono, bold, italic, size, false)
+    }
+
+    /// [`Layout::shape`] for text of one direction. Right-to-left text
+    /// gets mirrored characters (UAX #9 rule L4), such as `)` for `(`; its
+    /// glyphs stay in logical order.
+    fn shape_dir(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32, rtl: bool) -> Runs {
         let key = (
             text.to_string(),
-            mono as u8 | (bold as u8) << 1 | (italic as u8) << 2,
+            mono as u8 | (bold as u8) << 1 | (italic as u8) << 2 | (rtl as u8) << 3,
             size.to_bits(),
         );
         if let Some(runs) = self.shape_cache.borrow().get(&key) {
             return runs.clone();
         }
-        let runs = self.shape_uncached(text, mono, bold, italic, size);
+        let runs = self.shape_uncached(text, mono, bold, italic, size, rtl);
         let mut cache = self.shape_cache.borrow_mut();
         if cache.len() >= SHAPE_CACHE_SIZE {
             cache.clear();
@@ -489,11 +514,12 @@ impl Layout<'_> {
         runs
     }
 
-    fn shape_uncached(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> Runs {
+    fn shape_uncached(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32, rtl: bool) -> Runs {
         let chars: Vec<char> = text
             .chars()
             .filter(|&c| !chars::is_invisible(c))
             .map(|c| if chars::is_space_like(c) { ' ' } else { c })
+            .map(|c| if rtl { bidi::mirror(c).unwrap_or(c) } else { c })
             .collect();
         // Each base character is resolved together with the combining marks
         // that follow it, so they end up in one font.
@@ -549,10 +575,12 @@ impl Layout<'_> {
             }
         }
         let mut norm = Vec::new();
+        let hebrew = cluster.iter().any(|&c| Script::of(c) == Some(Script::Hebrew));
         for face in self.fonts().candidates(mono, bold, italic) {
             let f = &self.fonts().faces[face];
             norm.clear();
-            if normalize::for_font(cluster, |c| f.glyph(c).is_some(), &mut norm) {
+            let forms = hebrew && !f.positions_marks(Script::Hebrew);
+            if normalize::for_font(cluster, |c| f.glyph(c).is_some(), forms, &mut norm) {
                 items.extend(norm.iter().map(|&c| (face, f.glyph(c).unwrap_or(0), c)));
                 return;
             }
@@ -736,6 +764,62 @@ impl Layout<'_> {
             .or_insert_with(|| self.o.fonts.faces[face].kern_1000(left, right))
     }
 
+    /// Shape a line of text that stands alone (a line of code, a list
+    /// marker): resolve its embedding levels, with the direction `rtl` or
+    /// else that of its first strong character, and shape each run of one
+    /// level. The runs are in logical order; see [`Layout::visual_runs`].
+    fn shape_levels(
+        &self,
+        text: &str,
+        mono: bool,
+        bold: bool,
+        italic: bool,
+        size: f32,
+        rtl: Option<bool>,
+    ) -> LevelRuns {
+        let chars: Vec<char> = text.chars().collect();
+        if rtl != Some(true) && !bidi::needs_resolving(&chars) {
+            let runs = self.shape(text, mono, bold, italic, size);
+            return runs.into_iter().map(|(f, g, w)| (0, f, g, w)).collect();
+        }
+        let mut l = bidi::resolve(&chars, rtl);
+        let classes: Vec<_> = chars.iter().map(|&c| bidi::class(c)).collect();
+        bidi::reset_whitespace(&classes, &mut l.levels, l.paragraph);
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let level = l.levels[i];
+            let mut j = i + 1;
+            while j < chars.len() && l.levels[j] == level {
+                j += 1;
+            }
+            let seg: String = chars[i..j].iter().collect();
+            for (f, g, w) in self.shape_dir(&seg, mono, bold, italic, size, level % 2 == 1) {
+                out.push((level, f, g, w));
+            }
+            i = j;
+        }
+        out
+    }
+
+    /// Put runs from [`Layout::shape_levels`] into visual order (UAX #9
+    /// rule L2), turning right-to-left runs around.
+    fn visual_runs(&self, runs: LevelRuns) -> Runs {
+        let levels: Vec<u8> = runs.iter().map(|r| r.0).collect();
+        let mut slots: Vec<Option<_>> = runs.into_iter().map(Some).collect();
+        bidi::visual_order(&levels)
+            .into_iter()
+            .filter_map(|k| slots[k].take())
+            .map(|(level, face, glyphs, w)| {
+                if level % 2 == 0 {
+                    return (face, glyphs, w);
+                }
+                let font = &self.o.fonts.faces[face];
+                (face, right_to_left(&glyphs, |g| font.advance_1000(g)), w)
+            })
+            .collect()
+    }
+
     fn measure(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> f32 {
         self.shape(text, mono, bold, italic, size)
             .iter()
@@ -821,7 +905,12 @@ impl Layout<'_> {
     /// (UAX #14), computed over the whole paragraph so that they are right
     /// across style changes. Each piece of text between opportunities is
     /// shaped as a unit.
-    fn tokenize(&self, inlines: &[Inline], size: f32, color: Color, force_bold: bool) -> Vec<Tok> {
+    ///
+    /// Embedding levels come from the Unicode Bidirectional Algorithm (UAX
+    /// #9), also over the whole paragraph; text changes frags where the
+    /// level changes. The second result says whether the paragraph is
+    /// right-to-left (its first strong character is).
+    fn tokenize(&self, inlines: &[Inline], size: f32, color: Color, force_bold: bool) -> (Vec<Tok>, bool) {
         // The paragraph as one character sequence. Hard breaks and images
         // stand in as LINE SEPARATOR and OBJECT REPLACEMENT CHARACTER, which
         // have the right line breaking classes.
@@ -877,11 +966,17 @@ impl Layout<'_> {
             }
         }
         let breaks = linebreak::opportunities(&text);
+        let (levels, rtl) = if bidi::needs_resolving(&text) {
+            let l = bidi::resolve(&text, None);
+            (l.levels.clone(), l.rtl())
+        } else {
+            (vec![0; text.len()], false)
+        };
 
         let mut toks = Vec::new();
         let mut word = Word::default();
-        // Width of the spaces since the last text.
-        let mut pending: Option<f32> = None;
+        // Width and level of the spaces since the last text.
+        let mut pending: Option<(f32, u8)> = None;
         // Whether the last word ended at an opportunity without a space, so
         // the next one continues it on the same line if both fit.
         let mut joined = false;
@@ -912,7 +1007,7 @@ impl Layout<'_> {
                     i += 1;
                 }
                 Slot::Space(k) => {
-                    *pending.get_or_insert(0.0) += styles[k].space;
+                    pending.get_or_insert((0.0, levels[i])).0 += styles[k].space;
                     i += 1;
                 }
                 Slot::Text(k) => {
@@ -924,6 +1019,7 @@ impl Layout<'_> {
                         && slots[j] == Slot::Text(k)
                         && breaks[j] == Break::No
                         && text[j - 1] != '\u{200C}'
+                        && levels[j] == levels[i]
                     {
                         j += 1;
                     }
@@ -933,27 +1029,29 @@ impl Layout<'_> {
                         // a hyphen if the line breaks there.
                         if pending.is_none() && i > 0 && text[i - 1] == '\u{AD}' {
                             if let Slot::Text(h) = slots[i - 1] {
-                                word.hyphen = self.hyphen(&styles[h]);
+                                word.hyphen = self.hyphen(&styles[h], levels[i - 1]);
                             }
                         }
                         end_word(&mut word, &mut toks);
                         match pending.take() {
-                            Some(w) => {
-                                toks.push(Tok::Space(w));
+                            Some((w, level)) => {
+                                toks.push(Tok::Space(w, level));
                                 joined = false;
                             }
                             None => joined = matches!(toks.last(), Some(Tok::Word(_))),
                         }
-                    } else if let Some(w) = pending.take() {
+                    } else if let Some((w, level)) = pending.take() {
                         // Spaces where the line must not break stay inside the word.
                         let face = self
                             .fonts()
                             .primary(st.style.code, st.style.bold, st.style.italic);
-                        word.frags.push(st.frag(Vec::new(), w, face));
+                        word.frags.push(st.frag(Vec::new(), w, face, level));
                     }
                     let seg: String = text[i..j].iter().collect();
                     let (mono, bold, italic) = (st.style.code, st.style.bold, st.style.italic);
-                    for (face, glyphs, w) in self.shape(&seg, mono, bold, italic, st.size) {
+                    let level = levels[i];
+                    for (face, glyphs, w) in self.shape_dir(&seg, mono, bold, italic, st.size, level % 2 == 1)
+                    {
                         if glyphs.is_empty() {
                             continue;
                         }
@@ -961,19 +1059,20 @@ impl Layout<'_> {
                             // Kerning with the end of the previous word, for
                             // when both end up on one line.
                             if let Some(Tok::Word(prev)) = toks.last_mut() {
-                                if let Some(f) = prev.frags.last_mut().filter(|f| f.same_run(face, st)) {
+                                if let Some(f) = prev.frags.last_mut().filter(|f| f.same_run(face, st, level))
+                                {
                                     self.kern_join(f, &glyphs[0]);
                                 }
                             }
                         }
                         joined = false;
                         match word.frags.last_mut() {
-                            Some(f) if f.same_run(face, st) => {
+                            Some(f) if f.same_run(face, st, level) => {
                                 self.kern_join(f, &glyphs[0]);
                                 f.glyphs.extend_from_slice(&glyphs);
                                 f.width += w;
                             }
-                            _ => word.frags.push(st.frag(glyphs, w, face)),
+                            _ => word.frags.push(st.frag(glyphs, w, face, level)),
                         }
                     }
                     i = j;
@@ -981,15 +1080,15 @@ impl Layout<'_> {
             }
         }
         end_word(&mut word, &mut toks);
-        toks
+        (toks, rtl)
     }
 
     /// The hyphen shown where a line breaks at a soft hyphen.
-    fn hyphen(&self, st: &TextStyle) -> Option<Frag> {
+    fn hyphen(&self, st: &TextStyle, level: u8) -> Option<Frag> {
         let (mono, bold, italic) = (st.style.code, st.style.bold, st.style.italic);
         let runs = self.shape("-", mono, bold, italic, st.size);
         let (face, glyphs, w) = runs.into_iter().next()?;
-        Some(st.frag(glyphs, w, face))
+        Some(st.frag(glyphs, w, face, level))
     }
 
     fn wrap(&self, toks: &[Tok], max_w: f32, base_size: f32) -> Vec<Laid> {
@@ -1000,7 +1099,9 @@ impl Layout<'_> {
             ..Line::default()
         };
         let mut line = new_line();
+        // Width and embedding level of the spaces before the next word.
         let mut space = 0.0f32;
+        let mut space_level = 0u8;
         // The words on the current line: token index, and the number of
         // frags and the width of the line before the word.
         let mut placed: Vec<(usize, usize, f32)> = Vec::new();
@@ -1012,9 +1113,10 @@ impl Layout<'_> {
         let mut i = 0;
         while i < toks.len() {
             match &toks[i] {
-                Tok::Space(w) => {
+                Tok::Space(w, level) => {
                     if !line.frags.is_empty() {
                         space += w;
+                        space_level = *level;
                     }
                 }
                 Tok::Break => {
@@ -1107,11 +1209,25 @@ impl Layout<'_> {
                             }
                         }
                     } else {
-                        let mut x = if line.frags.is_empty() {
-                            0.0
-                        } else {
-                            line.width + space
-                        };
+                        let mut x = line.width;
+                        if !line.frags.is_empty() && space > 0.0 {
+                            // The spaces become a frag without glyphs, so
+                            // bidirectional reordering can place them.
+                            let first = &word.frags[0];
+                            let gap = Frag {
+                                face: first.face,
+                                size: first.size,
+                                glyphs: Vec::new(),
+                                level: space_level,
+                                width: space,
+                                color: first.color,
+                                code: false,
+                                strike: false,
+                                link: None,
+                            };
+                            push_frag(&mut line, x, gap);
+                            x += space;
+                        }
                         for f in &word.frags {
                             push_frag(&mut line, x, f.clone());
                             x += f.width;
@@ -1148,6 +1264,9 @@ impl Layout<'_> {
                 }
             }
             frags.push((*x, f.clone()));
+        }
+        if frags.iter().any(|(_, f)| f.level > 0) {
+            frags = self.reorder(frags);
         }
         for (fx, f) in &frags {
             if f.code {
@@ -1208,17 +1327,39 @@ impl Layout<'_> {
         }
     }
 
+    /// Put the frags of a line, in logical order, into visual order (UAX #9
+    /// rule L2), turning right-to-left frags around.
+    fn reorder(&self, frags: Vec<(f32, Frag)>) -> Vec<(f32, Frag)> {
+        let levels: Vec<u8> = frags.iter().map(|(_, f)| f.level).collect();
+        let mut x = frags.first().map_or(0.0, |f| f.0);
+        let mut slots: Vec<Option<Frag>> = frags.into_iter().map(|(_, f)| Some(f)).collect();
+        let mut out = Vec::with_capacity(slots.len());
+        for k in bidi::visual_order(&levels) {
+            let Some(mut f) = slots[k].take() else { continue };
+            if f.level % 2 == 1 {
+                let font = &self.o.fonts.faces[f.face];
+                f.glyphs = right_to_left(&f.glyphs, |g| font.advance_1000(g));
+            }
+            let w = f.width;
+            out.push((x, f));
+            x += w;
+        }
+        out
+    }
+
     fn draw_marker(&mut self, baseline: f32) {
         let Some(m) = self.marker.take() else { return };
         match m.kind {
             MarkerKind::Text(t) => {
-                let runs = self.shape(&t, false, false, false, m.size);
+                let runs = self.visual_runs(self.shape_levels(&t, false, false, false, m.size, Some(m.rtl)));
                 let w: f32 = runs.iter().map(|r| r.2).sum();
-                self.show_runs(&runs, m.size, m.right - w, baseline, m.color);
+                let x = if m.rtl { m.edge } else { m.edge - w };
+                self.show_runs(&runs, m.size, x, baseline, m.color);
             }
             MarkerKind::Check(checked) => {
                 let s = m.size * 0.72;
-                let (x, y) = (m.right - s, baseline - m.size * 0.05);
+                let x = if m.rtl { m.edge } else { m.edge - s };
+                let y = baseline - m.size * 0.05;
                 let ops = &mut self.page().ops;
                 nums(ops, &[m.color.0, m.color.1, m.color.2]);
                 ops.extend_from_slice(b"RG 0.8 w ");
@@ -1255,13 +1396,19 @@ impl Layout<'_> {
         } else {
             inlines
         };
-        let toks = self.tokenize(inlines, size, ctx.color, bold);
+        let (toks, rtl) = self.tokenize(inlines, size, ctx.color, bold);
         for item in self.wrap(&toks, ctx.w, size) {
             match item {
                 Laid::Line(line) => {
                     let lh = self.line_height(&line);
                     self.ensure(lh);
-                    self.draw_line(&line, ctx.x, lh);
+                    // Right-to-left paragraphs are set flush right.
+                    let x = if rtl {
+                        ctx.x + (ctx.w - line.width).max(0.0)
+                    } else {
+                        ctx.x
+                    };
+                    self.draw_line(&line, x, lh);
                     self.y -= lh;
                 }
                 Laid::Image { alt, src } => self.image(&alt, &src, ctx),
@@ -1444,9 +1591,11 @@ impl Layout<'_> {
         let lines = if lines.is_empty() { &empty[..] } else { lines };
         for line in lines {
             // Wrap long lines at the glyph that would overflow the box.
-            let mut chunks: Vec<Runs> = vec![Vec::new()];
+            // Lines of code are left-to-right paragraphs; right-to-left text
+            // in them is reordered.
+            let mut chunks: Vec<LevelRuns> = vec![Vec::new()];
             let mut x = 0.0;
-            for (face, glyphs, _) in self.shape(line, true, false, false, size) {
+            for (level, face, glyphs, _) in self.shape_levels(line, true, false, false, size, Some(false)) {
                 for g in glyphs {
                     let w = g.adv * size / 1000.0;
                     // Never split a mark from its base.
@@ -1456,11 +1605,11 @@ impl Layout<'_> {
                     }
                     let chunk = chunks.last_mut().expect("chunks is never empty");
                     match chunk.last_mut() {
-                        Some((f, gs, cw)) if *f == face => {
+                        Some((l, f, gs, cw)) if *f == face && *l == level => {
                             gs.push(g);
                             *cw += w;
                         }
-                        _ => chunk.push((face, vec![g], w)),
+                        _ => chunk.push((level, face, vec![g], w)),
                     }
                     x += w;
                 }
@@ -1472,7 +1621,8 @@ impl Layout<'_> {
                 self.at_top = false;
                 self.fill_rect(ctx.x, self.y - lh, ctx.w, lh + 0.3, CODE_BG);
                 let baseline = self.y - lh / 2.0 - size * 0.26;
-                self.show_runs(&chunk, size, ctx.x + pad, baseline, ctx.color);
+                let runs = self.visual_runs(chunk);
+                self.show_runs(&runs, size, ctx.x + pad, baseline, ctx.color);
                 self.y -= lh;
             }
         }
@@ -1489,8 +1639,10 @@ impl Layout<'_> {
         let indent = fs * 1.2;
         self.ensure(fs * LINE_SPACING);
         let start = (self.pages.len() - 1, self.y);
+        // Right-to-left quotes have their bar on the right.
+        let rtl = blocks_rtl(inner);
         let child = Ctx {
-            x: ctx.x + indent,
+            x: if rtl { ctx.x } else { ctx.x + indent },
             w: (ctx.w - indent).max(fs),
             color: MUTED,
             ..ctx
@@ -1498,7 +1650,11 @@ impl Layout<'_> {
         self.blocks(inner, child);
         self.pending_gap = 0.0;
         let end = (self.pages.len() - 1, self.y);
-        let bar_x = ctx.x + fs * 0.3;
+        let bar_x = if rtl {
+            ctx.x + ctx.w - fs * 0.3 - 2.5
+        } else {
+            ctx.x + fs * 0.3
+        };
         for p in start.0..=end.0 {
             let top = if p == start.0 { start.1 } else { self.top() };
             let bot = if p == end.0 { end.1 } else { self.bottom() };
@@ -1534,6 +1690,10 @@ impl Layout<'_> {
             ..ctx
         };
         for (k, item) in items.iter().enumerate() {
+            // Right-to-left items are indented from the right, with the
+            // marker on that side.
+            let rtl = blocks_rtl(&item.blocks);
+            let child = if rtl { Ctx { x: ctx.x, ..child } } else { child };
             let kind = match item.task {
                 Some(c) => MarkerKind::Check(c),
                 None if ordered => MarkerKind::Text(format!("{}.", start.saturating_add(k as u64))),
@@ -1541,7 +1701,12 @@ impl Layout<'_> {
             };
             self.marker = Some(Marker {
                 kind,
-                right: ctx.x + indent - fs * 0.45,
+                edge: if rtl {
+                    ctx.x + ctx.w - indent + fs * 0.45
+                } else {
+                    ctx.x + indent - fs * 0.45
+                },
+                rtl,
                 size: fs,
                 color: ctx.color,
             });
@@ -1560,7 +1725,7 @@ impl Layout<'_> {
         let fs = self.o.font_size;
         let size = fs * 0.92;
         let pad = fs * 0.45;
-        let cell_toks = |l: &Self, raw: &str, bold: bool| -> Vec<Tok> {
+        let cell_toks = |l: &Self, raw: &str, bold: bool| -> (Vec<Tok>, bool) {
             let mut inl = inline::parse(raw, l.refs);
             for i in inl.iter_mut() {
                 if let Inline::Image { alt, .. } = i {
@@ -1573,7 +1738,7 @@ impl Layout<'_> {
             }
             l.tokenize(&inl, size, ctx.color, bold)
         };
-        let mut grid: Vec<Vec<Vec<Tok>>> = Vec::with_capacity(rows.len() + 1);
+        let mut grid: Vec<Vec<(Vec<Tok>, bool)>> = Vec::with_capacity(rows.len() + 1);
         grid.push(header.iter().map(|c| cell_toks(self, c, true)).collect());
         for r in rows {
             grid.push(r.iter().take(cols).map(|c| cell_toks(self, c, false)).collect());
@@ -1583,7 +1748,7 @@ impl Layout<'_> {
         let mut nat = vec![0.0f32; cols];
         let mut min = vec![0.0f32; cols];
         for row in &grid {
-            for (c, toks) in row.iter().enumerate() {
+            for (c, (toks, _)) in row.iter().enumerate() {
                 let mut total = 0.0;
                 for t in toks {
                     match t {
@@ -1592,7 +1757,7 @@ impl Layout<'_> {
                             total += w;
                             min[c] = min[c].max(w.min(ctx.w / cols as f32));
                         }
-                        Tok::Space(w) => total += w,
+                        Tok::Space(w, _) => total += w,
                         _ => {}
                     }
                 }
@@ -1617,17 +1782,19 @@ impl Layout<'_> {
         self.draw_marker(self.y - fs);
         self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, 0.8, RULE);
         for (r, row) in grid.into_iter().enumerate() {
-            let cells: Vec<Vec<Line>> = row
+            let cells: Vec<(Vec<Line>, bool)> = row
                 .into_iter()
                 .enumerate()
-                .map(|(c, toks)| {
-                    self.wrap(&toks, widths[c], size)
+                .map(|(c, (toks, rtl))| {
+                    let lines = self
+                        .wrap(&toks, widths[c], size)
                         .into_iter()
                         .filter_map(|l| if let Laid::Line(l) = l { Some(l) } else { None })
-                        .collect()
+                        .collect();
+                    (lines, rtl)
                 })
                 .collect();
-            let nlines = cells.iter().map(Vec::len).max().unwrap_or(0).max(1);
+            let nlines = cells.iter().map(|c| c.0.len()).max().unwrap_or(0).max(1);
             let bg = r == 0;
             self.ensure(pad);
             if bg {
@@ -1637,7 +1804,7 @@ impl Layout<'_> {
             for k in 0..nlines {
                 let lh = cells
                     .iter()
-                    .filter_map(|c| c.get(k))
+                    .filter_map(|c| c.0.get(k))
                     .map(|l| self.line_height(l))
                     .fold(size * LINE_SPACING, f32::max);
                 if self.y - lh < self.bottom() {
@@ -1648,12 +1815,15 @@ impl Layout<'_> {
                     self.fill_rect(ctx.x, self.y - lh, table_w, lh + 0.3, CODE_BG);
                 }
                 let mut x = ctx.x;
-                for (c, lines) in cells.iter().enumerate() {
+                for (c, (lines, rtl)) in cells.iter().enumerate() {
                     if let Some(line) = lines.get(k) {
                         let slack = (widths[c] - line.width).max(0.0);
+                        // Cells without an alignment follow their text's
+                        // direction.
                         let off = match aligns[c] {
                             Align::Right => slack,
                             Align::Center => slack / 2.0,
+                            Align::None if *rtl => slack,
                             _ => 0.0,
                         };
                         self.draw_line(line, x + pad + off, lh);
@@ -1691,6 +1861,79 @@ impl Layout<'_> {
             }
         }
     }
+}
+
+/// Whether blocks read right-to-left: whether the first strong character
+/// of their first text (UAX #9 rules P2 and P3) is right-to-left. Code
+/// blocks and rules have no direction and are skipped.
+fn blocks_rtl(blocks: &[Block]) -> bool {
+    let text_rtl = |t: &str| bidi::first_strong(&t.chars().collect::<Vec<_>>());
+    fn first(blocks: &[Block], text_rtl: &dyn Fn(&str) -> Option<bool>) -> Option<bool> {
+        blocks.iter().find_map(|b| match b {
+            Block::Heading { text, .. } | Block::Paragraph(text) => text_rtl(text),
+            Block::Quote(inner) => first(inner, text_rtl),
+            Block::List { items, .. } => items.iter().find_map(|i| first(&i.blocks, text_rtl)),
+            Block::Table { header, .. } => header.iter().find_map(|h| text_rtl(h)),
+            Block::Code(_) | Block::Rule => None,
+        })
+    }
+    first(blocks, &text_rtl) == Some(true)
+}
+
+/// Turn the glyphs of a right-to-left run from logical order, positioned as
+/// if the run were left-to-right, into visual order. Each base glyph gets
+/// the span it has in logical order, measured from the right end instead
+/// of the left, so kerning stays between the same glyphs; the marks after
+/// a base (glyphs without advance) keep their offsets from it. `natural`
+/// gives a glyph's advance without kerning.
+fn right_to_left(glyphs: &[G], natural: impl Fn(u16) -> f32) -> Vec<G> {
+    let total: f32 = glyphs.iter().map(|g| g.adv).sum();
+    let mut pens = Vec::with_capacity(glyphs.len());
+    let mut pen = 0.0;
+    for g in glyphs {
+        pens.push(pen);
+        pen += g.adv;
+    }
+    // Clusters of a base and its marks, and where each base goes.
+    let mut clusters = Vec::new();
+    let mut k = 0;
+    while k < glyphs.len() {
+        let start = k;
+        k += 1;
+        while k < glyphs.len() && glyphs[k].adv == 0.0 {
+            k += 1;
+        }
+        let base = &glyphs[start];
+        let width = if base.adv == 0.0 { 0.0 } else { natural(base.id) };
+        clusters.push((start..k, total - pens[start] - width));
+    }
+    clusters.reverse();
+    let mut out = Vec::with_capacity(glyphs.len());
+    let mut pen = 0.0;
+    for (c, (range, x)) in clusters.iter().enumerate() {
+        let next = clusters.get(c + 1).map_or(total, |n| n.1);
+        let b = range.start;
+        let base = glyphs[b];
+        let adv = next - pen;
+        out.push(G {
+            id: base.id,
+            adv,
+            dx: x + base.dx - pen,
+            dy: base.dy,
+        });
+        let after = pen + adv;
+        for m in b + 1..range.end {
+            let g = glyphs[m];
+            out.push(G {
+                id: g.id,
+                adv: 0.0,
+                dx: x + pens[m] - pens[b] + g.dx - after,
+                dy: g.dy,
+            });
+        }
+        pen = after;
+    }
+    out
 }
 
 /// Place marks on their bases for a font without mark positioning data,
@@ -1837,6 +2080,30 @@ mod tests {
         assert!(acute[1] + a1.dy > base[3]);
         assert!(dia[1] + a2.dy > acute[3] + a1.dy);
         assert!(dot[3] + a3.dy < base[1]);
+    }
+
+    #[test]
+    fn right_to_left_runs_keep_kerning_and_marks() {
+        // Logical order: A (500 wide, kerned by -20 against B), a mark
+        // centred on A, then B (600 wide).
+        let g = |id, adv, dx| G { id, adv, dx, dy: 0.0 };
+        let logical = [g(1, 480.0, 0.0), g(2, 0.0, -250.0), g(3, 600.0, 0.0)];
+        let natural = |id: u16| if id == 1 { 500.0 } else { 600.0 };
+        let visual = right_to_left(&logical, natural);
+        // Drawn positions: pen plus offset.
+        let mut pen = 0.0;
+        let placed: Vec<(u16, f32)> = visual
+            .iter()
+            .map(|g| {
+                let at = (g.id, pen + g.dx);
+                pen += g.adv;
+                at
+            })
+            .collect();
+        // B on the left, A 20 closer to it than its width, the mark where it
+        // was relative to A; the total width is unchanged.
+        assert_eq!(placed, [(3, 0.0), (1, 580.0), (2, 810.0)]);
+        assert_eq!(pen, 1080.0);
     }
 
     #[test]

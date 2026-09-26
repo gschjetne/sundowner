@@ -766,7 +766,7 @@ mod tests {
                     cluster: k,
                 })
                 .collect();
-            for script in [Script::Latin, Script::Greek, Script::Cyrillic, Script::Other] {
+            for script in Script::ALL {
                 face.substitute(script, &mut g);
             }
         }

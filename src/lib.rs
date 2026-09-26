@@ -1,6 +1,8 @@
 //! sundowner: a dependency-free Markdown to PDF converter.
 #![forbid(unsafe_code)]
 
+pub mod bidi;
+pub mod bidi_table;
 pub mod chars;
 pub mod config;
 pub mod flate;
