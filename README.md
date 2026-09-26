@@ -126,8 +126,8 @@ and `#anchor` links become clickable; other links are shown as plain text.
 ## Design
 
 - **No dependencies.** Everything is in `src/`: the Markdown parser, layout
-  engine, TrueType parser and subsetter, PDF writer, DEFLATE codec and
-  PNG/JPEG readers. The bundled fonts are compiled into the binary.
+  engine, Unicode line breaker, TrueType parser and subsetter, OpenType
+  glyph substitution, PDF writer, DEFLATE codec and PNG/JPEG readers. The bundled fonts are compiled into the binary.
 - **Self-contained PDFs.**
   - Every font is embedded as a subset (Type 0 / CIDFontType2 with
     Identity-H encoding), so viewers never substitute fonts.
@@ -135,12 +135,32 @@ and `#anchor` links become clickable; other links are shown as plain text.
   - A one-word document is about 3 KB.
   - Subset names are derived from their contents, so identical input gives
     byte-identical output.
+- **Ligatures and contextual forms.** Glyph substitutions come from the
+  font's OpenType GSUB table, with the features HarfBuzz applies by default
+  to Latin, Greek and Cyrillic: `ccmp`, `locl`, `rlig`, `liga`, `clig`,
+  `calt`, `rclt` and `rvrn`, from the language system of the text's script.
+  All GSUB lookup types are supported, including chained contextual and
+  reverse chained substitutions, along with the lookup flags that skip
+  marks or ligatures. For the bundled fonts the result matches HarfBuzz
+  glyph for glyph. Ligatures map back to their characters in the ToUnicode
+  map, so copying `office` from the PDF gives `office`. A zero-width
+  non-joiner (U+200C) prevents a ligature. Code gets the same treatment, so
+  programming fonts with ligatures show them; Cousine has none.
 - **Kerning.** Pairs of adjacent glyphs are kerned using the font's
   OpenType `kern` feature (GPOS pair adjustment). Fonts without GPOS
   kerning fall back to the legacy `kern` table. Kerning is included when
-  measuring text, so line breaks account for it. It applies within a word
-  in one font, not across spaces or font changes. As the OpenType spec
-  prescribes, adjustments from all of the font's kerning lookups add up.
+  measuring text, so line breaks account for it. It applies to text in one
+  font, not across spaces or font changes. As the OpenType spec prescribes,
+  adjustments from all of the font's kerning lookups add up.
+- **Line breaking** follows the Unicode Line Breaking Algorithm
+  ([UAX #14](https://www.unicode.org/reports/tr14/), Unicode 17.0) in full,
+  and passes its official conformance test. Lines break at spaces, after
+  hyphens and dashes, and between CJK characters. They do not break before
+  closing punctuation (`word !`, `« quote »`), inside numbers such as
+  `$12.50`, or at no-break spaces. Break opportunities are computed over
+  the whole paragraph, across style changes. A soft hyphen (U+00AD) marks
+  a possible break, and shows a hyphen only if the line breaks there. There
+  is no automatic hyphenation.
 - **Compact output.** Content streams are compressed with a small built-in
   DEFLATE encoder (LZ77 with short hash chains and the fixed Huffman code).
   This is simple and fast but compresses less than zlib or gzip at their
@@ -170,12 +190,11 @@ and `#anchor` links become clickable; other links are shown as plain text.
 
 ## Limitations
 
-- **Limited text shaping.** Each character maps to one glyph. Pair kerning
-  is applied (see above), but there are no ligatures, no contextual forms,
-  no mark positioning and no right-to-left layout. Latin, Greek, Cyrillic
-  and CJK render correctly. Arabic, Hebrew and Indic scripts do not.
-- **Line breaking** happens at spaces, and between any two CJK characters.
-  It does not implement the full Unicode line-breaking rules.
+- **Shaping is for Latin, Greek and Cyrillic.** Ligatures and contextual
+  forms are applied (see above), but there is no mark positioning, no
+  right-to-left layout and no script-specific shaping. Latin, Greek,
+  Cyrillic and CJK render correctly. Arabic, Hebrew and Indic scripts do
+  not.
 - **Combining marks** are drawn as separate glyphs. They are not composed
   into precomposed characters.
 - Remote images, interlaced PNGs and formats other than PNG and JPEG are not
@@ -196,6 +215,12 @@ cargo test                                   # quick
 cargo test --release -- --include-ignored    # plus the stress tests (as in CI)
 ```
 
+The line breaking tables in `src/linebreak_table.rs` are generated from the
+Unicode Character Database by `tools/gen_linebreak.py` (Python 3, standard
+library only). It also writes the conformance test data in `tests/data/`.
+To move to another Unicode version, change `VERSION` in the script and run
+it.
+
 Requires Rust 1.87 or newer (the code uses `u*::is_multiple_of`, stabilized
 in 1.87). CI checks formatting, clippy, the full test suite, the static build
 and the minimum Rust version.
@@ -205,4 +230,6 @@ and the minimum Rust version.
 The code is licensed under the MIT License (see `LICENSE`). The bundled
 fonts in `fonts/` are licensed under the SIL Open Font License 1.1. See
 [`fonts/README.md`](fonts/README.md) for their sources, changes and license
-compliance, or run `sundowner --licenses`.
+compliance, or run `sundowner --licenses`. The line breaking tables and test
+data are derived from the Unicode Character Database, under the Unicode
+License v3 (see `LICENSE-UNICODE`).

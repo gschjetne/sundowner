@@ -31,7 +31,8 @@ OPTIONS:
         --no-images         Do not load image files (images must be relative paths
                             inside the input file's directory)
     -q, --quiet             Do not print warnings
-        --licenses          Show the licenses of sundowner and its bundled fonts
+        --licenses          Show the licenses of sundowner, its bundled fonts
+                            and the Unicode data it includes
     -h, --help              Show this help
     -V, --version           Show version
 
@@ -71,6 +72,11 @@ fn licenses() -> String {
     for (name, text) in FONT_LICENSES {
         s.push_str(&format!("\n==== {name} ====\n\n{text}\n"));
     }
+    s.push_str(&format!(
+        "\n==== Unicode Character Database {} (line breaking properties) ====\n\n{}",
+        sundowner::linebreak_table::UNICODE_VERSION,
+        include_str!("../LICENSE-UNICODE")
+    ));
     s
 }
 

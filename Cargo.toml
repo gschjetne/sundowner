@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Fast, dependency-free Markdown to PDF converter"
-license = "MIT AND OFL-1.1"
+license = "MIT AND OFL-1.1 AND Unicode-3.0"
 
 [dependencies]
 

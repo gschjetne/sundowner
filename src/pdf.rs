@@ -313,7 +313,7 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32) -> Vec<u8> {
 
 /// Embed one face as a subset Type0/CIDFontType2 font with Identity-H
 /// encoding: content streams address glyphs by their 2-byte glyph ID.
-fn write_font(w: &mut Writer, face: &Face, used: &BTreeMap<u16, char>, ids: [usize; 5]) {
+fn write_font(w: &mut Writer, face: &Face, used: &BTreeMap<u16, String>, ids: [usize; 5]) {
     let [type0, cid, desc, file, tounicode] = ids;
     let gids: BTreeSet<u16> = used.keys().copied().collect();
 
@@ -405,14 +405,17 @@ fn write_font(w: &mut Writer, face: &Face, used: &BTreeMap<u16, char>, ids: [usi
          /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
          1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n",
     );
-    let entries: Vec<(&u16, &char)> = used.iter().filter(|(&g, _)| g != 0).collect();
+    // A glyph can stand for several characters (a ligature). Glyphs that
+    // stand for none (the second glyph of a decomposed character) are left
+    // out.
+    let entries: Vec<(&u16, &String)> = used.iter().filter(|(&g, t)| g != 0 && !t.is_empty()).collect();
     for chunk in entries.chunks(100) {
         cmap.push_str(&format!("{} beginbfchar\n", chunk.len()));
-        for (g, c) in chunk {
-            let mut buf = [0u16; 2];
-            let hex: String = c
-                .encode_utf16(&mut buf)
-                .iter()
+        for (g, text) in chunk {
+            // At most 512 bytes (256 UTF-16 code units) per destination.
+            let hex: String = text
+                .encode_utf16()
+                .take(256)
                 .map(|u| format!("{u:04X}"))
                 .collect();
             cmap.push_str(&format!("<{g:04X}> <{hex}>\n"));
