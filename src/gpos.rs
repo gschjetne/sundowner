@@ -30,7 +30,7 @@ struct Lookup {
 #[derive(Default)]
 pub struct MarkPositioning {
     lookups: Vec<Option<Lookup>>,
-    plans: [Vec<u16>; 4],
+    plans: [Vec<u16>; Script::ALL.len()],
 }
 
 const BUDGET: usize = 100_000;
@@ -80,10 +80,10 @@ impl MarkPositioning {
 
 fn try_parse(t: &[u8]) -> Option<MarkPositioning> {
     let mut budget = Budget(BUDGET);
-    let mut plans: [Vec<u16>; 4] = Default::default();
+    let mut plans: [Vec<u16>; Script::ALL.len()] = Default::default();
     // A malformed or budget-exhausting script section only loses that
     // script; Latin comes first so it survives problems in later ones.
-    for s in [Script::Latin, Script::Greek, Script::Cyrillic, Script::Other] {
+    for s in Script::ALL {
         plans[s as usize] =
             otl::feature_lookups(t, Scripts::First(s.tags()), &[b"mark", b"mkmk"], &mut budget)
                 .unwrap_or_default();

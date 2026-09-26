@@ -38,7 +38,7 @@ impl Family {
 }
 
 pub struct Fonts {
-    pub faces: Vec<Face>,
+    pub faces: Faces,
     /// Families tried in order for body text and headings.
     pub body: Vec<Family>,
     /// Families tried in order for code.
@@ -49,55 +49,105 @@ pub struct Fonts {
 
 impl std::fmt::Debug for Fonts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let names: Vec<&str> = self.faces.iter().map(|x| x.postscript_name.as_str()).collect();
-        f.debug_struct("Fonts").field("faces", &names).finish()
+        f.debug_struct("Fonts").field("faces", &self.faces.len()).finish()
     }
 }
 
-/// A bundled font file and its license notice.
+/// A bundled font file.
 pub struct Bundled {
+    /// Path below `fonts/`.
     pub file: &'static str,
     pub data: &'static [u8],
+    /// `data` is zlib-compressed and inflated when the font is first used.
+    pub compressed: bool,
 }
 
-pub const BUNDLED: [Bundled; 8] = [
-    Bundled {
-        file: "Alegreya-Regular.ttf",
-        data: include_bytes!("../fonts/Alegreya-Regular.ttf"),
-    },
-    Bundled {
-        file: "Alegreya-Bold.ttf",
-        data: include_bytes!("../fonts/Alegreya-Bold.ttf"),
-    },
-    Bundled {
-        file: "Alegreya-Italic.ttf",
-        data: include_bytes!("../fonts/Alegreya-Italic.ttf"),
-    },
-    Bundled {
-        file: "Alegreya-BoldItalic.ttf",
-        data: include_bytes!("../fonts/Alegreya-BoldItalic.ttf"),
-    },
-    Bundled {
-        file: "Cousine-Regular.ttf",
-        data: include_bytes!("../fonts/Cousine-Regular.ttf"),
-    },
-    Bundled {
-        file: "Cousine-Bold.ttf",
-        data: include_bytes!("../fonts/Cousine-Bold.ttf"),
-    },
-    Bundled {
-        file: "Cousine-Italic.ttf",
-        data: include_bytes!("../fonts/Cousine-Italic.ttf"),
-    },
-    Bundled {
-        file: "Cousine-BoldItalic.ttf",
-        data: include_bytes!("../fonts/Cousine-BoldItalic.ttf"),
-    },
-];
+macro_rules! base {
+    ($file:literal) => {
+        Bundled {
+            file: $file,
+            data: include_bytes!(concat!("../fonts/", $file)),
+            compressed: false,
+        }
+    };
+}
+
+#[cfg(feature = "silk")]
+macro_rules! silk {
+    ($file:literal) => {
+        Bundled {
+            file: concat!("silk/", $file),
+            data: include_bytes!(concat!(env!("OUT_DIR"), "/", $file, ".z")),
+            compressed: true,
+        }
+    };
+}
+
+macro_rules! bundled {
+    ($($extra:expr),*) => {
+        &[
+            base!("Alegreya-Regular.ttf"),
+            base!("Alegreya-Bold.ttf"),
+            base!("Alegreya-Italic.ttf"),
+            base!("Alegreya-BoldItalic.ttf"),
+            base!("Cousine-Regular.ttf"),
+            base!("Cousine-Bold.ttf"),
+            base!("Cousine-Italic.ttf"),
+            base!("Cousine-BoldItalic.ttf"),
+            $($extra),*
+        ]
+    };
+}
+
+/// The name of the set of bundled fonts this binary was built with.
+#[cfg(not(feature = "silk"))]
+pub const TIER: &str = "europa";
+#[cfg(feature = "silk")]
+pub const TIER: &str = "silk";
+
+/// The bundled fonts: the base set, then the regular and bold faces of each
+/// family of the tier.
+#[cfg(not(feature = "silk"))]
+pub const BUNDLED: &[Bundled] = bundled!();
+#[cfg(feature = "silk")]
+pub const BUNDLED: &[Bundled] = bundled!(
+    silk!("FrankRuhlLibre-Regular.ttf"),
+    silk!("FrankRuhlLibre-Bold.ttf"),
+    silk!("NotoSerifHebrew-Regular.ttf"),
+    silk!("NotoSerifHebrew-Bold.ttf"),
+    silk!("NotoSerifArmenian-Regular.ttf"),
+    silk!("NotoSerifArmenian-Bold.ttf"),
+    silk!("NotoSerifSC-Regular.ttf"),
+    silk!("NotoSerifSC-Bold.ttf"),
+    silk!("GowunBatang-Regular.ttf"),
+    silk!("GowunBatang-Bold.ttf")
+);
+
+/// Number of bundled fonts in the base set (Alegreya and Cousine).
+const BASE_FONTS: usize = 8;
+
+/// Number of families of the tier that come before Cousine in the fallback
+/// chains: the Hebrew and Armenian ones, so Hebrew is not set in Cousine.
+/// The CJK fonts come after it, so the symbols and box drawing characters
+/// that Cousine has keep coming from it (and do not unpack a CJK font).
+const TIER_BEFORE_MONO: usize = if cfg!(feature = "silk") { 3 } else { 0 };
+
+/// The bytes of a bundled font, inflated on first use and kept for the
+/// rest of the run.
+fn bundled_data(i: usize) -> &'static [u8] {
+    static INFLATED: [OnceLock<Vec<u8>>; BUNDLED.len()] = [const { OnceLock::new() }; BUNDLED.len()];
+    let b = &BUNDLED[i];
+    if !b.compressed {
+        return b.data;
+    }
+    INFLATED[i].get_or_init(|| {
+        crate::flate::zlib_decompress(b.data, MAX_FONT_FILE as usize).expect("bundled fonts are valid")
+    })
+}
 
 /// License notices for the bundled fonts, as required by the SIL Open Font
 /// License (shown by `sundowner --licenses`).
-pub const FONT_LICENSES: [(&str, &str); 2] = [
+pub const FONT_LICENSES: &[(&str, &str)] = &[
     (
         "Alegreya (Regular, Bold, Italic, Bold Italic; static instances generated from the variable \
          fonts, see fonts/build.py)",
@@ -107,7 +157,70 @@ pub const FONT_LICENSES: [(&str, &str); 2] = [
         "Cousine (Regular, Bold, Italic, Bold Italic; unmodified)",
         include_str!("../fonts/OFL-Cousine.txt"),
     ),
+    #[cfg(feature = "silk")]
+    (
+        "Frank Ruhl Libre (Regular, Bold; static instances generated from the variable font)",
+        include_str!("../fonts/silk/OFL-FrankRuhlLibre.txt"),
+    ),
+    #[cfg(feature = "silk")]
+    (
+        "Noto Serif Hebrew (Regular, Bold; static instances generated from the variable font)",
+        include_str!("../fonts/silk/OFL-NotoSerifHebrew.txt"),
+    ),
+    #[cfg(feature = "silk")]
+    (
+        "Noto Serif Armenian (Regular, Bold; static instances generated from the variable font)",
+        include_str!("../fonts/silk/OFL-NotoSerifArmenian.txt"),
+    ),
+    #[cfg(feature = "silk")]
+    (
+        "Noto Serif SC (Regular, Bold; static instances generated from the variable font)",
+        include_str!("../fonts/silk/OFL-NotoSerifSC.txt"),
+    ),
+    #[cfg(feature = "silk")]
+    (
+        "Gowun Batang (Regular, Bold; unmodified)",
+        include_str!("../fonts/silk/OFL-GowunBatang.txt"),
+    ),
 ];
+
+/// The loaded faces, indexed by [`FaceId`]. Compressed bundled fonts are
+/// only inflated and parsed when a face is first looked at, so a document
+/// that never reaches them in a fallback chain does not pay for them.
+pub struct Faces(Vec<Slot>);
+
+enum Slot {
+    Ready(Face),
+    Bundled(usize, OnceLock<Face>),
+}
+
+impl Faces {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn push(&mut self, face: Face) -> FaceId {
+        self.0.push(Slot::Ready(face));
+        self.0.len() - 1
+    }
+}
+
+impl std::ops::Index<FaceId> for Faces {
+    type Output = Face;
+
+    fn index(&self, id: FaceId) -> &Face {
+        match &self.0[id] {
+            Slot::Ready(face) => face,
+            Slot::Bundled(i, face) => face.get_or_init(|| {
+                Face::parse(Cow::Borrowed(bundled_data(*i)), 0).expect("bundled fonts are valid")
+            }),
+        }
+    }
+}
 
 /// A family whose faces are given as font files: `(path, collection index)`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -145,31 +258,45 @@ impl Fonts {
     /// - code: code family (default Cousine), fallbacks, body family,
     ///   bundled families
     ///
+    /// The bundled families are Alegreya, the tier's Hebrew and Armenian
+    /// families, Cousine, and the tier's CJK families.
+    ///
     /// The bundled fonts are always the final fallback.
     pub fn load(spec: &FontSpec) -> Result<Fonts, String> {
-        let mut faces: Vec<Face> = Vec::new();
-        let bundled = |i: usize, faces: &mut Vec<Face>| -> Result<FaceId, String> {
-            faces.push(
-                Face::parse(Cow::Borrowed(BUNDLED[i].data), 0)
-                    .map_err(|e| format!("{}: {e}", BUNDLED[i].file))?,
-            );
-            Ok(faces.len() - 1)
-        };
+        let mut faces = Faces(Vec::with_capacity(BUNDLED.len()));
+        for (i, b) in BUNDLED.iter().enumerate() {
+            let slot = if b.compressed {
+                Slot::Bundled(i, OnceLock::new())
+            } else {
+                Slot::Ready(Face::parse(Cow::Borrowed(b.data), 0).map_err(|e| format!("{}: {e}", b.file))?)
+            };
+            faces.0.push(slot);
+        }
         let serif = Family {
-            regular: bundled(0, &mut faces)?,
-            bold: Some(bundled(1, &mut faces)?),
-            italic: Some(bundled(2, &mut faces)?),
-            bold_italic: Some(bundled(3, &mut faces)?),
+            regular: 0,
+            bold: Some(1),
+            italic: Some(2),
+            bold_italic: Some(3),
         };
         let mono = Family {
-            regular: bundled(4, &mut faces)?,
-            bold: Some(bundled(5, &mut faces)?),
-            italic: Some(bundled(6, &mut faces)?),
-            bold_italic: Some(bundled(7, &mut faces)?),
+            regular: 4,
+            bold: Some(5),
+            italic: Some(6),
+            bold_italic: Some(7),
         };
+        // The families of the tier: regular and bold, no italics.
+        let tier: Vec<Family> = (BASE_FONTS..BUNDLED.len())
+            .step_by(2)
+            .map(|i| Family {
+                regular: i,
+                bold: Some(i + 1),
+                italic: None,
+                bold_italic: None,
+            })
+            .collect();
 
         let mut warnings = Vec::new();
-        let mut load_family = |f: &FamilySpec, what: &str, faces: &mut Vec<Face>| -> Result<Family, String> {
+        let mut load_family = |f: &FamilySpec, what: &str, faces: &mut Faces| -> Result<Family, String> {
             let mut one =
                 |p: &Option<(std::path::PathBuf, u32)>, weight: f32| -> Result<Option<FaceId>, String> {
                     let Some((path, index)) = p else { return Ok(None) };
@@ -181,8 +308,7 @@ impl Fonts {
                         path.display()
                     ));
                     }
-                    faces.push(face);
-                    Ok(Some(faces.len() - 1))
+                    Ok(Some(faces.push(face)))
                 };
             let regular =
                 one(&f.regular, 400.0)?.ok_or_else(|| format!("{what}: a 'regular' font is required"))?;
@@ -213,9 +339,16 @@ impl Fonts {
         let main_mono = user_mono.unwrap_or(mono);
         let chain = |first: Family| -> Vec<Family> {
             let mut out: Vec<Family> = Vec::new();
-            for f in [first].iter().chain(&fallbacks).chain(&[main_body, serif, mono]) {
-                if !out.contains(f) {
-                    out.push(*f);
+            let families = [first].into_iter().chain(fallbacks.iter().copied());
+            let (alphabets, cjk) = tier.split_at(TIER_BEFORE_MONO);
+            for f in families
+                .chain([main_body, serif])
+                .chain(alphabets.iter().copied())
+                .chain([mono])
+                .chain(cjk.iter().copied())
+            {
+                if !out.contains(&f) {
+                    out.push(f);
                 }
             }
             out
@@ -297,6 +430,7 @@ mod tests {
         assert!(f.faces[face].italic && f.faces[face].postscript_name.contains("Cousine"));
         let (face, _) = f.resolve('a', false, true, true).unwrap();
         assert!(f.faces[face].italic);
+        #[cfg(not(feature = "silk"))]
         assert!(f.resolve('中', false, false, false).is_none());
         assert!(f.warnings.is_empty());
     }
@@ -321,7 +455,8 @@ mod tests {
             ..Default::default()
         };
         let f = Fonts::load(&spec).unwrap();
-        assert_eq!(f.faces.len(), 9);
+        let user = BUNDLED.len();
+        assert_eq!(f.faces.len(), user + 1);
         assert_eq!(
             f.resolve('x', false, false, false).unwrap().0,
             0,
@@ -332,7 +467,7 @@ mod tests {
             4,
             "bundled Cousine"
         );
-        assert_eq!(f.body[1].regular, 8, "the fallback is next in line");
+        assert_eq!(f.body[1].regular, user, "the fallback is next in line");
     }
 
     #[test]
@@ -347,17 +482,17 @@ mod tests {
         let f = Fonts::load(&spec).unwrap();
         let (face, _) = f.resolve('x', false, true, true).unwrap();
         assert_eq!(
-            face, 8,
+            face,
+            BUNDLED.len(),
             "no bold italic in the user family: its regular face, never a fake"
         );
-        assert_eq!(
-            f.body.last().unwrap().regular,
-            4,
-            "bundled fonts remain the last fallback"
+        assert!(
+            f.body.iter().any(|fam| fam.regular == 4) && f.body.last().unwrap().regular < BUNDLED.len(),
+            "bundled fonts remain the last fallbacks"
         );
     }
 
-    /// Every bundled face must cover Latin (Basic, Latin-1 and Extended-A),
+    /// Every face of the base set must cover Latin (Basic, Latin-1 and Extended-A),
     /// modern and polytonic Greek and Cyrillic, so no style or code falls
     /// back to another font or to boxes.
     #[test]
@@ -386,9 +521,69 @@ mod tests {
             "Latin, Greek, Cyrillic, polytonic"
         );
         assert_eq!(f.faces.len(), BUNDLED.len());
-        for (face, b) in f.faces.iter().zip(&BUNDLED) {
+        for (i, b) in BUNDLED[..BASE_FONTS].iter().enumerate() {
+            let face = &f.faces[i];
             let missing: String = wanted.iter().filter(|&&c| face.glyph(c).is_none()).collect();
             assert!(missing.is_empty(), "{} lacks {missing:?}", b.file);
+        }
+    }
+
+    /// Every script of the silk tier is set in its intended family, in
+    /// every style, with no gaps.
+    #[cfg(feature = "silk")]
+    #[test]
+    fn silk_covers_its_scripts() {
+        let f = Fonts::builtin();
+        let chars = |r: std::ops::RangeInclusive<u32>| r.filter_map(char::from_u32).collect::<Vec<_>>();
+        let hebrew: Vec<char> = chars(0x5D0..=0x5EA)
+            .into_iter()
+            .chain(chars(0x5B0..=0x5BD))
+            .chain([
+                '\u{5BF}', '\u{5C1}', '\u{5C2}', '\u{5C7}', '\u{5BE}', '\u{5F3}', '\u{5F4}',
+            ])
+            .collect();
+        let armenian: Vec<char> = chars(0x531..=0x556)
+            .into_iter()
+            .chain(chars(0x559..=0x55F))
+            .chain(chars(0x561..=0x587))
+            .chain(['\u{589}', '\u{58A}'])
+            .collect();
+        let han: Vec<char> = chars(0x3400..=0x4DBF)
+            .into_iter()
+            .chain(chars(0x4E00..=0x9FFF))
+            .collect();
+        let kana: Vec<char> = chars(0x3041..=0x3096)
+            .into_iter()
+            .chain(chars(0x30A1..=0x30FA))
+            .chain(chars(0x3001..=0x303F))
+            .collect();
+        // Symbols that Cousine has come from it, not from a CJK font.
+        for c in ['─', '█', '≡', '♠'] {
+            let (face, _) = f.resolve(c, false, false, false).unwrap();
+            assert_eq!(face, 4, "{c}");
+        }
+        let cases: [(&str, &[char], &str); 6] = [
+            ("Hebrew", &hebrew, "FrankRuhlLibre"),
+            ("cantillation", &chars(0x591..=0x5AF), "NotoSerifHebrew"),
+            ("Armenian", &armenian, "NotoSerifArmenian"),
+            ("Han", &han, "NotoSerifSC"),
+            ("kana", &kana, "NotoSerifSC"),
+            ("Hangul", &chars(0xAC00..=0xD7A3), "GowunBatang"),
+        ];
+        for (what, cs, family) in cases {
+            for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+                for &c in cs {
+                    let (face, _) = f
+                        .resolve(c, false, bold, italic)
+                        .unwrap_or_else(|| panic!("{what}: U+{:04X} not covered", c as u32));
+                    let name = &f.faces[face].postscript_name;
+                    assert!(
+                        name.starts_with(family) && name.ends_with(if bold { "-Bold" } else { "-Regular" }),
+                        "{what}: U+{:04X} set in {name}",
+                        c as u32
+                    );
+                }
+            }
         }
     }
 

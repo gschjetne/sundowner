@@ -1,8 +1,9 @@
 //! Glyph substitution from the OpenType GSUB table: ligatures, contextual
 //! alternates and the other substitutions a font applies by default.
 //!
-//! The features applied are those HarfBuzz enables by default for Latin,
-//! Greek and Cyrillic text: `rvrn`, `ccmp`, `locl`, `rlig`, `liga`, `clig`,
+//! The features applied are those HarfBuzz enables by default for the
+//! scripts that need no script-specific shaping (Latin, Greek, Cyrillic,
+//! Armenian, Hebrew, Chinese, Japanese and Korean): `rvrn`, `ccmp`, `locl`, `rlig`, `liga`, `clig`,
 //! `calt` and `rclt`, taken from the default language system of the text's
 //! script. Their lookups are applied in lookup-list order, each one over the
 //! whole glyph sequence, as the OpenType specification prescribes. All
@@ -36,6 +37,11 @@ pub enum Script {
     Latin,
     Greek,
     Cyrillic,
+    Armenian,
+    Hebrew,
+    Han,
+    Kana,
+    Hangul,
     /// Anything else, including text without letters.
     Other,
 }
@@ -57,6 +63,19 @@ impl Script {
             }
             0x1F00..=0x1FFF => Script::Greek,
             0x400..=0x52F | 0x1C80..=0x1C8F | 0x2DE0..=0x2DFF | 0xA640..=0xA69F => Script::Cyrillic,
+            0x531..=0x556 | 0x559..=0x58A | 0x58D..=0x58F | 0xFB13..=0xFB17 => Script::Armenian,
+            0x591..=0x5C7 | 0x5D0..=0x5F4 | 0xFB1D..=0xFB4F => Script::Hebrew,
+            0x2E80..=0x2FDF | 0x3005 | 0x3007 | 0x3021..=0x3029 | 0x3038..=0x303B | 0x3400..=0x4DBF => {
+                Script::Han
+            }
+            0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x20000..=0x3FFFF => Script::Han,
+            0x3041..=0x3096 | 0x309D..=0x309F | 0x30A1..=0x30FA | 0x30FD..=0x30FF | 0x31F0..=0x31FF => {
+                Script::Kana
+            }
+            0xFF66..=0xFF6F | 0xFF71..=0xFF9D | 0x1B000..=0x1B16F => Script::Kana,
+            0x1100..=0x11FF | 0x3131..=0x318E | 0xA960..=0xA97F | 0xAC00..=0xD7FF | 0xFFA0..=0xFFDC => {
+                Script::Hangul
+            }
             _ => return None,
         })
     }
@@ -67,9 +86,27 @@ impl Script {
             Script::Latin => &[b"latn", b"DFLT", b"dflt"],
             Script::Greek => &[b"grek", b"DFLT", b"dflt", b"latn"],
             Script::Cyrillic => &[b"cyrl", b"DFLT", b"dflt", b"latn"],
+            Script::Armenian => &[b"armn", b"DFLT", b"dflt", b"latn"],
+            Script::Hebrew => &[b"hebr", b"DFLT", b"dflt", b"latn"],
+            Script::Han => &[b"hani", b"DFLT", b"dflt", b"latn"],
+            Script::Kana => &[b"kana", b"DFLT", b"dflt", b"latn"],
+            Script::Hangul => &[b"hang", b"DFLT", b"dflt", b"latn"],
             Script::Other => &[b"DFLT", b"dflt", b"latn"],
         }
     }
+
+    /// Every script, Latin first.
+    pub const ALL: [Script; 9] = [
+        Script::Latin,
+        Script::Greek,
+        Script::Cyrillic,
+        Script::Armenian,
+        Script::Hebrew,
+        Script::Han,
+        Script::Kana,
+        Script::Hangul,
+        Script::Other,
+    ];
 
     fn index(self) -> usize {
         self as usize
@@ -99,7 +136,7 @@ struct Lookup {
 pub struct Gsub {
     lookups: Vec<Option<Lookup>>,
     /// Lookup indices to apply, in order, per [`Script`].
-    plans: [Vec<u16>; 4],
+    plans: [Vec<u16>; Script::ALL.len()],
     gdef: Gdef,
 }
 
@@ -119,10 +156,10 @@ impl Gsub {
 
     fn try_parse(t: &[u8], num_glyphs: u16) -> Option<Gsub> {
         let mut budget = Budget(BUDGET);
-        let mut plans: [Vec<u16>; 4] = Default::default();
+        let mut plans: [Vec<u16>; Script::ALL.len()] = Default::default();
         // A malformed or budget-exhausting script section only loses that
         // script; Latin comes first so it survives problems in later ones.
-        for s in [Script::Latin, Script::Greek, Script::Cyrillic, Script::Other] {
+        for s in Script::ALL {
             plans[s.index()] =
                 otl::feature_lookups(t, Scripts::First(s.tags()), &FEATURES, &mut budget).unwrap_or_default();
         }

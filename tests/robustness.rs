@@ -86,6 +86,18 @@ const PIECES: &[&str] = &[
     "\r",
     "\u{FEFF}",
     "\u{301}",
+    "שָׁלוֹם",
+    "עברית",
+    "\u{5B8}",
+    "Հայ",
+    "123",
+    "\u{202B}",
+    "\u{202E}",
+    "\u{202C}",
+    "\u{2067}",
+    "\u{2068}",
+    "\u{2069}",
+    "\u{200F}",
     "=",
     "![a](missing.png)",
 ];
@@ -170,6 +182,12 @@ fn adversarial(scale: usize) {
         "1. ".repeat(50_000 / scale),
         "# ".repeat(100_000 / scale),
         "![".repeat(50_000 / scale) + &"](a)".repeat(10),
+        "א".repeat(1_000_000 / scale),
+        "א b ".repeat(100_000 / scale),
+        "\u{202B}".repeat(100_000 / scale) + "x",
+        "\u{2067}א(".repeat(50_000 / scale) + &")\u{2069}".repeat(50_000 / scale),
+        "(א".repeat(100_000 / scale) + &")".repeat(100_000 / scale),
+        "```\n".to_string() + &"שלום (x) עולם\n".repeat(20_000 / scale),
     ];
     for case in &cases {
         let start = Instant::now();

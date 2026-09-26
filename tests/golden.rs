@@ -199,9 +199,9 @@ fn every_script_in_the_bundled_fonts_uses_real_glyphs() {
 
 #[test]
 fn uncovered_characters_warn_and_use_notdef() {
-    let out = render("日本 🎉");
+    let out = render("กข 🎉");
     assert_eq!(out.warnings.len(), 1);
-    assert!(out.warnings[0].contains("U+65E5") && out.warnings[0].contains("U+1F389"));
+    assert!(out.warnings[0].contains("U+0E01") && out.warnings[0].contains("U+1F389"));
     let r = runs(&out, 0);
     assert!(r.iter().all(|x| x.face == REGULAR));
     // The glyph is .notdef (ID 0), which maps back to the first missing character.
@@ -391,4 +391,103 @@ fn joined_words_kern_past_trailing_marks() {
     let with_mark = x_after("A\u{331}\u{AD}VATAR x");
     let without = x_after("A\u{AD}VATAR x");
     assert!((with_mark - without).abs() < 0.01, "{with_mark} vs {without}");
+}
+
+/// The text of a run as read in logical order, for right-to-left runs
+/// (whose glyphs are drawn, and so mapped back, in visual order).
+fn logical(s: &str) -> String {
+    s.chars().rev().collect()
+}
+
+fn rtl_run<'a>(runs: &'a [Run], text: &str) -> &'a Run {
+    run(runs, &logical(text))
+}
+
+#[test]
+fn right_to_left_paragraphs_are_reordered_and_flush_right() {
+    let out = render("שלום עולם\n\nabc");
+    let r = runs(&out, 0);
+    let (first, second) = (rtl_run(&r, "שלום"), rtl_run(&r, "עולם"));
+    // The first word is on the right, and the paragraph ends at the right
+    // margin while the Latin one starts at the left.
+    assert!(first.x > second.x, "{r:?}");
+    assert!(second.x > run(&r, "abc").x + 300.0, "{r:?}");
+    let margin = Options::default().margin;
+    let right = Options::default().page_width - margin;
+    assert_eq!(run(&r, "abc").x, margin);
+    assert!(first.x < right && first.x > right - 50.0, "{r:?}");
+}
+
+#[test]
+fn mixed_directions_follow_the_bidi_algorithm() {
+    // Hebrew inside an English paragraph: the Hebrew words run right to
+    // left between the English ones.
+    let l = lines(&render("abc שלום עולם def"));
+    assert_eq!(l, [format!("abc {} {} def", logical("עולם"), logical("שלום"))]);
+    // Numbers and Latin inside Hebrew stay left to right, and brackets are
+    // mirrored so they still enclose their text.
+    // (Runs split where the direction changes, so compare without spaces.)
+    let l = lines(&render("שלום 123 (abc) עולם"))[0].replace(' ', "");
+    assert_eq!(l, format!("{}(abc)123{}", logical("עולם"), logical("שלום")));
+    let l = lines(&render("א (ב) ג"))[0].replace(' ', "");
+    assert_eq!(l, "ג(ב)א");
+}
+
+#[test]
+fn right_to_left_lists_and_quotes_are_mirrored() {
+    let out = render("- שלום\n- abc\n\n> עולם\n");
+    let r = runs(&out, 0);
+    let bullets: Vec<&Run> = r.iter().filter(|x| x.text == "\u{2022}").collect();
+    assert_eq!(bullets.len(), 2);
+    // The Hebrew item has its bullet on the right, the Latin one on the left.
+    assert!(bullets[0].x > rtl_run(&r, "שלום").x);
+    assert!(bullets[1].x < run(&r, "abc").x);
+    // The quote is indented from the right: it ends left of the bar's side.
+    let margin = Options::default().margin;
+    let right = Options::default().page_width - margin;
+    assert!(rtl_run(&r, "עולם").x < right - 15.0);
+    // Its bar is on the right.
+    let ops = String::from_utf8_lossy(&out.pages[0].ops).to_string();
+    let bar = ops.lines().find(|l| l.ends_with("re f")).expect("quote bar");
+    let bar_x: f32 = bar.split(' ').nth_back(5).unwrap().parse().unwrap();
+    assert!(bar_x > right - 10.0, "{bar}");
+}
+
+#[test]
+fn code_stays_left_to_right_with_right_to_left_parts_reordered() {
+    let l = lines(&render("```\nx = \"שלום עולם\"\n```\n"))[0].replace(' ', "");
+    assert_eq!(l, format!("x=\"{}{}\"", logical("עולם"), logical("שלום")));
+}
+
+/// The silk tier sets each of its scripts in its own family, in regular and
+/// bold.
+#[cfg(feature = "silk")]
+#[test]
+fn silk_sets_each_script_in_its_family() {
+    let out = render("שלום **שלום** Հայերեն 中文 ひらがな 한국어 **中文**");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let r = runs(&out, 0);
+    let name = |run: &Run| out.fonts.faces[run.face].postscript_name.clone();
+    let mut hebrew: Vec<String> = r.iter().filter(|x| x.text == logical("שלום")).map(name).collect();
+    hebrew.sort();
+    assert_eq!(hebrew, ["FrankRuhlLibre-Bold", "FrankRuhlLibre-Regular"]);
+    assert_eq!(name(run(&r, "Հայերեն")), "NotoSerifArmenian-Regular");
+    assert_eq!(name(run(&r, "ひらがな")), "NotoSerifSC-Regular");
+    assert_eq!(name(run(&r, "한국어")), "GowunBatang-Regular");
+    let mut han: Vec<String> = r.iter().filter(|x| x.text == "中文").map(name).collect();
+    han.sort();
+    assert_eq!(han, ["NotoSerifSC-Bold", "NotoSerifSC-Regular"]);
+    // Cantillation marks, which Frank Ruhl Libre lacks, come from Noto
+    // Serif Hebrew together with their letter.
+    let out = render("בָּרָ֣א");
+    let r = runs(&out, 0);
+    assert!(r
+        .iter()
+        .any(|x| name_of(&out, x) == "NotoSerifHebrew-Regular" && x.text.contains('\u{5A3}')));
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+}
+
+#[cfg(feature = "silk")]
+fn name_of(out: &Output, run: &Run) -> String {
+    out.fonts.faces[run.face].postscript_name.clone()
 }

@@ -11,6 +11,28 @@ PDF.
 Fonts installed on the machine are never used, so the same input and
 configuration produce the same PDF everywhere.
 
+sundowner comes in two builds, which differ only in the fonts they bundle:
+
+| Build | Scripts | Size |
+|-------|---------|------|
+| **europa** (default) | Latin, Greek, Cyrillic: the alphabets on euro banknotes | 3.2 MB |
+| **silk** (`--features silk`) | also Hebrew, Armenian, Chinese, Japanese and Korean: the scripts along the Silk Road | 27 MB |
+
+The silk build adds fonts in the same humanist, broad-nib spirit as
+Alegreya, as far as each writing system has one:
+[Frank Ruhl Libre](https://github.com/fontef/frankruhllibre) for Hebrew
+(with [Noto Serif Hebrew](https://github.com/notofonts/hebrew) for
+cantillation marks, which Frank Ruhl Libre lacks),
+[Noto Serif Armenian](https://github.com/notofonts/armenian),
+[Noto Serif SC](https://github.com/notofonts/noto-cjk), a Song/Mincho
+face, for Chinese characters and Japanese kana, and
+[Gowun Batang](https://github.com/yangheeryu/Gowun-Batang), a
+brush-inspired Batang, for Korean. They have regular and bold weights; as
+these scripts have no italics, italic text uses the upright font. The
+silk fonts are stored compressed and only unpacked when a document uses
+them, so documents in the europa scripts are as fast, and come out the
+same, with either build.
+
 ```sh
 sundowner notes.md                 # writes notes.pdf
 sundowner *.md                     # one PDF per input
@@ -41,9 +63,10 @@ Exit status: `0` on success, `1` if any input failed, `2` on usage errors.
 
 ## Fonts and configuration
 
-Every bundled font, in every style, covers Latin (including Central and
+Alegreya and Cousine, in every style, cover Latin (including Central and
 Eastern European), modern and polytonic Greek, and Cyrillic; a test enforces
-this. To use other fonts, or to cover other scripts and emoji,
+this, and one that every script of the silk build is set in its font in
+every style. To use other fonts, or to cover other scripts and emoji,
 create a `.sundowner` file. sundowner uses the nearest one in the input
 file's directory or any parent directory, or the file given with `--config`.
 The search goes all the way up, so a `.sundowner` in your home directory
@@ -83,9 +106,16 @@ regular = fonts/NotoEmoji-Regular.ttf
   TrueType collection with `#index`, e.g. `fonts/NotoSansCJK.ttc#2`.
 - **Character lookup.** For each character, sundowner uses the first font
   that has a glyph for it:
-  - body text: `[body]`, then the `[fallback]` fonts, then the bundled fonts
+  - body text: `[body]`, then the `[fallback]` fonts, then the bundled fonts:
+    Alegreya, (silk: Frank Ruhl Libre, Noto Serif Hebrew, Noto Serif
+    Armenian), Cousine, (silk: Noto Serif SC, Gowun Batang)
   - code: `[mono]`, then the `[fallback]` fonts, then the body font, then
     the bundled fonts
+
+  Characters that fonts share, such as spaces and punctuation, therefore
+  come from the first font: in the silk build, Chinese text gets its
+  spaces and Western punctuation from Alegreya, while ideographic
+  punctuation (`。`, `、`, `「」`) comes from Noto Serif SC.
 
   Characters that no font covers are drawn as the font's empty box, and a
   warning lists them.
@@ -135,9 +165,25 @@ and `#anchor` links become clickable; other links are shown as plain text.
   - A one-word document is about 3 KB.
   - Subset names are derived from their contents, so identical input gives
     byte-identical output.
+- **Bidirectional text.** Hebrew and other right-to-left text is laid out
+  with the Unicode Bidirectional Algorithm
+  ([UAX #9](https://www.unicode.org/reports/tr9/), Unicode 17.0) in full,
+  including explicit embeddings, overrides and isolates (U+202A–U+202E,
+  U+2066–U+2069) and paired brackets, and passes both official
+  conformance tests. Each paragraph, heading, list item and table cell
+  takes its direction from its first strong character, like GitHub's
+  `dir="auto"`: right-to-left paragraphs are set flush right, and
+  right-to-left list items and quotes are indented from the right, with
+  their bullets, numbers and bars on the right. Numbers and Latin words
+  inside Hebrew stay left-to-right, and brackets are mirrored (`(` shows as
+  `)` in right-to-left text). Lines are broken first and then reordered,
+  as the algorithm prescribes. Code blocks are left-to-right, with
+  right-to-left parts reordered. Table columns keep their order; cells
+  without an explicit alignment follow their text's direction.
 - **Ligatures and contextual forms.** Glyph substitutions come from the
   font's OpenType GSUB table, with the features HarfBuzz applies by default
-  to Latin, Greek and Cyrillic: `ccmp`, `locl`, `rlig`, `liga`, `clig`,
+  to scripts without script-specific shaping (Latin, Greek, Cyrillic,
+  Armenian, Hebrew, Chinese, Japanese and Korean): `ccmp`, `locl`, `rlig`, `liga`, `clig`,
   `calt`, `rclt` and `rvrn`, from the language system of the text's script.
   All GSUB lookup types are supported, including chained contextual and
   reverse chained substitutions, along with the lookup flags that skip
@@ -155,8 +201,12 @@ and `#anchor` links become clickable; other links are shown as plain text.
   or stacked on each other, by the font's anchors (the GPOS `mark` and `mkmk`
   features: mark-to-base, mark-to-ligature and mark-to-mark). Fonts without
   anchors get marks centred over or under the letter from the glyph
-  outlines. Kerning looks past marks. For the bundled fonts, glyphs and
-  positions match HarfBuzz.
+  outlines. Kerning looks past marks. Hebrew points are ordered as HarfBuzz
+  orders them (shin and sin dots, dagesh, vowels, meteg), and for fonts
+  without mark positioning, such as Cousine, a letter and its points
+  become the Hebrew presentation form where the font has one. For the
+  bundled fonts, glyphs and positions match HarfBuzz, in right-to-left
+  text too.
 - **Kerning.** Pairs of adjacent glyphs are kerned using the font's
   OpenType `kern` feature (GPOS pair adjustment). Fonts without GPOS
   kerning fall back to the legacy `kern` table. Kerning is included when
@@ -201,11 +251,25 @@ and `#anchor` links become clickable; other links are shown as plain text.
 
 ## Limitations
 
-- **Shaping is for Latin, Greek and Cyrillic.** Ligatures, contextual
-  forms and combining marks are handled (see above), but there is no
-  right-to-left layout, no contextual positioning (GPOS lookup types 7 and
-  8) and no script-specific shaping. Latin, Greek, Cyrillic and CJK render
-  correctly. Arabic, Hebrew and Indic scripts do not.
+- **No script-specific shaping.** Ligatures, contextual forms, combining
+  marks and right-to-left layout are handled (see above), but there is no
+  contextual positioning (GPOS lookup types 7 and 8) and none of the
+  shaping that Arabic, Syriac, the Indic scripts, Thai or Mongolian need.
+  Latin, Greek, Cyrillic, Armenian, Hebrew and CJK render correctly.
+  Arabic is next.
+- **One style of Chinese characters.** The silk build bundles one Han
+  font, Noto Serif SC, which covers all of CJK Unified Ideographs and
+  Extension A (but little of Extension B and later), so Japanese and
+  traditional Chinese text are covered apart from rare characters, but characters that look
+  different in Japan, Taiwan or Hong Kong use their mainland China forms.
+  Add Noto Serif JP, TC or HK as a `[fallback]` for the regional forms.
+  There is no vertical text.
+- **Cantillation marks** in Hebrew come from Noto Serif Hebrew, so in
+  cantillated (biblical) text the letters that carry them are set in Noto
+  Serif Hebrew and the others in Frank Ruhl Libre.
+- **CJK in code** is set in Noto Serif SC, which is proportional, so CJK
+  characters in code do not line up in columns. Add a monospaced CJK font
+  as `[mono]` or `[fallback]` if that matters.
 - **Marks on ligatures** attach to the ligature's last component. A mark
   that belonged to an earlier component, such as an accent on the f of an
   "fi" ligature, is placed on the last one instead.
@@ -215,20 +279,29 @@ and `#anchor` links become clickable; other links are shown as plain text.
 ## Building
 
 ```sh
-# Fully static Linux binary (about 3.1 MB, most of it the bundled fonts)
+# Fully static Linux binary (about 3.2 MB, most of it the bundled fonts)
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 # -> target/x86_64-unknown-linux-musl/release/sundowner
+
+# The silk build (about 27 MB)
+cargo build --release --target x86_64-unknown-linux-musl --features silk
 
 # Regular build for the host platform
 cargo build --release
 
 cargo test                                   # quick
 cargo test --release -- --include-ignored    # plus the stress tests (as in CI)
+cargo test --release --features silk -- --include-ignored
 ```
 
-The Unicode tables in `src/linebreak_table.rs` and `src/normalize_table.rs`
-are generated from the Unicode Character Database by `tools/gen_unicode.py`
+The silk fonts are compressed by `build.rs`, with sundowner's own DEFLATE
+encoder, when the feature is enabled; this adds a few seconds to the
+build. A document that uses them pays about 0.15 s to unpack each of the
+large CJK fonts it needs.
+
+The Unicode tables in `src/linebreak_table.rs`, `src/normalize_table.rs`
+and `src/bidi_table.rs` are generated from the Unicode Character Database by `tools/gen_unicode.py`
 (Python 3, standard library only). It also writes the conformance test
 data in `tests/data/`. To move to another Unicode version, change `VERSION`
 in the script and run it.
@@ -242,6 +315,6 @@ and the minimum Rust version.
 The code is licensed under the MIT License (see `LICENSE`). The bundled
 fonts in `fonts/` are licensed under the SIL Open Font License 1.1. See
 [`fonts/README.md`](fonts/README.md) for their sources, changes and license
-compliance, or run `sundowner --licenses`. The line breaking and
-normalization tables and their test data are derived from the Unicode
+compliance, or run `sundowner --licenses`. The line breaking,
+normalization and bidirectional tables and their test data are derived from the Unicode
 Character Database, under the Unicode License v3 (see `LICENSE-UNICODE`).

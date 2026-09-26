@@ -36,9 +36,20 @@ OPTIONS:
     -h, --help              Show this help
     -V, --version           Show version
 
-Text is set in the bundled Alegreya and code in Cousine. Other fonts,
-including fallbacks for other scripts, are added in a .sundowner file; see
-the README. Installed system fonts are never used.
+Text is set in the bundled Alegreya and code in Cousine, which cover Latin,
+Greek and Cyrillic. Other fonts, including fallbacks for other scripts, are
+added in a .sundowner file; see the README. Installed system fonts are
+never used.
+";
+
+/// What the fonts of this build cover, shown after the usage.
+#[cfg(not(feature = "silk"))]
+const TIER: &str = "This is the europa build: Latin, Greek and Cyrillic.\n";
+#[cfg(feature = "silk")]
+const TIER: &str = "\
+This is the silk build, which also bundles Frank Ruhl Libre and Noto Serif
+Hebrew for Hebrew, Noto Serif Armenian for Armenian, Noto Serif SC for
+Chinese and Japanese, and Gowun Batang for Korean.
 ";
 
 const MM: f32 = 72.0 / 25.4;
@@ -73,7 +84,7 @@ fn licenses() -> String {
         s.push_str(&format!("\n==== {name} ====\n\n{text}\n"));
     }
     s.push_str(&format!(
-        "\n==== Unicode Character Database {} (line breaking and normalization data) ====\n\n{}",
+        "\n==== Unicode Character Database {} (line breaking, normalization and bidirectional data) ====\n\n{}",
         sundowner::linebreak_table::UNICODE_VERSION,
         include_str!("../LICENSE-UNICODE")
     ));
@@ -116,11 +127,15 @@ fn parse_args() -> Result<Option<Args>, String> {
         match flag.as_str() {
             "--" => only_files = true,
             "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{USAGE}\n{TIER}");
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("sundowner {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "sundowner {} ({})",
+                    env!("CARGO_PKG_VERSION"),
+                    sundowner::fonts::TIER
+                );
                 return Ok(None);
             }
             "--licenses" => {
