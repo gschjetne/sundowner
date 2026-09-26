@@ -300,6 +300,9 @@ and `#anchor` links become clickable; other links are shown as plain text.
 - Remote images, interlaced PNGs and formats other than PNG and JPEG are not
   embedded. They appear as an italic `[image: …]` placeholder with a warning.
 
+[`IDEAS.md`](IDEAS.md) collects features that may come later, such as
+justification, hyphenation and kashida.
+
 ## Building
 
 ```sh
