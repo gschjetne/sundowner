@@ -292,10 +292,7 @@ impl Face {
             return out;
         }
         let mut p = 10;
-        loop {
-            let (Some(flags), Some(child)) = (u16_at(g, p), u16_at(g, p + 2)) else {
-                break;
-            };
+        while let (Some(flags), Some(child)) = (u16_at(g, p), u16_at(g, p + 2)) {
             out.push(child);
             p += 4 + if flags & 0x0001 != 0 { 4 } else { 2 };
             p += if flags & 0x0008 != 0 {
