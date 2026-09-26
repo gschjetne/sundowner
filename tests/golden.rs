@@ -380,3 +380,15 @@ fn combining_marks_compose_or_attach() {
     assert!(out.used[REGULAR].values().any(|t| t == "\u{303}"));
     assert!(out.warnings.is_empty(), "{:?}", out.warnings);
 }
+
+#[test]
+fn joined_words_kern_past_trailing_marks() {
+    // A soft hyphen that does not break joins "A̱" and "VATAR" on one line.
+    // The A-V pair must still be kerned although "A̱" ends with a combining
+    // mark (U+0331 has no precomposed form with A), so the next word lands
+    // exactly where it does without the mark.
+    let x_after = |src: &str| run(&runs(&render(src), 0), "x").x;
+    let with_mark = x_after("A\u{331}\u{AD}VATAR x");
+    let without = x_after("A\u{AD}VATAR x");
+    assert!((with_mark - without).abs() < 0.01, "{with_mark} vs {without}");
+}

@@ -704,12 +704,27 @@ impl Layout<'_> {
 
     /// Add the kerning between the last glyph of `f` and `next` to `f`, for
     /// text that continues `f` on the same line.
-    fn kern_join(&self, f: &mut Frag, next: u16) {
-        if let Some(last) = f.glyphs.last_mut() {
-            let k = self.kern_1000(f.face, last.id, next);
-            last.adv += k;
-            f.width += k * f.size / 1000.0;
+    ///
+    /// Like `shape_run`, this looks past marks: the pair is the last base
+    /// glyph (non-zero advance) and `next`, not a trailing combining mark.
+    fn kern_join(&self, f: &mut Frag, next: &G) {
+        if next.adv == 0.0 {
+            return;
         }
+        let Some(b) = f.glyphs.iter().rposition(|g| g.adv != 0.0) else {
+            return;
+        };
+        let k = self.kern_1000(f.face, f.glyphs[b].id, next.id);
+        if k == 0.0 {
+            return;
+        }
+        f.glyphs[b].adv += k;
+        // Marks after the base are placed relative to the pen, which the
+        // kerning just moved; keep them where they were.
+        for g in &mut f.glyphs[b + 1..] {
+            g.dx -= k;
+        }
+        f.width += k * f.size / 1000.0;
     }
 
     /// Kerning between two glyphs of a face, in 1/1000 em.
@@ -947,14 +962,14 @@ impl Layout<'_> {
                             // when both end up on one line.
                             if let Some(Tok::Word(prev)) = toks.last_mut() {
                                 if let Some(f) = prev.frags.last_mut().filter(|f| f.same_run(face, st)) {
-                                    self.kern_join(f, glyphs[0].id);
+                                    self.kern_join(f, &glyphs[0]);
                                 }
                             }
                         }
                         joined = false;
                         match word.frags.last_mut() {
                             Some(f) if f.same_run(face, st) => {
-                                self.kern_join(f, glyphs[0].id);
+                                self.kern_join(f, &glyphs[0]);
                                 f.glyphs.extend_from_slice(&glyphs);
                                 f.width += w;
                             }
@@ -1044,7 +1059,7 @@ impl Layout<'_> {
                             if let Tok::Word(Word { hyphen: Some(h), .. }) = &toks[ti] {
                                 if let Some((_, last)) = line.frags.last_mut().filter(|(_, l)| l.joins(h)) {
                                     let before = last.width;
-                                    self.kern_join(last, h.glyphs[0].id);
+                                    self.kern_join(last, &h.glyphs[0]);
                                     line.width += last.width - before;
                                 }
                                 let x = line.width;

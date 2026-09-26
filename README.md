@@ -206,6 +206,9 @@ and `#anchor` links become clickable; other links are shown as plain text.
   right-to-left layout, no contextual positioning (GPOS lookup types 7 and
   8) and no script-specific shaping. Latin, Greek, Cyrillic and CJK render
   correctly. Arabic, Hebrew and Indic scripts do not.
+- **Marks on ligatures** attach to the ligature's last component. A mark
+  that belonged to an earlier component, such as an accent on the f of an
+  "fi" ligature, is placed on the last one instead.
 - Remote images, interlaced PNGs and formats other than PNG and JPEG are not
   embedded. They appear as an italic `[image: …]` placeholder with a warning.
 
