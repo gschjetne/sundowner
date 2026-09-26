@@ -41,11 +41,17 @@ impl Kerning {
         self.lookups.is_empty() && self.legacy.is_none()
     }
 
-    /// The legacy `kern` table's adjustment for a pair, if the font kerns
-    /// with that table (it has no GPOS kerning).
-    pub fn legacy(&self, kern: &[u8], left: u16, right: u16) -> Option<i32> {
-        let (off, n) = self.legacy?;
-        Some(legacy_pair(kern, off, n, left, right).unwrap_or(0) as i32)
+    /// Whether the font kerns with the legacy `kern` table (it has no GPOS
+    /// kerning, but a `kern` table).
+    pub fn has_legacy(&self) -> bool {
+        self.legacy.is_some()
+    }
+
+    /// The legacy `kern` table's adjustment for a pair, in font units: 0 for
+    /// a pair it does not list, or if the font does not use the table.
+    pub fn legacy(&self, kern: &[u8], left: u16, right: u16) -> i32 {
+        let Some((off, n)) = self.legacy else { return 0 };
+        legacy_pair(kern, off, n, left, right).unwrap_or(0) as i32
     }
 
     /// Adjustment of the advance between `left` and `right`, in font units.

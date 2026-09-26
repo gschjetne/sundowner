@@ -313,18 +313,10 @@ impl Face {
             rtl,
             &mut pos,
         );
-        // The legacy kern table, between glyphs that are not marks, split
-        // between the two as HarfBuzz does.
-        let bases: Vec<usize> = (0..glyphs.len()).filter(|&i| !is_mark(i)).collect();
-        for w in bases.windows(2) {
-            let (i, j) = (w[0], w[1]);
-            let Some(k) = self.kerning.legacy(t(b"kern"), glyphs[i], glyphs[j]) else {
-                break;
-            };
-            let (k1, k2) = (k >> 1, k - (k >> 1));
-            pos[i].x_advance += k1;
-            pos[j].x_advance += k2;
-            pos[j].x_offset += k2;
+        if self.kerning.has_legacy() {
+            position::legacy_kern(&mut pos, is_mark, |i, j| {
+                self.kerning.legacy(t(b"kern"), glyphs[i], glyphs[j])
+            });
         }
         if let Some(a) = fallback {
             position::attach_fallback(&mut pos, a);

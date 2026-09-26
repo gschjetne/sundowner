@@ -194,8 +194,9 @@ and `#anchor` links become clickable; other links are shown as plain text.
   each only to the letters in that form, then `rlig`, `calt` and `rclt`,
   and `liga`, `clig` and `mset`. Marks are ordered as HarfBuzz orders
   them (shadda before the vowels, hamza next to its letter). With Amiri,
-  glyphs and positions match HarfBuzz, in all four styles, for Arabic,
-  Persian, Urdu and fully vocalized Quranic text.
+  glyphs and positions match HarfBuzz, in all four styles, for 153 words
+  of Arabic, Persian, Urdu and fully vocalized Quranic text: a test
+  checks all 612 cases against data from `tools/gen_harfbuzz.py`.
 - **Ligatures and contextual forms.** Glyph substitutions come from the
   font's OpenType GSUB table, with the features HarfBuzz applies by default
   to scripts without script-specific shaping (Latin, Greek, Cyrillic,
@@ -230,12 +231,15 @@ and `#anchor` links become clickable; other links are shown as plain text.
   measuring text, so line breaks account for it. It applies to text in one
   font, not across spaces or font changes. As the OpenType spec prescribes,
   adjustments from all of the font's kerning lookups add up.
-- **Glyph positioning.** Right-to-left text, and text in fonts that use
-  more than pair kerning and mark attachment for its script, is positioned
-  with all of the GPOS table as HarfBuzz applies it: single and pair
-  adjustment, cursive attachment (which connects Arabic letters), mark
-  attachment and contextual and chained contextual positioning, from the
-  `kern`, `mark`, `mkmk`, `curs`, `dist`, `abvm` and `blwm` features.
+- **Glyph positioning.** All right-to-left text (Hebrew as well as
+  Arabic), and text in fonts that use more than pair kerning and mark
+  attachment for its script, is positioned with all of the GPOS table as
+  HarfBuzz applies it: single and pair adjustment, cursive attachment
+  (which connects Arabic letters), mark attachment and contextual and
+  chained contextual positioning, from the `kern`, `mark`, `mkmk`, `curs`,
+  `dist`, `abvm` and `blwm` features. Device tables, which adjust
+  positions for a given pixel size, are ignored; HarfBuzz ignores them too
+  unless it is given a pixel size, which output like PDF has none of.
 - **Line breaking** follows the Unicode Line Breaking Algorithm
   ([UAX #14](https://www.unicode.org/reports/tr14/), Unicode 17.0) in full,
   and passes its official conformance test. Lines break at spaces, after
@@ -332,6 +336,11 @@ and `src/bidi_table.rs` are generated from the Unicode Character Database by `to
 (Python 3, standard library only). It also writes the conformance test
 data in `tests/data/`. To move to another Unicode version, change `VERSION`
 in the script and run it.
+
+`tools/gen_harfbuzz.py` (Python 3 with `uharfbuzz`) shapes the words of
+`tests/data/arabic-words.txt` with HarfBuzz and writes the glyphs and
+positions `tests/arabic.rs` expects. Run it after changing the word list,
+Amiri or the HarfBuzz version.
 
 Requires Rust 1.87 or newer (the code uses `u*::is_multiple_of`, stabilized
 in 1.87). CI checks formatting, clippy, the full test suite, the static build

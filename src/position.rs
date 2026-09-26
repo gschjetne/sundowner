@@ -614,6 +614,26 @@ fn reverse_cursive_chain(pos: &mut [Pos], i: usize, new_parent: usize, depth: us
     pos[j].cursive = true;
 }
 
+/// Kern with a legacy `kern` table: `pair` gives the adjustment for two
+/// glyphs (0 for pairs the table does not list). Marks are skipped, and the
+/// adjustment is split between the two glyphs as HarfBuzz does.
+pub fn legacy_kern(pos: &mut [Pos], is_mark: &dyn Fn(usize) -> bool, pair: impl Fn(usize, usize) -> i32) {
+    let mut prev: Option<usize> = None;
+    for j in 0..pos.len() {
+        if is_mark(j) {
+            continue;
+        }
+        if let Some(i) = prev {
+            let k = pair(i, j);
+            let (k1, k2) = (k >> 1, k - (k >> 1));
+            pos[i].x_advance += k1;
+            pos[j].x_advance += k2;
+            pos[j].x_offset += k2;
+        }
+        prev = Some(j);
+    }
+}
+
 /// Attach marks by `attachments` (from the outlines, for fonts without
 /// mark positioning), as mark attachment lookups would.
 pub fn attach_fallback(pos: &mut [Pos], attachments: &[Option<Attachment>]) {
@@ -675,6 +695,23 @@ fn propagate(pos: &mut [Pos], i: usize, rtl: bool, depth: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_kerning_skips_marks_and_unlisted_pairs() {
+        // Glyphs 0 1 2 3 4 with 2 a mark; only the pairs (0, 1) and (3, 4)
+        // are kerned. The unlisted pair (1, 3) in between must not stop the
+        // kerning of (3, 4).
+        let mut pos = [Pos::advance(500); 5];
+        let pair = |i, j| match (i, j) {
+            (0, 1) => -40,
+            (3, 4) => -31,
+            _ => 0,
+        };
+        legacy_kern(&mut pos, &|i| i == 2, pair);
+        let adv: Vec<i32> = pos.iter().map(|p| p.x_advance).collect();
+        assert_eq!(adv, [480, 480, 500, 484, 485]);
+        assert_eq!((pos[1].x_offset, pos[4].x_offset), (-20, -15));
+    }
 
     #[test]
     fn marks_hang_on_their_base_in_both_directions() {

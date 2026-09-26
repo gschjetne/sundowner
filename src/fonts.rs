@@ -131,10 +131,11 @@ pub const BUNDLED: &[Bundled] = bundled!(
 #[cfg(test)]
 const BASE_FONTS: usize = 8;
 
-/// A family of the tier: its regular, bold, italic and bold italic faces
-/// (indices into [`BUNDLED`]), and whether it comes before Cousine in the
-/// fallback chains.
-type TierFamily = (usize, Option<usize>, Option<usize>, Option<usize>, bool);
+/// A family of the tier: the start of its file names in [`BUNDLED`] (the
+/// files are `<name>-Regular.ttf`, `-Bold`, `-Italic` and `-BoldItalic`,
+/// those that exist), and whether it comes before Cousine in the fallback
+/// chains.
+type TierFamily = (&'static str, bool);
 
 /// The families of the tier, in fallback order. The Hebrew and Armenian
 /// ones come before Cousine, so Hebrew is not set in Cousine. The others
@@ -144,12 +145,12 @@ type TierFamily = (usize, Option<usize>, Option<usize>, Option<usize>, bool);
 const TIER_FAMILIES: &[TierFamily] = &[];
 #[cfg(feature = "silk")]
 const TIER_FAMILIES: &[TierFamily] = &[
-    (8, Some(9), None, None, true),            // Frank Ruhl Libre
-    (10, Some(11), None, None, true),          // Noto Serif Hebrew
-    (12, Some(13), None, None, true),          // Noto Serif Armenian
-    (18, Some(19), Some(20), Some(21), false), // Amiri
-    (14, Some(15), None, None, false),         // Noto Serif SC
-    (16, Some(17), None, None, false),         // Gowun Batang
+    ("silk/FrankRuhlLibre", true),
+    ("silk/NotoSerifHebrew", true),
+    ("silk/NotoSerifArmenian", true),
+    ("silk/Amiri", false),
+    ("silk/NotoSerifSC", false),
+    ("silk/GowunBatang", false),
 ];
 
 /// The bytes of a bundled font, inflated on first use and kept for the
@@ -313,14 +314,19 @@ impl Fonts {
             bold_italic: Some(7),
         };
         let tier = |before_mono: bool| {
-            TIER_FAMILIES.iter().filter(move |f| f.4 == before_mono).map(
-                |&(regular, bold, italic, bold_italic, _)| Family {
-                    regular,
-                    bold,
-                    italic,
-                    bold_italic,
-                },
-            )
+            let face = |name: &str, style: &str| {
+                let file = format!("{name}-{style}.ttf");
+                BUNDLED.iter().position(|b| b.file == file)
+            };
+            TIER_FAMILIES
+                .iter()
+                .filter(move |f| f.1 == before_mono)
+                .map(move |&(name, _)| Family {
+                    regular: face(name, "Regular").expect("the regular face of a tier family is bundled"),
+                    bold: face(name, "Bold"),
+                    italic: face(name, "Italic"),
+                    bold_italic: face(name, "BoldItalic"),
+                })
         };
 
         let mut warnings = Vec::new();
