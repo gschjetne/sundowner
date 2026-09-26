@@ -73,7 +73,7 @@ fn licenses() -> String {
         s.push_str(&format!("\n==== {name} ====\n\n{text}\n"));
     }
     s.push_str(&format!(
-        "\n==== Unicode Character Database {} (line breaking properties) ====\n\n{}",
+        "\n==== Unicode Character Database {} (line breaking and normalization data) ====\n\n{}",
         sundowner::linebreak_table::UNICODE_VERSION,
         include_str!("../LICENSE-UNICODE")
     ));

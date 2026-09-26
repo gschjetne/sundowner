@@ -5,8 +5,10 @@
 //! Every read is bounds-checked, so malformed fonts produce an error rather
 //! than a panic.
 
+use crate::gpos::{Attachment, MarkPositioning};
 use crate::gsub::{Glyph, Gsub, Script};
 use crate::kern::Kerning;
+use crate::otl::Gdef;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -33,6 +35,8 @@ pub struct Face {
     cmap: HashMap<u32, u16>,
     kerning: Kerning,
     gsub: Gsub,
+    marks: MarkPositioning,
+    gdef: Gdef,
 }
 
 fn u16_at(d: &[u8], i: usize) -> Option<u16> {
@@ -189,6 +193,8 @@ impl Face {
         let variable_default_weight = table(b"fvar").map(fvar_default_weight);
         let kerning = Kerning::parse(table(b"GPOS"), table(b"GDEF"), table(b"kern"));
         let gsub = Gsub::parse(table(b"GSUB"), table(b"GDEF"), num_glyphs);
+        let marks = MarkPositioning::parse(table(b"GPOS"));
+        let gdef = Gdef::parse(table(b"GDEF"));
         let cmap = parse_cmap(req(b"cmap")?, num_glyphs)?;
         if cmap.is_empty() {
             return Err("font has no usable Unicode character map".into());
@@ -212,6 +218,8 @@ impl Face {
             variable_default_weight,
             kerning,
             gsub,
+            marks,
+            gdef,
             advances,
             lsbs,
             cmap,
@@ -233,9 +241,36 @@ impl Face {
         self.gsub.apply(t(b"GSUB"), t(b"GDEF"), script, glyphs);
     }
 
-    /// Whether the font substitutes glyphs for text in `script`.
-    pub fn has_substitutions(&self) -> bool {
-        !self.gsub.is_empty()
+    /// The GDEF class of a glyph (1 base, 2 ligature, 3 mark, 0 unknown),
+    /// or `None` if the font does not classify glyphs.
+    pub fn glyph_class(&self, g: u16) -> Option<u16> {
+        self.gdef
+            .has_classes()
+            .then(|| self.gdef.glyph_class(self.table(b"GDEF").unwrap_or(&[]), g))
+    }
+
+    /// Whether the font has mark positioning (GPOS anchors) for `script`.
+    pub fn positions_marks(&self, script: Script) -> bool {
+        self.marks.has(script)
+    }
+
+    /// Attach the marks among `glyphs` to their bases by the font's anchors.
+    pub fn attach_marks(
+        &self,
+        script: Script,
+        glyphs: &[u16],
+        is_mark: &dyn Fn(usize) -> bool,
+    ) -> Vec<Option<Attachment>> {
+        let t = |tag: &[u8; 4]| self.table(tag).unwrap_or(&[]);
+        self.marks
+            .apply(t(b"GPOS"), t(b"GDEF"), &self.gdef, script, glyphs, is_mark)
+    }
+
+    /// The bounding box of a glyph's outline, `[x_min, y_min, x_max, y_max]`
+    /// in font units, or `None` for an empty glyph.
+    pub fn glyph_bbox(&self, gid: u16) -> Option<[i16; 4]> {
+        let g = self.glyph_data(gid);
+        Some([i16_at(g, 2)?, i16_at(g, 4)?, i16_at(g, 6)?, i16_at(g, 8)?])
     }
 
     /// Kerning between two adjacent glyphs, in font units (negative moves

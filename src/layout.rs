@@ -3,11 +3,13 @@
 
 use crate::chars;
 use crate::fonts::{FaceId, Fonts};
+use crate::gpos::Attachment;
 use crate::gsub::{Glyph, Script};
 use crate::image::{self, Image};
 use crate::inline::{self, Inline, Style};
 use crate::linebreak::{self, Break};
 use crate::markdown::{Align, Block, Document};
+use crate::normalize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -18,6 +20,8 @@ use std::sync::Arc;
 const LINE_SPACING: f32 = 1.4;
 /// Longest run of characters shaped as one unit.
 const MAX_RUN: usize = 1024;
+/// Most combining marks kept with one base character.
+const MAX_CLUSTER: usize = 32;
 /// Most entries kept in the shaping cache.
 const SHAPE_CACHE_SIZE: usize = 20_000;
 const TEXT: Color = (0.11, 0.11, 0.12);
@@ -58,12 +62,23 @@ impl Default for Options {
     }
 }
 
+/// A positioned glyph. Distances are in 1/1000 em: `adv` moves the pen to
+/// the next glyph (including kerning; zero for marks), and the glyph is
+/// drawn offset by `dx`, `dy` from the pen (marks on their base).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct G {
+    id: u16,
+    adv: f32,
+    dx: f32,
+    dy: f32,
+}
+
 /// A run of text in a single font, size, color and link.
 #[derive(Clone)]
 struct Frag {
     face: FaceId,
     size: f32,
-    glyphs: Vec<u16>,
+    glyphs: Vec<G>,
     width: f32,
     color: Color,
     code: bool,
@@ -81,6 +96,20 @@ impl Frag {
             && self.strike == st.style.strike
             && self.link == st.link
             && self.color == st.color
+    }
+
+    /// A copy with only some of the glyphs.
+    fn piece(&self, range: std::ops::Range<usize>, width: f32) -> Frag {
+        Frag {
+            face: self.face,
+            size: self.size,
+            glyphs: self.glyphs[range].to_vec(),
+            width,
+            color: self.color,
+            code: self.code,
+            strike: self.strike,
+            link: self.link.clone(),
+        }
     }
 
     /// Whether `next` can be drawn as a continuation of this frag.
@@ -107,7 +136,7 @@ struct TextStyle {
 }
 
 impl TextStyle {
-    fn frag(&self, glyphs: Vec<u16>, width: f32, face: FaceId) -> Frag {
+    fn frag(&self, glyphs: Vec<G>, width: f32, face: FaceId) -> Frag {
         Frag {
             face,
             size: self.size,
@@ -344,8 +373,10 @@ fn nums(out: &mut Vec<u8>, vs: &[f32]) {
 }
 
 /// Append a text object drawing `glyphs` (2-byte glyph IDs, Identity-H).
-/// Kerning adjustments go into a `TJ` array, in thousandths of an em
-/// (positive values move the next glyph left).
+/// `width` gives each glyph's advance as the PDF font declares it; where a
+/// glyph's advance differs (kerning, zero-width marks) or it is offset (a
+/// positioned mark), `TJ` adjustments and text rise (`Ts`) move it, in
+/// thousandths of an em.
 #[allow(clippy::too_many_arguments)]
 fn glyph_ops(
     ops: &mut Vec<u8>,
@@ -354,8 +385,8 @@ fn glyph_ops(
     x: f32,
     y: f32,
     c: Color,
-    glyphs: &[u16],
-    kerns: &[f32],
+    glyphs: &[G],
+    width: impl Fn(u16) -> f32,
 ) {
     ops.extend_from_slice(b"BT ");
     nums(ops, &[c.0, c.1, c.2]);
@@ -363,28 +394,61 @@ fn glyph_ops(
     num(ops, size);
     ops.extend_from_slice(b" Tf ");
     nums(ops, &[x, y]);
-    if kerns.iter().all(|&k| k == 0.0) {
+    let plain = |g: &G| g.dx == 0.0 && g.dy == 0.0 && (g.adv - width(g.id)).abs() < 0.005;
+    if glyphs.iter().all(plain) {
         ops.extend_from_slice(b"Td <");
         for g in glyphs {
-            let _ = write!(ops, "{g:04X}");
+            let _ = write!(ops, "{:04X}", g.id);
         }
         ops.extend_from_slice(b"> Tj ET\n");
         return;
     }
-    ops.extend_from_slice(b"Td [<");
-    for (i, g) in glyphs.iter().enumerate() {
-        if let Some(&k) = i.checked_sub(1).and_then(|p| kerns.get(p)).filter(|&&k| k != 0.0) {
-            ops.push(b'>');
-            num(ops, -k);
-            ops.push(b'<');
+    ops.extend_from_slice(b"Td [");
+    // Pending pen movement to the right, and whether a hex string is open.
+    let (mut shift, mut rise, mut open) = (0.0f32, 0.0f32, false);
+    for g in glyphs {
+        shift += g.dx;
+        if g.dy != rise {
+            // Text rise cannot change inside a TJ array.
+            if open {
+                ops.push(b'>');
+                open = false;
+            }
+            if shift.abs() >= 0.005 {
+                num(ops, -shift);
+                shift = 0.0;
+            }
+            ops.extend_from_slice(b"] TJ ");
+            num(ops, g.dy * size / 1000.0);
+            ops.extend_from_slice(b" Ts [");
+            rise = g.dy;
         }
-        let _ = write!(ops, "{g:04X}");
+        if shift.abs() >= 0.005 {
+            if open {
+                ops.push(b'>');
+                open = false;
+            }
+            num(ops, -shift);
+        }
+        if !open {
+            ops.push(b'<');
+            open = true;
+        }
+        let _ = write!(ops, "{:04X}", g.id);
+        shift = g.adv - width(g.id) - g.dx;
     }
-    ops.extend_from_slice(b">] TJ ET\n");
+    if open {
+        ops.push(b'>');
+    }
+    ops.extend_from_slice(b"] TJ");
+    if rise != 0.0 {
+        ops.extend_from_slice(b" 0 Ts");
+    }
+    ops.extend_from_slice(b" ET\n");
 }
 
 /// Glyph runs for a piece of text: `(face, glyphs, width)`.
-type Runs = Vec<(FaceId, Vec<u16>, f32)>;
+type Runs = Vec<(FaceId, Vec<G>, f32)>;
 
 pub fn slugify(s: &str) -> String {
     let mut out = String::new();
@@ -426,9 +490,22 @@ impl Layout<'_> {
     }
 
     fn shape_uncached(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> Runs {
+        let chars: Vec<char> = text
+            .chars()
+            .filter(|&c| !chars::is_invisible(c))
+            .map(|c| if chars::is_space_like(c) { ' ' } else { c })
+            .collect();
+        // Each base character is resolved together with the combining marks
+        // that follow it, so they end up in one font.
         let mut items: Vec<(FaceId, u16, char)> = Vec::new();
-        for c in text.chars() {
-            self.resolve_char(c, mono, bold, italic, &mut items, true);
+        let mut i = 0;
+        while i < chars.len() {
+            let mut j = i + 1;
+            while j < chars.len() && j - i <= MAX_CLUSTER && normalize::is_mark(chars[j]) {
+                j += 1;
+            }
+            self.resolve_cluster(&chars[i..j], mono, bold, italic, &mut items);
+            i = j;
         }
         let mut runs = Vec::new();
         let mut start = 0;
@@ -450,6 +527,39 @@ impl Layout<'_> {
             start = end;
         }
         runs
+    }
+
+    /// Resolve a character and the combining marks after it. The first font
+    /// that covers the whole cluster, after normalizing it for that font
+    /// (composing marks into precomposed characters the font has, or
+    /// decomposing characters it lacks), sets it; if none does, each
+    /// character is resolved on its own.
+    fn resolve_cluster(
+        &self,
+        cluster: &[char],
+        mono: bool,
+        bold: bool,
+        italic: bool,
+        items: &mut Vec<(FaceId, u16, char)>,
+    ) {
+        if let [c] = cluster {
+            if let Some((face, gid)) = self.fonts().resolve(*c, mono, bold, italic) {
+                items.push((face, gid, *c));
+                return;
+            }
+        }
+        let mut norm = Vec::new();
+        for face in self.fonts().candidates(mono, bold, italic) {
+            let f = &self.fonts().faces[face];
+            norm.clear();
+            if normalize::for_font(cluster, |c| f.glyph(c).is_some(), &mut norm) {
+                items.extend(norm.iter().map(|&c| (face, f.glyph(c).unwrap_or(0), c)));
+                return;
+            }
+        }
+        for &c in cluster {
+            self.resolve_char(c, mono, bold, italic, items, true);
+        }
     }
 
     /// Resolve a character to a face and glyph, falling back to a plain-text
@@ -484,15 +594,15 @@ impl Layout<'_> {
         }
     }
 
-    /// Substitute and measure the glyphs of characters set in one face, and
-    /// record the text each resulting glyph stands for.
+    /// Substitute and position the glyphs of characters set in one face,
+    /// and record the text each resulting glyph stands for.
     fn shape_run(
         &self,
         face: FaceId,
         items: &[(FaceId, u16, char)],
         script: Script,
         size: f32,
-    ) -> (FaceId, Vec<u16>, f32) {
+    ) -> (FaceId, Vec<G>, f32) {
         let font = &self.fonts().faces[face];
         let mut glyphs: Vec<Glyph> = items
             .iter()
@@ -504,7 +614,6 @@ impl Layout<'_> {
             .collect();
         font.substitute(script, &mut glyphs);
         let mut used = self.used.borrow_mut();
-        let mut width = 0.0;
         for (k, g) in glyphs.iter().enumerate() {
             // The first glyph of a cluster represents all of its characters.
             let first = k == 0 || glyphs[k - 1].cluster != g.cluster;
@@ -527,12 +636,80 @@ impl Layout<'_> {
             if entry.is_empty() {
                 *entry = text;
             }
-            width += self.fonts().width(face, g.id, size);
-            if k > 0 {
-                width += self.kern(face, glyphs[k - 1].id, g.id, size);
+        }
+        drop(used);
+
+        // Marks by the font's glyph classes, or else by their characters.
+        let source = |g: &Glyph| items.get(g.cluster as usize).map_or(' ', |i| i.2);
+        let marks: Vec<bool> = glyphs
+            .iter()
+            .map(|g| match font.glyph_class(g.id) {
+                Some(class) => class == 3,
+                None => normalize::is_mark(source(g)),
+            })
+            .collect();
+        let mut out: Vec<G> = glyphs
+            .iter()
+            .zip(&marks)
+            .map(|(g, &mark)| G {
+                id: g.id,
+                adv: if mark { 0.0 } else { font.advance_1000(g.id) },
+                dx: 0.0,
+                dy: 0.0,
+            })
+            .collect();
+        // Kerning between neighbouring glyphs, looking past marks.
+        let mut prev: Option<usize> = None;
+        for k in 0..out.len() {
+            if marks[k] {
+                continue;
+            }
+            if let Some(p) = prev {
+                out[p].adv += self.kern_1000(face, out[p].id, out[k].id);
+            }
+            prev = Some(k);
+        }
+        if marks.iter().any(|&m| m) {
+            let ids: Vec<u16> = out.iter().map(|g| g.id).collect();
+            let attachments = if font.positions_marks(script) {
+                font.attach_marks(script, &ids, &|k| marks[k])
+            } else {
+                let classes: Vec<u8> = glyphs
+                    .iter()
+                    .map(|g| match source(g) {
+                        c if normalize::is_mark(c) => normalize::ccc(c),
+                        _ => 230,
+                    })
+                    .collect();
+                fallback_marks(font, &ids, &marks, &classes)
+            };
+            let scale = 1000.0 / font.units_per_em as f32;
+            let mut pens = Vec::with_capacity(out.len());
+            let mut pen = 0.0;
+            for g in &out {
+                pens.push(pen);
+                pen += g.adv;
+            }
+            for k in 0..out.len() {
+                if let Some(a) = attachments[k].filter(|a| a.parent < k) {
+                    let p = out[a.parent];
+                    out[k].dx = pens[a.parent] + p.dx + a.dx as f32 * scale - pens[k];
+                    out[k].dy = p.dy + a.dy as f32 * scale;
+                }
             }
         }
-        (face, glyphs.into_iter().map(|g| g.id).collect(), width)
+        let width = out.iter().map(|g| g.adv).sum::<f32>() * size / 1000.0;
+        (face, out, width)
+    }
+
+    /// Add the kerning between the last glyph of `f` and `next` to `f`, for
+    /// text that continues `f` on the same line.
+    fn kern_join(&self, f: &mut Frag, next: u16) {
+        if let Some(last) = f.glyphs.last_mut() {
+            let k = self.kern_1000(f.face, last.id, next);
+            last.adv += k;
+            f.width += k * f.size / 1000.0;
+        }
     }
 
     /// Kerning between two glyphs of a face, in 1/1000 em.
@@ -542,19 +719,6 @@ impl Layout<'_> {
             .borrow_mut()
             .entry((face, left, right))
             .or_insert_with(|| self.o.fonts.faces[face].kern_1000(left, right))
-    }
-
-    /// Kerning between two glyphs of a face, in points.
-    fn kern(&self, face: FaceId, left: u16, right: u16, size: f32) -> f32 {
-        self.kern_1000(face, left, right) * size / 1000.0
-    }
-
-    /// Kerning before each glyph after the first, for [`glyph_ops`].
-    fn kerns(&self, face: FaceId, glyphs: &[u16]) -> Vec<f32> {
-        glyphs
-            .windows(2)
-            .map(|p| self.kern_1000(face, p[0], p[1]))
-            .collect()
     }
 
     fn measure(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> f32 {
@@ -567,8 +731,11 @@ impl Layout<'_> {
     fn show_runs(&mut self, runs: &Runs, size: f32, x: f32, y: f32, c: Color) {
         let mut x = x;
         for (face, glyphs, w) in runs {
-            let kerns = self.kerns(*face, glyphs);
-            glyph_ops(&mut self.page().ops, *face, size, x, y, c, glyphs, &kerns);
+            let fonts = self.o.fonts.clone();
+            let font = &fonts.faces[*face];
+            glyph_ops(&mut self.page().ops, *face, size, x, y, c, glyphs, |g| {
+                font.advance_1000(g)
+            });
             x += w;
         }
     }
@@ -780,18 +947,14 @@ impl Layout<'_> {
                             // when both end up on one line.
                             if let Some(Tok::Word(prev)) = toks.last_mut() {
                                 if let Some(f) = prev.frags.last_mut().filter(|f| f.same_run(face, st)) {
-                                    if let (Some(&l), Some(&r)) = (f.glyphs.last(), glyphs.first()) {
-                                        f.width += self.kern(face, l, r, st.size);
-                                    }
+                                    self.kern_join(f, glyphs[0].id);
                                 }
                             }
                         }
                         joined = false;
                         match word.frags.last_mut() {
                             Some(f) if f.same_run(face, st) => {
-                                if let (Some(&l), Some(&r)) = (f.glyphs.last(), glyphs.first()) {
-                                    f.width += self.kern(face, l, r, st.size);
-                                }
+                                self.kern_join(f, glyphs[0].id);
                                 f.glyphs.extend_from_slice(&glyphs);
                                 f.width += w;
                             }
@@ -880,11 +1043,9 @@ impl Layout<'_> {
                         if let Some(&(ti, ..)) = placed.last() {
                             if let Tok::Word(Word { hyphen: Some(h), .. }) = &toks[ti] {
                                 if let Some((_, last)) = line.frags.last_mut().filter(|(_, l)| l.joins(h)) {
-                                    if let (Some(&l), Some(&r)) = (last.glyphs.last(), h.glyphs.first()) {
-                                        let k = self.kern(h.face, l, r, h.size);
-                                        last.width += k;
-                                        line.width += k;
-                                    }
+                                    let before = last.width;
+                                    self.kern_join(last, h.glyphs[0].id);
+                                    line.width += last.width - before;
                                 }
                                 let x = line.width;
                                 push_frag(&mut line, x, h.clone());
@@ -909,18 +1070,12 @@ impl Layout<'_> {
                                 continue;
                             }
                             let mut acc = 0.0;
-                            for (k, &g) in f.glyphs.iter().enumerate() {
-                                let mut cw = self.fonts().width(f.face, g, f.size);
-                                if k > start {
-                                    cw += self.kern(f.face, f.glyphs[k - 1], g, f.size);
-                                }
-                                if x + acc + cw > max_w && (x + acc) > 0.0 {
+                            for (k, g) in f.glyphs.iter().enumerate() {
+                                let cw = g.adv * f.size / 1000.0;
+                                // Never split a mark from its base.
+                                if x + acc + cw > max_w && (x + acc) > 0.0 && g.adv != 0.0 {
                                     if k > start {
-                                        let piece = Frag {
-                                            glyphs: f.glyphs[start..k].to_vec(),
-                                            width: acc,
-                                            ..f.clone()
-                                        };
+                                        let piece = f.piece(start..k, acc);
                                         push_frag(&mut line, x, piece);
                                     }
                                     out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
@@ -932,11 +1087,7 @@ impl Layout<'_> {
                                 acc += cw;
                             }
                             if start < f.glyphs.len() {
-                                let piece = Frag {
-                                    glyphs: f.glyphs[start..].to_vec(),
-                                    width: acc + (f.width - self.frag_width(f)),
-                                    ..f.clone()
-                                };
+                                let piece = f.piece(start..f.glyphs.len(), acc);
                                 push_frag(&mut line, x, piece);
                             }
                         }
@@ -960,19 +1111,6 @@ impl Layout<'_> {
             out.push(Laid::Line(line));
         }
         out
-    }
-
-    /// Width of a frag's glyphs with the kerning between them (without the
-    /// kerning to a following word that `Frag::width` may include).
-    fn frag_width(&self, f: &Frag) -> f32 {
-        let mut w = 0.0;
-        for (k, &g) in f.glyphs.iter().enumerate() {
-            w += self.fonts().width(f.face, g, f.size);
-            if k > 0 {
-                w += self.kern(f.face, f.glyphs[k - 1], g, f.size);
-            }
-        }
-        w
     }
 
     fn line_height(&self, line: &Line) -> f32 {
@@ -1010,7 +1148,8 @@ impl Layout<'_> {
         for (fx, f) in &frags {
             let fx = x + fx;
             if !f.glyphs.is_empty() {
-                let kerns = self.kerns(f.face, &f.glyphs);
+                let fonts = self.o.fonts.clone();
+                let font = &fonts.faces[f.face];
                 glyph_ops(
                     &mut self.page().ops,
                     f.face,
@@ -1019,7 +1158,7 @@ impl Layout<'_> {
                     baseline,
                     f.color,
                     &f.glyphs,
-                    &kerns,
+                    |g| font.advance_1000(g),
                 );
             }
             if f.strike {
@@ -1294,19 +1433,15 @@ impl Layout<'_> {
             let mut x = 0.0;
             for (face, glyphs, _) in self.shape(line, true, false, false, size) {
                 for g in glyphs {
-                    let w = self.fonts().width(face, g, size);
-                    if x + w > avail && x > 0.0 {
+                    let w = g.adv * size / 1000.0;
+                    // Never split a mark from its base.
+                    if x + w > avail && x > 0.0 && g.adv != 0.0 {
                         chunks.push(Vec::new());
                         x = 0.0;
                     }
                     let chunk = chunks.last_mut().expect("chunks is never empty");
                     match chunk.last_mut() {
                         Some((f, gs, cw)) if *f == face => {
-                            if let Some(&prev) = gs.last() {
-                                let k = self.kern(face, prev, g, size);
-                                *cw += k;
-                                x += k;
-                            }
                             gs.push(g);
                             *cw += w;
                         }
@@ -1533,12 +1668,61 @@ impl Layout<'_> {
             let w: f32 = runs.iter().map(|r| r.2).sum();
             let mut x = (self.o.page_width - w) / 2.0;
             for (face, glyphs, gw) in &runs {
-                let kerns = self.kerns(*face, glyphs);
-                glyph_ops(&mut self.pages[i].ops, *face, size, x, y, MUTED, glyphs, &kerns);
+                let font = &self.o.fonts.faces[*face];
+                glyph_ops(&mut self.pages[i].ops, *face, size, x, y, MUTED, glyphs, |g| {
+                    font.advance_1000(g)
+                });
                 x += gw;
             }
         }
     }
+}
+
+/// Place marks on their bases for a font without mark positioning data,
+/// from the glyphs' outlines: centred horizontally, and stacked above the
+/// base (or below it, by the mark's combining class) with a small gap.
+fn fallback_marks(
+    font: &crate::ttf::Face,
+    ids: &[u16],
+    marks: &[bool],
+    classes: &[u8],
+) -> Vec<Option<Attachment>> {
+    let gap = font.units_per_em as i32 / 16;
+    let mut out = vec![None; ids.len()];
+    // The current base, its box, and the top and bottom of the stack.
+    let mut base: Option<(usize, [i32; 4])> = None;
+    let (mut top, mut bottom) = (0, 0);
+    for k in 0..ids.len() {
+        let bbox = font.glyph_bbox(ids[k]).map(|b| b.map(i32::from));
+        if !marks[k] {
+            base = bbox.map(|b| (k, b));
+            if let Some(b) = bbox {
+                (top, bottom) = (b[3], b[1]);
+            }
+            continue;
+        }
+        let (Some((parent, b)), Some(m)) = (base, bbox) else {
+            continue;
+        };
+        let dx = (b[0] + b[2]) / 2 - (m[0] + m[2]) / 2;
+        let dy = match classes[k] {
+            // Overlays stay where they are designed.
+            1 => 0,
+            // Below the base.
+            200..=204 | 218 | 220 | 222 | 233 => {
+                let dy = bottom - gap - m[3];
+                bottom = dy + m[1];
+                dy
+            }
+            _ => {
+                let dy = top + gap - m[1];
+                top = dy + m[3];
+                dy
+            }
+        };
+        out[k] = Some(Attachment { parent, dx, dy });
+    }
+    out
 }
 
 /// Resolve an image reference to a file inside `base`. Only relative paths
@@ -1615,6 +1799,29 @@ mod tests {
             v.push(b' ');
         }
         assert_eq!(String::from_utf8(v).unwrap(), "0 1 -2.5 1.23 0.05 0 101 ");
+    }
+
+    #[test]
+    fn fallback_marks_stack_above_and_below() {
+        let fonts = Fonts::builtin();
+        let f = &fonts.faces[0];
+        let g = |c: char| f.glyph(c).unwrap();
+        let ids = [g('A'), g('\u{301}'), g('\u{308}'), g('\u{323}')];
+        let bbox = |c: char| f.glyph_bbox(g(c)).unwrap().map(i32::from);
+        let a = fallback_marks(f, &ids, &[false, true, true, true], &[0, 230, 230, 220]);
+        let (base, acute, dia, dot) = (bbox('A'), bbox('\u{301}'), bbox('\u{308}'), bbox('\u{323}'));
+        let [Some(a1), Some(a2), Some(a3)] = [a[1], a[2], a[3]] else {
+            panic!("{a:?}")
+        };
+        assert!(a.iter().skip(1).all(|x| x.is_some_and(|x| x.parent == 0)));
+        // Centred on the base.
+        let centre = |b: [i32; 4], dx: i32| (b[0] + b[2]) / 2 + dx;
+        assert!((centre(acute, a1.dx) - (base[0] + base[2]) / 2).abs() <= 1);
+        // The acute sits above the A, the diaeresis above the acute, the dot
+        // below the A.
+        assert!(acute[1] + a1.dy > base[3]);
+        assert!(dia[1] + a2.dy > acute[3] + a1.dy);
+        assert!(dot[3] + a3.dy < base[1]);
     }
 
     #[test]

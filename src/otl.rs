@@ -258,6 +258,11 @@ impl Gdef {
         }
     }
 
+    /// Whether the font classifies glyphs (base, ligature, mark).
+    pub fn has_classes(&self) -> bool {
+        self.classes.is_some()
+    }
+
     pub fn glyph_class(&self, d: &[u8], g: u16) -> u16 {
         self.classes.map_or(0, |o| class_of(d, o, g))
     }

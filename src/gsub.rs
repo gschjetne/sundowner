@@ -62,7 +62,7 @@ impl Script {
     }
 
     /// OpenType script tags to look for, best first.
-    fn tags(self) -> &'static [&'static [u8; 4]] {
+    pub(crate) fn tags(self) -> &'static [&'static [u8; 4]] {
         match self {
             Script::Latin => &[b"latn", b"DFLT", b"dflt"],
             Script::Greek => &[b"grek", b"DFLT", b"dflt", b"latn"],
