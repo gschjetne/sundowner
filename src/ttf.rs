@@ -5,6 +5,7 @@
 //! Every read is bounds-checked, so malformed fonts produce an error rather
 //! than a panic.
 
+use crate::kern::Kerning;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -29,6 +30,7 @@ pub struct Face {
     advances: Vec<u16>,
     lsbs: Vec<i16>,
     cmap: HashMap<u32, u16>,
+    kerning: Kerning,
 }
 
 fn u16_at(d: &[u8], i: usize) -> Option<u16> {
@@ -192,6 +194,7 @@ impl Face {
                 .and_then(|a| u32_at(fvar, a + 8))
                 .map_or(400.0, |v| (v as i32 as f32 / 65536.0).round())
         });
+        let kerning = Kerning::parse(table(b"GPOS"), table(b"GDEF"), table(b"kern"));
         let cmap = parse_cmap(req(b"cmap")?, num_glyphs)?;
         if cmap.is_empty() {
             return Err("font has no usable Unicode character map".into());
@@ -213,6 +216,7 @@ impl Face {
             no_subset,
             postscript_name,
             variable_default_weight,
+            kerning,
             advances,
             lsbs,
             cmap,
@@ -222,6 +226,21 @@ impl Face {
     /// Glyph for a character, if the font has one.
     pub fn glyph(&self, c: char) -> Option<u16> {
         self.cmap.get(&(c as u32)).copied()
+    }
+
+    /// Kerning between two adjacent glyphs, in font units (negative moves
+    /// the right glyph closer).
+    pub fn kern(&self, left: u16, right: u16) -> i32 {
+        if self.kerning.is_empty() {
+            return 0;
+        }
+        let t = |tag: &[u8; 4]| self.table(tag).unwrap_or(&[]);
+        self.kerning.pair(t(b"GPOS"), t(b"GDEF"), t(b"kern"), left, right)
+    }
+
+    /// Kerning scaled to 1/1000 em.
+    pub fn kern_1000(&self, left: u16, right: u16) -> f32 {
+        self.kern(left, right) as f32 * 1000.0 / self.units_per_em as f32
     }
 
     /// Advance width in font units.
@@ -610,6 +629,22 @@ mod tests {
     }
 
     #[test]
+    fn gpos_pair_kerning() {
+        let f = Face::parse(Cow::Borrowed(ALEGREYA), 0).unwrap();
+        let k = |a: char, b: char| f.kern(f.glyph(a).unwrap(), f.glyph(b).unwrap());
+        // Reference values from fontTools for the class-based (format 2) subtable.
+        assert_eq!(k('A', 'V'), -42);
+        assert_eq!(k('T', 'o'), -60);
+        assert_eq!(k('L', 'T'), -40);
+        assert_eq!(k('Γ', 'α'), -60);
+        assert_eq!(k('Г', 'А'), -55);
+        assert_eq!(k('o', 'o'), 0);
+        // A monospace font has no kerning.
+        let mono = Face::parse(Cow::Borrowed(include_bytes!("../fonts/Cousine-Regular.ttf")), 0).unwrap();
+        assert_eq!(mono.kern(mono.glyph('A').unwrap(), mono.glyph('V').unwrap()), 0);
+    }
+
+    #[test]
     fn rejects_garbage() {
         assert!(Face::parse(Cow::Borrowed(b"not a font"), 0).is_err());
         assert!(Face::parse(Cow::Borrowed(b"OTTO\0\0\0\0"), 0)
@@ -631,6 +666,9 @@ mod tests {
             if let Ok(f) = Face::parse(Cow::Owned(d), 0) {
                 let used: BTreeSet<u16> = "Ab".chars().filter_map(|c| f.glyph(c)).collect();
                 let _ = f.subset(&used);
+                for l in 0..40 {
+                    let _ = f.kern(l, 40 - l);
+                }
             }
         }
     }
