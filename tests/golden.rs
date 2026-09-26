@@ -354,3 +354,29 @@ fn soft_hyphens_show_only_where_the_line_breaks() {
         "extraordinarily incomprehensibilities".replace(' ', "")
     );
 }
+
+#[test]
+fn combining_marks_compose_or_attach() {
+    // e + combining acute is set as the precomposed é, and copies as é.
+    let out = render("cafe\u{301}");
+    let r = runs(&out, 0);
+    assert_eq!(run(&r, "café").face, REGULAR);
+    let e_acute = Fonts::builtin().faces[REGULAR].glyph('é').unwrap();
+    assert_eq!(out.used[REGULAR].get(&e_acute).map(String::as_str), Some("é"));
+    // Marks in non-canonical order compose the same way: ệ.
+    let out = render("e\u{302}\u{323} e\u{323}\u{302}");
+    let r = runs(&out, 0);
+    assert!(r.iter().all(|x| x.text == "ệ"), "{r:?}");
+    // Without a precomposed character, the mark is positioned on its base
+    // by the font's anchors: above a capital with text rise.
+    let out = render("Q\u{303}");
+    let ops = String::from_utf8_lossy(&out.pages[0].ops).to_string();
+    assert!(ops.contains(" Ts [") && ops.contains("] TJ 0 Ts ET"), "{ops}");
+    assert_eq!(run(&runs(&out, 0), "Q\u{303}").face, REGULAR);
+    // Over a capital, the font's contextual substitutions use a flatter
+    // tilde, which still copies as the combining tilde.
+    let tilde = Fonts::builtin().faces[REGULAR].glyph('\u{303}').unwrap();
+    assert!(!out.used[REGULAR].contains_key(&tilde));
+    assert!(out.used[REGULAR].values().any(|t| t == "\u{303}"));
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+}

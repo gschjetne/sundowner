@@ -126,8 +126,8 @@ and `#anchor` links become clickable; other links are shown as plain text.
 ## Design
 
 - **No dependencies.** Everything is in `src/`: the Markdown parser, layout
-  engine, Unicode line breaker, TrueType parser and subsetter, OpenType
-  glyph substitution, PDF writer, DEFLATE codec and PNG/JPEG readers. The bundled fonts are compiled into the binary.
+  engine, Unicode line breaker and normalizer, TrueType parser and
+  subsetter, OpenType glyph substitution and positioning, PDF writer, DEFLATE codec and PNG/JPEG readers. The bundled fonts are compiled into the binary.
 - **Self-contained PDFs.**
   - Every font is embedded as a subset (Type 0 / CIDFontType2 with
     Identity-H encoding), so viewers never substitute fonts.
@@ -146,6 +146,17 @@ and `#anchor` links become clickable; other links are shown as plain text.
   map, so copying `office` from the PDF gives `office`. A zero-width
   non-joiner (U+200C) prevents a ligature. Code gets the same treatment, so
   programming fonts with ligatures show them; Cousine has none.
+- **Combining marks.** A letter and the combining marks after it are set
+  together, in the first font that covers them all. They are normalized
+  for that font, as HarfBuzz does: marks go in canonical order, and a
+  letter and its marks become the precomposed character where the font has
+  one (`e` + U+0301 is drawn as the designed `é`). Where there is no
+  precomposed glyph, the marks take no space and are attached to the letter,
+  or stacked on each other, by the font's anchors (the GPOS `mark` and `mkmk`
+  features: mark-to-base, mark-to-ligature and mark-to-mark). Fonts without
+  anchors get marks centred over or under the letter from the glyph
+  outlines. Kerning looks past marks. For the bundled fonts, glyphs and
+  positions match HarfBuzz.
 - **Kerning.** Pairs of adjacent glyphs are kerned using the font's
   OpenType `kern` feature (GPOS pair adjustment). Fonts without GPOS
   kerning fall back to the legacy `kern` table. Kerning is included when
@@ -190,13 +201,11 @@ and `#anchor` links become clickable; other links are shown as plain text.
 
 ## Limitations
 
-- **Shaping is for Latin, Greek and Cyrillic.** Ligatures and contextual
-  forms are applied (see above), but there is no mark positioning, no
-  right-to-left layout and no script-specific shaping. Latin, Greek,
-  Cyrillic and CJK render correctly. Arabic, Hebrew and Indic scripts do
-  not.
-- **Combining marks** are drawn as separate glyphs. They are not composed
-  into precomposed characters.
+- **Shaping is for Latin, Greek and Cyrillic.** Ligatures, contextual
+  forms and combining marks are handled (see above), but there is no
+  right-to-left layout, no contextual positioning (GPOS lookup types 7 and
+  8) and no script-specific shaping. Latin, Greek, Cyrillic and CJK render
+  correctly. Arabic, Hebrew and Indic scripts do not.
 - Remote images, interlaced PNGs and formats other than PNG and JPEG are not
   embedded. They appear as an italic `[image: …]` placeholder with a warning.
 
@@ -215,11 +224,11 @@ cargo test                                   # quick
 cargo test --release -- --include-ignored    # plus the stress tests (as in CI)
 ```
 
-The line breaking tables in `src/linebreak_table.rs` are generated from the
-Unicode Character Database by `tools/gen_linebreak.py` (Python 3, standard
-library only). It also writes the conformance test data in `tests/data/`.
-To move to another Unicode version, change `VERSION` in the script and run
-it.
+The Unicode tables in `src/linebreak_table.rs` and `src/normalize_table.rs`
+are generated from the Unicode Character Database by `tools/gen_unicode.py`
+(Python 3, standard library only). It also writes the conformance test
+data in `tests/data/`. To move to another Unicode version, change `VERSION`
+in the script and run it.
 
 Requires Rust 1.87 or newer (the code uses `u*::is_multiple_of`, stabilized
 in 1.87). CI checks formatting, clippy, the full test suite, the static build
@@ -230,6 +239,6 @@ and the minimum Rust version.
 The code is licensed under the MIT License (see `LICENSE`). The bundled
 fonts in `fonts/` are licensed under the SIL Open Font License 1.1. See
 [`fonts/README.md`](fonts/README.md) for their sources, changes and license
-compliance, or run `sundowner --licenses`. The line breaking tables and test
-data are derived from the Unicode Character Database, under the Unicode
-License v3 (see `LICENSE-UNICODE`).
+compliance, or run `sundowner --licenses`. The line breaking and
+normalization tables and their test data are derived from the Unicode
+Character Database, under the Unicode License v3 (see `LICENSE-UNICODE`).

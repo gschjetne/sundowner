@@ -243,6 +243,21 @@ impl Fonts {
         None
     }
 
+    /// The faces tried for text in this style, in the order [`Fonts::resolve`]
+    /// tries them.
+    pub fn candidates(&self, mono: bool, bold: bool, italic: bool) -> Vec<FaceId> {
+        let chain = if mono { &self.mono } else { &self.body };
+        let mut out = Vec::new();
+        for fam in chain {
+            for face in fam.faces(bold, italic) {
+                if !out.contains(&face) {
+                    out.push(face);
+                }
+            }
+        }
+        out
+    }
+
     /// The face used for characters no font covers (its `.notdef` glyph).
     pub fn primary(&self, mono: bool, bold: bool, italic: bool) -> FaceId {
         let chain = if mono { &self.mono } else { &self.body };
