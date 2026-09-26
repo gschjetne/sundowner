@@ -35,7 +35,7 @@ OPTIONS:
     -h, --help              Show this help
     -V, --version           Show version
 
-Text is set in the bundled Alegreya and code in Roboto Mono. Other fonts,
+Text is set in the bundled Alegreya and code in Cousine. Other fonts,
 including fallbacks for other scripts, are added in a .sundowner file; see
 the README. Installed system fonts are never used.
 ";

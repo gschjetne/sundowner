@@ -78,20 +78,20 @@ pub const BUNDLED: [Bundled; 8] = [
         data: include_bytes!("../fonts/Alegreya-BoldItalic.ttf"),
     },
     Bundled {
-        file: "RobotoMono-Regular.ttf",
-        data: include_bytes!("../fonts/RobotoMono-Regular.ttf"),
+        file: "Cousine-Regular.ttf",
+        data: include_bytes!("../fonts/Cousine-Regular.ttf"),
     },
     Bundled {
-        file: "RobotoMono-Bold.ttf",
-        data: include_bytes!("../fonts/RobotoMono-Bold.ttf"),
+        file: "Cousine-Bold.ttf",
+        data: include_bytes!("../fonts/Cousine-Bold.ttf"),
     },
     Bundled {
-        file: "RobotoMono-Italic.ttf",
-        data: include_bytes!("../fonts/RobotoMono-Italic.ttf"),
+        file: "Cousine-Italic.ttf",
+        data: include_bytes!("../fonts/Cousine-Italic.ttf"),
     },
     Bundled {
-        file: "RobotoMono-BoldItalic.ttf",
-        data: include_bytes!("../fonts/RobotoMono-BoldItalic.ttf"),
+        file: "Cousine-BoldItalic.ttf",
+        data: include_bytes!("../fonts/Cousine-BoldItalic.ttf"),
     },
 ];
 
@@ -104,9 +104,8 @@ pub const FONT_LICENSES: [(&str, &str); 2] = [
         include_str!("../fonts/OFL-Alegreya.txt"),
     ),
     (
-        "Roboto Mono (Regular, Bold, Italic, Bold Italic; static instances generated from the \
-         variable fonts, see fonts/build.py)",
-        include_str!("../fonts/OFL-RobotoMono.txt"),
+        "Cousine (Regular, Bold, Italic, Bold Italic; unmodified)",
+        include_str!("../fonts/OFL-Cousine.txt"),
     ),
 ];
 
@@ -132,7 +131,7 @@ pub struct FontSpec {
 const MAX_FONT_FILE: u64 = 512 << 20;
 
 impl Fonts {
-    /// The bundled fonts only: Alegreya for text, Roboto Mono for code.
+    /// The bundled fonts only: Alegreya for text, Cousine for code.
     pub fn builtin() -> Arc<Fonts> {
         static BUILTIN: OnceLock<Arc<Fonts>> = OnceLock::new();
         BUILTIN
@@ -143,7 +142,7 @@ impl Fonts {
     /// Load the configured fonts. The chains are:
     ///
     /// - body: body family (default Alegreya), fallbacks, bundled families
-    /// - code: code family (default Roboto Mono), fallbacks, body family,
+    /// - code: code family (default Cousine), fallbacks, body family,
     ///   bundled families
     ///
     /// The bundled fonts are always the final fallback.
@@ -278,9 +277,9 @@ mod tests {
         let (face, _) = f.resolve('a', false, false, false).unwrap();
         assert!(f.faces[face].postscript_name.contains("Alegreya"));
         let (face, _) = f.resolve('a', true, false, false).unwrap();
-        assert!(f.faces[face].postscript_name.contains("RobotoMono"));
+        assert!(f.faces[face].postscript_name.contains("Cousine"));
         let (face, _) = f.resolve('a', true, false, true).unwrap();
-        assert!(f.faces[face].italic && f.faces[face].postscript_name.contains("RobotoMono"));
+        assert!(f.faces[face].italic && f.faces[face].postscript_name.contains("Cousine"));
         let (face, _) = f.resolve('a', false, true, true).unwrap();
         assert!(f.faces[face].italic);
         assert!(f.resolve('中', false, false, false).is_none());
@@ -316,7 +315,7 @@ mod tests {
         assert_eq!(
             f.resolve('x', true, false, false).unwrap().0,
             4,
-            "bundled Roboto Mono"
+            "bundled Cousine"
         );
         assert_eq!(f.body[1].regular, 8, "the fallback is next in line");
     }
@@ -325,7 +324,7 @@ mod tests {
     fn user_body_family_replaces_alegreya() {
         let spec = FontSpec {
             body: Some(FamilySpec {
-                regular: bundled_path("RobotoMono-Regular.ttf"),
+                regular: bundled_path("Cousine-Regular.ttf"),
                 ..Default::default()
             }),
             ..Default::default()
@@ -344,7 +343,8 @@ mod tests {
     }
 
     /// Every bundled face must cover Latin (Basic, Latin-1 and Extended-A),
-    /// modern Greek and Cyrillic, so no style or code falls back to boxes.
+    /// modern and polytonic Greek and Cyrillic, so no style or code falls
+    /// back to another font or to boxes.
     #[test]
     fn bundled_fonts_cover_latin_greek_cyrillic() {
         let f = Fonts::builtin();

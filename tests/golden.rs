@@ -178,16 +178,17 @@ fn long_documents_break_pages() {
 
 #[test]
 fn every_script_in_the_bundled_fonts_uses_real_glyphs() {
-    let out = render("Καλημέρα Съешь Łódź “q” € `код κώδικας Łódź` *`курсив`* **_`έντονα`_**");
+    let out = render("Καλημέρα Съешь Łódź “q” € `код κώδικας Łódź ἀρχὴ` *`курсив`* **_`ᾠδή`_**");
     let r = runs(&out, 0);
     assert_eq!(run(&r, "Καλημέρα").face, REGULAR);
     assert_eq!(run(&r, "Съешь").face, REGULAR);
     assert_eq!(run(&r, "Łódź").face, REGULAR);
-    // Code in every script and style stays in Roboto Mono; nothing falls back.
+    // Code in every script and style stays in Cousine; nothing falls back.
     assert_eq!(run(&r, "код").face, MONO);
     assert_eq!(run(&r, "κώδικας").face, MONO);
     assert_eq!(run(&r, "курсив").face, MONO_ITALIC);
-    assert_eq!(run(&r, "έντονα").face, MONO_BOLD_ITALIC);
+    assert_eq!(run(&r, "ᾠδή").face, MONO_BOLD_ITALIC);
+    assert_eq!(run(&r, "ἀρχὴ").face, MONO);
     assert!(out.warnings.is_empty(), "{:?}", out.warnings);
 }
 
@@ -214,7 +215,7 @@ fn fonts_are_embedded_subsets_with_unicode_maps() {
     assert_eq!(text.matches("/FontFile2").count(), 3);
     assert_eq!(text.matches("/ToUnicode").count(), 3);
     assert!(!text.contains("/Type1"), "no base-14 fonts");
-    assert!(text.contains("+AlegreyaRoman-Regular") && text.contains("+RobotoMono-Regular"));
+    assert!(text.contains("+AlegreyaRoman-Regular") && text.contains("+Cousine-Regular"));
     // Same input, same bytes.
     assert_eq!(
         pdf,

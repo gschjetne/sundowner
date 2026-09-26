@@ -6,8 +6,8 @@ only the standard library.
 
 Output is predictable: text is set in the bundled
 [Alegreya](https://github.com/huertatipografica/Alegreya) and code in
-[Roboto Mono](https://github.com/googlefonts/robotomono), both embedded in
-every PDF.
+[Cousine](https://github.com/googlefonts/cousine), both embedded in every
+PDF.
 Fonts installed on the machine are never used, so the same input and
 configuration produce the same PDF everywhere.
 
@@ -42,9 +42,8 @@ Exit status: `0` on success, `1` if any input failed, `2` on usage errors.
 ## Fonts and configuration
 
 Every bundled font, in every style, covers Latin (including Central and
-Eastern European), Greek and Cyrillic; a test enforces this. Alegreya also
-covers polytonic Greek, and code uses it for that when Roboto Mono lacks a
-glyph. To use other fonts, or to cover other scripts and emoji,
+Eastern European), modern and polytonic Greek, and Cyrillic; a test enforces
+this. To use other fonts, or to cover other scripts and emoji,
 create a `.sundowner` file. sundowner uses the nearest one in the input
 file's directory or any parent directory, or the file given with `--config`.
 
@@ -62,7 +61,7 @@ bold = fonts/SourceSans3-Bold.ttf
 italic = fonts/SourceSans3-Italic.ttf
 bold-italic = fonts/SourceSans3-BoldItalic.ttf
 
-# Replace Roboto Mono for code
+# Replace Cousine for code
 [mono]
 regular = fonts/JetBrainsMono-Regular.ttf
 bold = fonts/JetBrainsMono-Bold.ttf
@@ -176,7 +175,7 @@ and `#anchor` links become clickable; other links are shown as plain text.
 ## Building
 
 ```sh
-# Fully static Linux binary (about 2.3 MB, most of it the bundled fonts)
+# Fully static Linux binary (about 3.1 MB, most of it the bundled fonts)
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 # -> target/x86_64-unknown-linux-musl/release/sundowner
