@@ -120,8 +120,11 @@ impl Gsub {
     fn try_parse(t: &[u8], num_glyphs: u16) -> Option<Gsub> {
         let mut budget = Budget(BUDGET);
         let mut plans: [Vec<u16>; 4] = Default::default();
+        // A malformed or budget-exhausting script section only loses that
+        // script; Latin comes first so it survives problems in later ones.
         for s in [Script::Latin, Script::Greek, Script::Cyrillic, Script::Other] {
-            plans[s.index()] = otl::feature_lookups(t, Scripts::First(s.tags()), &FEATURES, &mut budget)?;
+            plans[s.index()] =
+                otl::feature_lookups(t, Scripts::First(s.tags()), &FEATURES, &mut budget).unwrap_or_default();
         }
         let list = u16_at(t, 8)? as usize;
         let n = budget.take(u16_at(t, list)? as usize)?;

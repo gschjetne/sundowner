@@ -81,9 +81,12 @@ impl MarkPositioning {
 fn try_parse(t: &[u8]) -> Option<MarkPositioning> {
     let mut budget = Budget(BUDGET);
     let mut plans: [Vec<u16>; 4] = Default::default();
+    // A malformed or budget-exhausting script section only loses that
+    // script; Latin comes first so it survives problems in later ones.
     for s in [Script::Latin, Script::Greek, Script::Cyrillic, Script::Other] {
         plans[s as usize] =
-            otl::feature_lookups(t, Scripts::First(s.tags()), &[b"mark", b"mkmk"], &mut budget)?;
+            otl::feature_lookups(t, Scripts::First(s.tags()), &[b"mark", b"mkmk"], &mut budget)
+                .unwrap_or_default();
     }
     let list = u16_at(t, 8)? as usize;
     let n = budget.take(u16_at(t, list)? as usize)?;
@@ -190,6 +193,10 @@ fn attach(
                 (j, (off != 0).then_some(second_array + off as usize)?)
             } else {
                 // The mark goes on the last component of the ligature.
+                // Which component a mark belonged to before the ligature
+                // formed is not tracked, so a mark on an earlier component
+                // (an accent on the f of an fi ligature) also lands on the
+                // last one.
                 let attach = second_array + u16_at(t, second_array + 2 + 2 * idx)? as usize;
                 let components = u16_at(t, attach)? as usize;
                 let comp = components.checked_sub(1)?;
