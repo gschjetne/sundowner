@@ -281,7 +281,7 @@ pub fn resolve_classes(orig: &[BidiClass], brackets: &[Bracket], level: Option<u
     let kept: Vec<usize> = (0..n).filter(|&i| !removed(orig[i])).collect();
     let mut sequences: Vec<Vec<usize>> = Vec::new();
     // Sequence waiting for the PDI at an index to continue it.
-    let mut waiting: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut waiting: Vec<Option<usize>> = vec![None; n];
     let mut k = 0;
     while k < kept.len() {
         let mut end = k + 1;
@@ -289,7 +289,7 @@ pub fn resolve_classes(orig: &[BidiClass], brackets: &[Bracket], level: Option<u
             end += 1;
         }
         let run = &kept[k..end];
-        let seq = match waiting.remove(&run[0]) {
+        let seq = match waiting[run[0]].take() {
             Some(s) if orig[run[0]] == PDI => s,
             _ => {
                 sequences.push(Vec::new());
@@ -300,7 +300,7 @@ pub fn resolve_classes(orig: &[BidiClass], brackets: &[Bracket], level: Option<u
         let last = run[run.len() - 1];
         if isolate_initiator(orig[last]) {
             if let Some(m) = matching[last] {
-                waiting.insert(m, seq);
+                waiting[m] = Some(seq);
             }
         }
         k = end;
@@ -581,6 +581,14 @@ mod tests {
         assert_eq!(l.levels, [1, 1, 1, 1, 1, 2, 2, 2, 1, 2, 2, 2]);
         let order = visual_order(&l.levels);
         assert_eq!(order, [9, 10, 11, 8, 5, 6, 7, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn class_table_starts_at_zero() {
+        // `class` relies on this: every code point is in some range.
+        assert_eq!(table::RANGES[0] >> 5, 0);
+        assert_eq!(class('\0'), BN);
+        assert_eq!(class(char::MAX), BN);
     }
 
     #[test]
