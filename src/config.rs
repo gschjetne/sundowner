@@ -14,7 +14,7 @@
 //! italic = fonts/SourceSans3-Italic.ttf
 //! bold-italic = fonts/SourceSans3-BoldItalic.ttf
 //!
-//! # Replace the bundled Roboto Mono for code
+//! # Replace the bundled Cousine for code
 //! [mono]
 //! regular = fonts/JetBrainsMono-Regular.ttf
 //!
