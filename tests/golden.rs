@@ -181,6 +181,62 @@ fn long_documents_break_pages() {
     }
 }
 
+/// The page each run of `text` is on.
+fn pages_of(out: &Output, text: &str) -> Vec<usize> {
+    (0..out.pages.len())
+        .flat_map(|p| {
+            runs(out, p)
+                .into_iter()
+                .filter(|r| r.text == text)
+                .map(move |_| p)
+        })
+        .collect()
+}
+
+/// Paragraphs that fill most of the first page.
+fn filler(n: usize) -> String {
+    (0..n).map(|k| format!("filler{k}\n\n")).collect()
+}
+
+#[test]
+fn code_blocks_that_fit_on_the_next_page_are_not_split() {
+    // With 28 paragraphs above it, the code block does not fit on the first
+    // page; it moves to the second page whole instead of being split.
+    let code: String = (0..10).map(|k| format!("line{k}\n")).collect();
+    let out = render(&format!("{}```\n{code}```\n\nafter\n", filler(28)));
+    assert_eq!(out.pages.len(), 2);
+    assert_eq!(pages_of(&out, "filler27"), [0]);
+    for k in 0..10 {
+        assert_eq!(pages_of(&out, &format!("line{k}")), [1], "line{k}");
+    }
+}
+
+#[test]
+fn headings_stay_with_the_text_after_them() {
+    for n in 26..32 {
+        let out = render(&format!(
+            "{}## Heading\n\nSectionstart and more words.\n",
+            filler(n)
+        ));
+        let heading = pages_of(&out, "Heading");
+        assert_eq!(heading.len(), 1);
+        assert_eq!(heading, pages_of(&out, "Sectionstart"), "{n} paragraphs");
+    }
+}
+
+#[test]
+fn page_breaks_use_space_left_at_the_end() {
+    // A long code block is split only where it has to be.
+    let code: String = (0..80).map(|k| format!("line{k}\n")).collect();
+    let out = render(&format!("{}```\n{code}```\n", filler(20)));
+    let first: Vec<usize> = (0..80)
+        .filter(|k| pages_of(&out, &format!("line{k}")) == [1])
+        .collect();
+    // The block starts on the second page, and the rest fits on the third.
+    assert_eq!(first.first(), Some(&0));
+    assert_eq!(out.pages.len(), 3);
+}
+
 #[test]
 fn every_script_in_the_bundled_fonts_uses_real_glyphs() {
     let out = render("Καλημέρα Съешь Łódź “q” € `код κώδικας Łódź ἀρχὴ` *`курсив`* **_`ᾠδή`_**");

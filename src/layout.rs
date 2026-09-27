@@ -32,6 +32,42 @@ const LINK: Color = (0.02, 0.35, 0.75);
 const CODE_BG: Color = (0.95, 0.95, 0.96);
 const RULE: Color = (0.82, 0.82, 0.85);
 
+// Page breaking. Breaks are chosen for the whole document at once, as the
+// Knuth-Plass algorithm chooses line breaks for a paragraph: every place a
+// page may break has a penalty, every page costs its unused space, and the
+// breaks with the least total cost win (see `plan_pages`). The penalties
+// are on the scale of plain TeX's.
+
+/// Penalty that rules out a break unless nothing else fits.
+const FORBID: f32 = 1e6;
+/// A break after the first line of a paragraph, leaving it alone at the
+/// bottom of a page (TeX's `\clubpenalty`).
+const CLUB: f32 = 150.0;
+/// A break before the last line of a paragraph, leaving it alone at the top
+/// of a page (TeX's `\widowpenalty`).
+const WIDOW: f32 = 150.0;
+/// Breaks inside a block quote.
+const IN_QUOTE: f32 = 100.0;
+/// Breaks inside a list item, and between the items of a list.
+const IN_ITEM: f32 = 60.0;
+const BETWEEN_ITEMS: f32 = 20.0;
+/// Breaks inside a code block, and near its ends (fewer than
+/// `CODE_EDGE_LINES` lines on one side).
+const IN_CODE: f32 = 100.0;
+const CODE_EDGE: f32 = 200.0;
+const CODE_EDGE_LINES: usize = 3;
+/// Breaks between the rows of a table, and inside a row.
+const TABLE_ROW: f32 = 50.0;
+const IN_ROW: f32 = 1000.0;
+/// Breaks before a heading of level 1 to 3 are encouraged, so that pages
+/// start with a new section (plain TeX's `\beginsection` does the same).
+const SECTION: [f32; 3] = [-100.0, -60.0, -30.0];
+/// Cost of every page, so that pages are not added to avoid penalties.
+const PAGE_COST: f32 = 10000.0;
+/// Cost of a page left entirely empty; less empty pages cost this times the
+/// cube of the empty fraction, so a line or two costs next to nothing.
+const EMPTY_COST: f32 = 2000.0;
+
 type Color = (f32, f32, f32);
 
 #[derive(Clone, Debug)]
@@ -273,13 +309,51 @@ struct Ctx {
     list_depth: usize,
 }
 
+/// A place where a page may break, recorded in the first pass: where the
+/// content before it ends and the content after it starts (they differ by
+/// the gap between them, which is dropped at the top of a page), and the
+/// penalty of breaking there.
+#[derive(Clone, Copy, Debug)]
+pub struct Breakpoint {
+    pub above: f32,
+    pub below: f32,
+    pub penalty: f32,
+}
+
+/// Lines laid out in the first pass, for the second.
+enum Laidout {
+    Text(Vec<Laid>, bool),
+    Code(Vec<LevelRuns>),
+    Table(Vec<f32>, f32, Vec<Vec<(Vec<Line>, bool)>>),
+}
+
+enum Pass {
+    /// Lay out on one endless page and record where pages may break.
+    Measure(Vec<Breakpoint>),
+    /// Lay out on pages, breaking at the chosen breakpoints.
+    Set(Vec<bool>),
+}
+
 struct Layout<'a> {
     o: &'a Options,
     refs: &'a HashMap<String, String>,
     pages: Vec<Page>,
+    /// Where the content on each full page ends.
+    page_ends: Vec<f32>,
     y: f32,
     at_top: bool,
     pending_gap: f32,
+    pass: Pass,
+    /// Places the page may break so far in this pass.
+    breakpoints: usize,
+    /// Penalty of breaks in the current block, from the blocks it is in.
+    keep: f32,
+    /// Penalty of the next break instead of `keep`, if set.
+    next_penalty: Option<f32>,
+    /// Blocks laid out in the first pass, in order, and how many of them
+    /// have been used in this pass.
+    laidout: Vec<Option<Laidout>>,
+    blocks_laid: usize,
     marker: Option<Marker>,
     images: Vec<Image>,
     image_cache: HashMap<String, Option<usize>>,
@@ -304,9 +378,16 @@ impl<'a> Layout<'a> {
             o,
             refs,
             pages: vec![Page::default()],
+            page_ends: Vec::new(),
             y: o.page_height - o.margin,
             at_top: true,
             pending_gap: 0.0,
+            pass: Pass::Measure(Vec::new()),
+            breakpoints: 0,
+            keep: 0.0,
+            next_penalty: None,
+            laidout: Vec::new(),
+            blocks_laid: 0,
             marker: None,
             images: Vec::new(),
             image_cache: HashMap::new(),
@@ -355,7 +436,15 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         tight: false,
         list_depth: 0,
     };
+    // Lay the document out twice: once to find where pages may break, and
+    // again to break them where it is best. The second pass reuses the
+    // first one's lines, shaping and images.
     l.blocks(&doc.blocks, ctx);
+    if let Pass::Measure(breakpoints) = &l.pass {
+        let plan = plan_pages(breakpoints, l.y, l.top() - l.bottom());
+        l.restart(plan);
+        l.blocks(&doc.blocks, ctx);
+    }
     if o.page_numbers {
         l.number_pages();
     }
@@ -388,6 +477,66 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         fonts: o.fonts.clone(),
         used: l.used.into_inner(),
     }
+}
+
+/// Choose where pages break: for each breakpoint, whether a new page starts
+/// there. `end` is where the document ends and `page_h` the height of the
+/// text area.
+///
+/// Each page costs [`PAGE_COST`] plus the penalty of the break that ends it
+/// plus its badness: [`EMPTY_COST`] times the cube of the fraction of it
+/// left empty. The last page's empty space is free, as a paragraph's last
+/// line is in Knuth and Plass's line breaking, so space left over at the end
+/// of the document goes to keeping blocks together earlier on. The cube
+/// makes a line or two of space cost next to nothing, while half a page
+/// costs as much as a bad break. Dynamic programming finds the breaks with
+/// the least total cost; as a page can only start at the breakpoints that
+/// fit above its end, this takes time linear in the length of the document.
+pub fn plan_pages(breakpoints: &[Breakpoint], end: f32, page_h: f32) -> Vec<bool> {
+    let n = breakpoints.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let page_h = page_h.max(1.0) as f64;
+    // Best total cost of the pages before breakpoint j, when a page starts
+    // there, and where the page before it starts.
+    let mut cost = vec![f64::INFINITY; n + 1];
+    let mut from = vec![0usize; n + 1];
+    cost[0] = 0.0;
+    for j in 1..=n {
+        let (above, penalty, last) = match breakpoints.get(j) {
+            Some(b) => (b.above, b.penalty.max(-FORBID) as f64, false),
+            None => (end, 0.0, true),
+        };
+        for i in (0..j).rev() {
+            let h = (breakpoints[i].below - above) as f64;
+            // A page must start at the previous breakpoint when even that
+            // content does not fit.
+            if h > page_h + 0.01 && i + 1 < j {
+                break;
+            }
+            let empty = ((page_h - h) / page_h).clamp(0.0, 1.0);
+            let badness = if h > page_h + 0.01 {
+                FORBID as f64 * 10.0
+            } else if last {
+                0.0
+            } else {
+                EMPTY_COST as f64 * empty * empty * empty
+            };
+            let c = cost[i] + PAGE_COST as f64 + badness + penalty;
+            if c < cost[j] {
+                cost[j] = c;
+                from[j] = i;
+            }
+        }
+    }
+    let mut plan = vec![false; n];
+    let mut j = from[n];
+    while j > 0 {
+        plan[j] = true;
+        j = from[j];
+    }
+    plan
 }
 
 /// Append a number in PDF syntax.
@@ -1036,6 +1185,9 @@ impl Layout<'_> {
     }
 
     fn show_runs(&mut self, runs: &Runs, size: f32, x: f32, y: f32, c: Color) {
+        if !self.drawing() {
+            return;
+        }
         let mut x = x;
         for (face, glyphs, w) in runs {
             let fonts = self.o.fonts.clone();
@@ -1064,29 +1216,104 @@ impl Layout<'_> {
     }
 
     fn new_page(&mut self) {
+        self.page_ends.push(self.y);
         self.pages.push(Page::default());
         self.y = self.top();
         self.at_top = true;
+    }
+
+    /// Start the second pass, which breaks pages where `plan` says.
+    fn restart(&mut self, plan: Vec<bool>) {
+        self.pass = Pass::Set(plan);
+        self.pages = vec![Page::default()];
+        self.page_ends.clear();
+        self.y = self.top();
+        self.at_top = true;
+        self.pending_gap = 0.0;
+        self.breakpoints = 0;
+        self.keep = 0.0;
+        self.next_penalty = None;
+        self.blocks_laid = 0;
+        self.marker = None;
+        self.headings.clear();
+        self.anchors.clear();
+        self.slug_counts.clear();
     }
 
     fn gap(&mut self, h: f32) {
         self.pending_gap = self.pending_gap.max(h);
     }
 
-    /// Reserve `h` points of vertical space, applying any pending gap and
-    /// starting a new page when the current one is full.
-    fn ensure(&mut self, h: f32) {
-        if !self.at_top {
-            self.y -= self.pending_gap;
+    /// Whether this pass draws: the first one only measures.
+    fn drawing(&self) -> bool {
+        matches!(self.pass, Pass::Set(_))
+    }
+
+    /// The lines of the next block from the first pass, if this is the
+    /// second, and its place for [`Self::keep_laidout`]. Blocks are laid out
+    /// in the same order in both passes.
+    fn laidout(&mut self) -> (usize, Option<Laidout>) {
+        let k = self.blocks_laid;
+        self.blocks_laid += 1;
+        match self.pass {
+            Pass::Measure(_) => {
+                self.laidout.push(None);
+                (k, None)
+            }
+            Pass::Set(_) => (k, self.laidout.get_mut(k).and_then(Option::take)),
+        }
+    }
+
+    /// Keep the lines of a block from the first pass for the second.
+    fn keep_laidout(&mut self, k: usize, laid: Laidout) {
+        if !self.drawing() {
+            self.laidout[k] = Some(laid);
+        }
+    }
+
+    /// Set the penalty of the next break, unless it is already forbidden.
+    fn penalize_next(&mut self, p: f32) {
+        if self.next_penalty.is_none_or(|q| q < FORBID) {
+            self.next_penalty = Some(p);
+        }
+    }
+
+    /// A place where the page may break, before content that is about to be
+    /// drawn: `penalty` adds to that of the blocks it is in. Applies any
+    /// pending gap, unless the page breaks here.
+    fn may_break(&mut self, penalty: f32) {
+        let penalty = self.next_penalty.take().unwrap_or(self.keep) + penalty;
+        let k = self.breakpoints;
+        self.breakpoints += 1;
+        let above = self.y;
+        match &mut self.pass {
+            Pass::Measure(breakpoints) => {
+                if !self.at_top {
+                    self.y -= self.pending_gap;
+                }
+                breakpoints.push(Breakpoint {
+                    above,
+                    below: self.y,
+                    penalty,
+                });
+            }
+            Pass::Set(plan) => {
+                if plan.get(k).copied().unwrap_or(false) && !self.at_top {
+                    self.new_page();
+                }
+                if !self.at_top {
+                    self.y -= self.pending_gap;
+                }
+            }
         }
         self.pending_gap = 0.0;
-        if self.y - h < self.bottom() && !self.at_top {
-            self.new_page();
-        }
         self.at_top = false;
     }
 
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Color) {
+        if !self.drawing() {
+            return;
+        }
         let ops = &mut self.page().ops;
         nums(ops, &[c.0, c.1, c.2]);
         ops.extend_from_slice(b"rg ");
@@ -1095,6 +1322,9 @@ impl Layout<'_> {
     }
 
     fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
+        if !self.drawing() {
+            return;
+        }
         let ops = &mut self.page().ops;
         nums(ops, &[c.0, c.1, c.2]);
         ops.extend_from_slice(b"RG ");
@@ -1462,6 +1692,9 @@ impl Layout<'_> {
     fn draw_line(&mut self, line: &Line, x: f32, lh: f32) {
         let baseline = self.y - lh / 2.0 - line.size * 0.26;
         self.draw_marker(baseline);
+        if !self.drawing() {
+            return;
+        }
         // Words that continue each other without a space are drawn as one
         // run; their widths already include the kerning between them.
         let mut frags: Vec<(f32, Frag)> = Vec::with_capacity(line.frags.len());
@@ -1558,6 +1791,9 @@ impl Layout<'_> {
 
     fn draw_marker(&mut self, baseline: f32) {
         let Some(m) = self.marker.take() else { return };
+        if !self.drawing() {
+            return;
+        }
         match m.kind {
             MarkerKind::Text(t) => {
                 let runs = self.visual_runs(self.shape_levels(&t, false, false, false, m.size, Some(m.rtl)));
@@ -1605,24 +1841,41 @@ impl Layout<'_> {
         } else {
             inlines
         };
-        let (toks, rtl) = self.tokenize(inlines, size, ctx.color, bold);
-        for item in self.wrap(&toks, ctx.w, size) {
+        let (slot, laidout) = self.laidout();
+        let (laid, rtl) = match laidout {
+            Some(Laidout::Text(laid, rtl)) => (laid, rtl),
+            _ => {
+                let (toks, rtl) = self.tokenize(inlines, size, ctx.color, bold);
+                (self.wrap(&toks, ctx.w, size), rtl)
+            }
+        };
+        let n = laid.len();
+        for (k, item) in laid.iter().enumerate() {
+            // Avoid leaving the first or last line of a paragraph alone.
+            let mut penalty = 0.0;
+            if k == 1 {
+                penalty += CLUB;
+            }
+            if k > 0 && k + 1 == n {
+                penalty += WIDOW;
+            }
             match item {
                 Laid::Line(line) => {
-                    let lh = self.line_height(&line);
-                    self.ensure(lh);
+                    let lh = self.line_height(line);
+                    self.may_break(penalty);
                     // Right-to-left paragraphs are set flush right.
                     let x = if rtl {
                         ctx.x + (ctx.w - line.width).max(0.0)
                     } else {
                         ctx.x
                     };
-                    self.draw_line(&line, x, lh);
+                    self.draw_line(line, x, lh);
                     self.y -= lh;
                 }
-                Laid::Image { alt, src } => self.image(&alt, &src, ctx),
+                Laid::Image { alt, src } => self.image(alt, src, ctx, penalty),
             }
         }
+        self.keep_laidout(slot, Laidout::Text(laid, rtl));
     }
 
     // ------------------------------------------------------------ images
@@ -1659,8 +1912,9 @@ impl Layout<'_> {
         image::load(&image::read_file(&path)?)
     }
 
-    fn image(&mut self, alt: &str, src: &str, ctx: Ctx) {
+    fn image(&mut self, alt: &str, src: &str, ctx: Ctx, penalty: f32) {
         let Some(idx) = self.load_image(src) else {
+            self.penalize_next(self.keep + penalty);
             return self.text_block(&[placeholder(alt, src)], self.o.font_size, ctx, false);
         };
         let (pw, ph) = (self.images[idx].width as f32, self.images[idx].height as f32);
@@ -1677,13 +1931,15 @@ impl Layout<'_> {
             h = max_h;
         }
         let (w, h) = (w.max(1.0), h.max(1.0));
-        self.ensure(h + 4.0);
+        self.may_break(penalty);
         self.draw_marker(self.y - self.o.font_size);
         let y = self.y - h - 2.0;
-        let ops = &mut self.page().ops;
-        ops.extend_from_slice(b"q ");
-        nums(ops, &[w, 0.0, 0.0, h, ctx.x, y]);
-        let _ = writeln!(ops, "cm /Im{idx} Do Q");
+        if self.drawing() {
+            let ops = &mut self.page().ops;
+            ops.extend_from_slice(b"q ");
+            nums(ops, &[w, 0.0, 0.0, h, ctx.x, y]);
+            let _ = writeln!(ops, "cm /Im{idx} Do Q");
+        }
         self.y -= h + 4.0;
     }
 
@@ -1719,7 +1975,7 @@ impl Layout<'_> {
                 }
                 Block::Rule => {
                     self.gap(fs * 0.6);
-                    self.ensure(fs * 0.6);
+                    self.may_break(0.0);
                     self.draw_marker(self.y - fs);
                     let y = self.y - fs * 0.3;
                     self.stroke_line(ctx.x, y, ctx.x + ctx.w, y, 0.75, RULE);
@@ -1735,7 +1991,7 @@ impl Layout<'_> {
         if self.marker.is_some() {
             // Empty list item: still show its bullet.
             let lh = fs * LINE_SPACING;
-            self.ensure(lh);
+            self.may_break(0.0);
             self.draw_marker(self.y - lh / 2.0 - fs * 0.26);
             self.y -= lh;
         }
@@ -1746,8 +2002,10 @@ impl Layout<'_> {
         let scale = [2.0, 1.6, 1.3, 1.15, 1.0, 0.9][(level.clamp(1, 6) - 1) as usize];
         let size = fs * scale;
         self.gap(if level <= 2 { fs * 1.3 } else { fs * 1.0 });
-        // Keep the heading together with the start of the following text.
-        self.ensure(size * LINE_SPACING + fs * LINE_SPACING * 2.0);
+        if let Some(bonus) = SECTION.get(level.max(1) as usize - 1) {
+            self.penalize_next(self.keep + bonus);
+        }
+        self.may_break(0.0);
 
         let inl = inline::parse(raw, self.refs);
         let title = inline::plain_text(&inl);
@@ -1768,7 +2026,12 @@ impl Layout<'_> {
         });
 
         let color = if level >= 6 { MUTED } else { ctx.color };
+        // Keep the heading's lines together, and with the text after it.
+        let keep = std::mem::replace(&mut self.keep, FORBID);
+        self.next_penalty = Some(FORBID);
         self.text_block(&inl, size, Ctx { color, ..ctx }, true);
+        self.keep = keep;
+        self.next_penalty = Some(FORBID);
         if level <= 2 {
             let y = self.y - fs * 0.15;
             self.stroke_line(
@@ -1791,18 +2054,54 @@ impl Layout<'_> {
         let pad = fs * 0.6;
         let avail = (ctx.w - 2.0 * pad).max(size);
 
-        self.ensure(pad + lh);
+        self.may_break(0.0);
         let top_y = self.y;
         self.fill_rect(ctx.x, top_y - pad, ctx.w, pad, CODE_BG);
         self.draw_marker(top_y - pad - lh / 2.0 - size * 0.26);
         self.y -= pad;
+        let (slot, laidout) = self.laidout();
+        let mut chunks = match laidout {
+            Some(Laidout::Code(chunks)) => chunks,
+            _ => self.code_lines(lines, size, avail),
+        };
+        // Breaks near either end would leave a few lines alone; the first
+        // line stays with the top padding.
+        let n = chunks.len();
+        let keep = self.keep;
+        self.keep += IN_CODE;
+        for (k, chunk) in chunks.iter_mut().enumerate() {
+            let penalty = if k == 0 {
+                FORBID
+            } else if k < CODE_EDGE_LINES || n - k < CODE_EDGE_LINES {
+                CODE_EDGE
+            } else {
+                0.0
+            };
+            self.may_break(penalty);
+            if self.drawing() {
+                self.fill_rect(ctx.x, self.y - lh, ctx.w, lh + 0.3, CODE_BG);
+                let baseline = self.y - lh / 2.0 - size * 0.26;
+                let runs = self.visual_runs(std::mem::take(chunk));
+                self.show_runs(&runs, size, ctx.x + pad, baseline, ctx.color);
+            }
+            self.y -= lh;
+        }
+        self.keep = keep;
+        self.keep_laidout(slot, Laidout::Code(chunks));
+        self.fill_rect(ctx.x, self.y - pad, ctx.w, pad + 0.3, CODE_BG);
+        self.y -= pad;
+    }
+
+    /// Shape the lines of a code block, and wrap long lines at the glyph
+    /// that would overflow the box.
+    fn code_lines(&self, lines: &[String], size: f32, avail: f32) -> Vec<LevelRuns> {
         let empty: [String; 1] = [String::new()];
         let lines = if lines.is_empty() { &empty[..] } else { lines };
+        let mut chunks: Vec<LevelRuns> = Vec::with_capacity(lines.len());
         for line in lines {
-            // Wrap long lines at the glyph that would overflow the box.
             // Lines of code are left-to-right paragraphs; right-to-left text
             // in them is reordered.
-            let mut chunks: Vec<LevelRuns> = vec![Vec::new()];
+            chunks.push(Vec::new());
             let mut x = 0.0;
             for (level, face, glyphs, _) in self.shape_levels(line, true, false, false, size, Some(false)) {
                 for g in glyphs {
@@ -1823,30 +2122,14 @@ impl Layout<'_> {
                     x += w;
                 }
             }
-            for chunk in chunks {
-                if self.y - lh < self.bottom() {
-                    self.new_page();
-                }
-                self.at_top = false;
-                self.fill_rect(ctx.x, self.y - lh, ctx.w, lh + 0.3, CODE_BG);
-                let baseline = self.y - lh / 2.0 - size * 0.26;
-                let runs = self.visual_runs(chunk);
-                self.show_runs(&runs, size, ctx.x + pad, baseline, ctx.color);
-                self.y -= lh;
-            }
         }
-        if self.y - pad < self.bottom() {
-            self.new_page();
-            self.at_top = false;
-        }
-        self.fill_rect(ctx.x, self.y - pad, ctx.w, pad + 0.3, CODE_BG);
-        self.y -= pad;
+        chunks
     }
 
     fn quote(&mut self, inner: &[Block], ctx: Ctx) {
         let fs = self.o.font_size;
         let indent = fs * 1.2;
-        self.ensure(fs * LINE_SPACING);
+        self.may_break(0.0);
         let start = (self.pages.len() - 1, self.y);
         // Right-to-left quotes have their bar on the right.
         let rtl = blocks_rtl(inner);
@@ -1856,7 +2139,11 @@ impl Layout<'_> {
             color: MUTED,
             ..ctx
         };
+        let keep = self.keep;
+        self.keep += IN_QUOTE;
+        self.next_penalty = Some(FORBID);
         self.blocks(inner, child);
+        self.keep = keep;
         self.pending_gap = 0.0;
         let end = (self.pages.len() - 1, self.y);
         let bar_x = if rtl {
@@ -1865,8 +2152,11 @@ impl Layout<'_> {
             ctx.x + fs * 0.3
         };
         for p in start.0..=end.0 {
+            if !self.drawing() {
+                break;
+            }
             let top = if p == start.0 { start.1 } else { self.top() };
-            let bot = if p == end.0 { end.1 } else { self.bottom() };
+            let bot = if p == end.0 { end.1 } else { self.page_ends[p] };
             if top - bot > 0.5 {
                 let ops = &mut self.pages[p].ops;
                 nums(ops, &[RULE.0, RULE.1, RULE.2]);
@@ -1919,7 +2209,13 @@ impl Layout<'_> {
                 size: fs,
                 color: ctx.color,
             });
+            let keep = self.keep;
+            if k > 0 {
+                self.penalize_next(keep + BETWEEN_ITEMS);
+            }
+            self.keep += IN_ITEM;
             self.blocks(&item.blocks, child);
+            self.keep = keep;
             if !tight {
                 self.gap(fs * 0.75);
             }
@@ -1934,6 +2230,74 @@ impl Layout<'_> {
         let fs = self.o.font_size;
         let size = fs * 0.92;
         let pad = fs * 0.45;
+        let (slot, laidout) = self.laidout();
+        let (widths, table_w, grid) = match laidout {
+            Some(Laidout::Table(widths, table_w, grid)) => (widths, table_w, grid),
+            _ => self.table_cells(cols, header, rows, size, pad, ctx),
+        };
+
+        self.may_break(0.0);
+        self.draw_marker(self.y - fs);
+        self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, 0.8, RULE);
+        for (r, cells) in grid.iter().enumerate() {
+            let nlines = cells.iter().map(|c| c.0.len()).max().unwrap_or(0).max(1);
+            let bg = r == 0;
+            // The header stays with the first row.
+            self.may_break(if r < 2 { FORBID } else { TABLE_ROW });
+            if bg {
+                self.fill_rect(ctx.x, self.y - pad, table_w, pad, CODE_BG);
+            }
+            self.y -= pad;
+            for k in 0..nlines {
+                let lh = cells
+                    .iter()
+                    .filter_map(|c| c.0.get(k))
+                    .map(|l| self.line_height(l))
+                    .fold(size * LINE_SPACING, f32::max);
+                self.may_break(if k == 0 { FORBID } else { IN_ROW });
+                if bg {
+                    self.fill_rect(ctx.x, self.y - lh, table_w, lh + 0.3, CODE_BG);
+                }
+                let mut x = ctx.x;
+                for (c, (lines, rtl)) in cells.iter().enumerate() {
+                    if let Some(line) = lines.get(k) {
+                        let slack = (widths[c] - line.width).max(0.0);
+                        // Cells without an alignment follow their text's
+                        // direction.
+                        let off = match aligns[c] {
+                            Align::Right => slack,
+                            Align::Center => slack / 2.0,
+                            Align::None if *rtl => slack,
+                            _ => 0.0,
+                        };
+                        self.draw_line(line, x + pad + off, lh);
+                    }
+                    x += widths[c] + 2.0 * pad;
+                }
+                self.y -= lh;
+            }
+            if bg {
+                self.fill_rect(ctx.x, self.y - pad, table_w, pad + 0.3, CODE_BG);
+            }
+            self.y -= pad;
+            let (lw, color) = if bg { (0.8, MUTED) } else { (0.5, RULE) };
+            self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, lw, color);
+        }
+        self.keep_laidout(slot, Laidout::Table(widths, table_w, grid));
+    }
+
+    /// Lay out the cells of a table: the column widths, the table's width,
+    /// and the lines of each cell with its direction, row by row.
+    #[allow(clippy::type_complexity)]
+    fn table_cells(
+        &self,
+        cols: usize,
+        header: &[String],
+        rows: &[Vec<String>],
+        size: f32,
+        pad: f32,
+        ctx: Ctx,
+    ) -> (Vec<f32>, f32, Vec<Vec<(Vec<Line>, bool)>>) {
         let cell_toks = |l: &Self, raw: &str, bold: bool| -> (Vec<Tok>, bool) {
             let mut inl = inline::parse(raw, l.refs);
             for i in inl.iter_mut() {
@@ -1986,71 +2350,23 @@ impl Layout<'_> {
         };
         let widths: Vec<f32> = widths.iter().map(|w| w.max(size)).collect();
         let table_w: f32 = widths.iter().map(|w| w + 2.0 * pad).sum();
-
-        self.ensure(size * LINE_SPACING * 2.0 + pad * 2.0);
-        self.draw_marker(self.y - fs);
-        self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, 0.8, RULE);
-        for (r, row) in grid.into_iter().enumerate() {
-            let cells: Vec<(Vec<Line>, bool)> = row
-                .into_iter()
-                .enumerate()
-                .map(|(c, (toks, rtl))| {
-                    let lines = self
-                        .wrap(&toks, widths[c], size)
-                        .into_iter()
-                        .filter_map(|l| if let Laid::Line(l) = l { Some(l) } else { None })
-                        .collect();
-                    (lines, rtl)
-                })
-                .collect();
-            let nlines = cells.iter().map(|c| c.0.len()).max().unwrap_or(0).max(1);
-            let bg = r == 0;
-            self.ensure(pad);
-            if bg {
-                self.fill_rect(ctx.x, self.y - pad, table_w, pad, CODE_BG);
-            }
-            self.y -= pad;
-            for k in 0..nlines {
-                let lh = cells
-                    .iter()
-                    .filter_map(|c| c.0.get(k))
-                    .map(|l| self.line_height(l))
-                    .fold(size * LINE_SPACING, f32::max);
-                if self.y - lh < self.bottom() {
-                    self.new_page();
-                }
-                self.at_top = false;
-                if bg {
-                    self.fill_rect(ctx.x, self.y - lh, table_w, lh + 0.3, CODE_BG);
-                }
-                let mut x = ctx.x;
-                for (c, (lines, rtl)) in cells.iter().enumerate() {
-                    if let Some(line) = lines.get(k) {
-                        let slack = (widths[c] - line.width).max(0.0);
-                        // Cells without an alignment follow their text's
-                        // direction.
-                        let off = match aligns[c] {
-                            Align::Right => slack,
-                            Align::Center => slack / 2.0,
-                            Align::None if *rtl => slack,
-                            _ => 0.0,
-                        };
-                        self.draw_line(line, x + pad + off, lh);
-                    }
-                    x += widths[c] + 2.0 * pad;
-                }
-                self.y -= lh;
-            }
-            if self.y - pad < self.bottom() {
-                self.new_page();
-            }
-            if bg {
-                self.fill_rect(ctx.x, self.y - pad, table_w, pad + 0.3, CODE_BG);
-            }
-            self.y -= pad;
-            let (lw, color) = if bg { (0.8, MUTED) } else { (0.5, RULE) };
-            self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, lw, color);
-        }
+        let grid = grid
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .enumerate()
+                    .map(|(c, (toks, rtl))| {
+                        let lines = self
+                            .wrap(&toks, widths[c], size)
+                            .into_iter()
+                            .filter_map(|l| if let Laid::Line(l) = l { Some(l) } else { None })
+                            .collect();
+                        (lines, rtl)
+                    })
+                    .collect()
+            })
+            .collect();
+        (widths, table_w, grid)
     }
 
     fn number_pages(&mut self) {
@@ -2246,6 +2562,56 @@ mod tests {
         assert!(acute[1] + a1.dy > base[3]);
         assert!(dia[1] + a2.dy > acute[3] + a1.dy);
         assert!(dot[3] + a3.dy < base[1]);
+    }
+
+    /// Breakpoints between `n` lines of height 10, with the given penalties
+    /// before each line.
+    fn lines(penalties: &[f32]) -> (Vec<Breakpoint>, f32) {
+        let bps = penalties
+            .iter()
+            .enumerate()
+            .map(|(k, &penalty)| {
+                let y = -10.0 * k as f32;
+                Breakpoint {
+                    above: y,
+                    below: y,
+                    penalty,
+                }
+            })
+            .collect();
+        (bps, -10.0 * penalties.len() as f32)
+    }
+
+    fn breaks(plan: &[bool]) -> Vec<usize> {
+        (0..plan.len()).filter(|&k| plan[k]).collect()
+    }
+
+    #[test]
+    fn pages_fill_up_when_nothing_is_penalized() {
+        let (bps, end) = lines(&[0.0; 25]);
+        assert_eq!(breaks(&plan_pages(&bps, end, 100.0)), [10, 20]);
+    }
+
+    #[test]
+    fn pages_break_early_rather_than_at_a_penalty() {
+        // Lines 8 to 14 are a block that the page should not break inside;
+        // it goes to the second page whole, as there is room at the end.
+        let mut p = [0.0; 25];
+        p[9..15].fill(IN_CODE);
+        let (bps, end) = lines(&p);
+        assert_eq!(breaks(&plan_pages(&bps, end, 100.0)), [8, 18]);
+        // Forbidden breaks are only taken when nothing else fits.
+        let (bps, end) = lines(&[FORBID; 15]);
+        assert_eq!(breaks(&plan_pages(&bps, end, 100.0)), [10]);
+    }
+
+    #[test]
+    fn pages_are_not_added_to_avoid_penalties() {
+        // Every break is bad, but three pages are still enough.
+        let (bps, end) = lines(&[CLUB; 30]);
+        assert_eq!(breaks(&plan_pages(&bps, end, 100.0)), [10, 20]);
+        let (bps, end) = lines(&[]);
+        assert!(plan_pages(&bps, end, 100.0).is_empty());
     }
 
     #[test]
