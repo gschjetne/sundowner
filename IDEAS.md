@@ -102,8 +102,6 @@ best built on one line breaker.
   rows.
 - An explicit page break, for example a `<!-- pagebreak -->` comment: a
   breakpoint with a penalty that forces a break (TeX's `\penalty-10000`).
-- Keep the lines of a table row together only up to a limit, as a long
-  cell that fills most of a page is better split than moved.
 
 ## Language-specific forms
 

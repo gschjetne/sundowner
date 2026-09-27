@@ -229,12 +229,43 @@ fn page_breaks_use_space_left_at_the_end() {
     // A long code block is split only where it has to be.
     let code: String = (0..80).map(|k| format!("line{k}\n")).collect();
     let out = render(&format!("{}```\n{code}```\n", filler(20)));
-    let first: Vec<usize> = (0..80)
-        .filter(|k| pages_of(&out, &format!("line{k}")) == [1])
+    // How many lines of code a page holds.
+    let full = render(&format!("```\n{code}```\n"));
+    let per_page = (0..80)
+        .filter(|k| pages_of(&full, &format!("line{k}")) == [0])
+        .count();
+    assert!(per_page < 80);
+    // The block starts at the top of the second page, fills it, and the
+    // rest goes on the third: it is split once, where it has to be.
+    let page: Vec<usize> = (0..80)
+        .map(|k| pages_of(&out, &format!("line{k}"))[..][0])
         .collect();
-    // The block starts on the second page, and the rest fits on the third.
-    assert_eq!(first.first(), Some(&0));
+    let expected: Vec<usize> = (0..80).map(|k| if k < per_page { 1 } else { 2 }).collect();
+    assert_eq!(page, expected);
     assert_eq!(out.pages.len(), 3);
+}
+
+#[test]
+fn table_rows_taller_than_half_a_page_are_split() {
+    // A row of a few lines moves to the next page whole rather than being
+    // split; a row taller than half the text area is split like a quote,
+    // so it starts right after a few paragraphs above it rather than
+    // leaving most of their page empty.
+    let row = |words: usize| -> String {
+        let text: Vec<String> = (0..words).map(|k| format!("w{k}")).collect();
+        format!("| a | b |\n|---|---|\n| start | {} |\n", text.join(" "))
+    };
+    let mut moved = false;
+    for n in 20..34 {
+        let out = render(&format!("{}{}", filler(n), row(60)));
+        let start = pages_of(&out, "start");
+        assert_eq!(start, pages_of(&out, "w59"), "{n} paragraphs");
+        moved |= start != pages_of(&out, &format!("filler{}", n - 1));
+    }
+    assert!(moved);
+    let out = render(&format!("{}{}", filler(12), row(800)));
+    assert_eq!(pages_of(&out, "filler11"), [0]);
+    assert_eq!(pages_of(&out, "start"), [0]);
 }
 
 #[test]

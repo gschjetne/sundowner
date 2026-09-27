@@ -56,9 +56,14 @@ const BETWEEN_ITEMS: f32 = 20.0;
 const IN_CODE: f32 = 100.0;
 const CODE_EDGE: f32 = 200.0;
 const CODE_EDGE_LINES: usize = 3;
-/// Breaks between the rows of a table, and inside a row.
+/// Breaks between the rows of a table, and inside a row. A row is kept
+/// together only while it is at most `TALL_ROW` of the text area high; a
+/// taller one is split like a quote, rather than moved whole and leaving a
+/// hole of up to a page above it.
 const TABLE_ROW: f32 = 50.0;
 const IN_ROW: f32 = 1000.0;
+const IN_TALL_ROW: f32 = 100.0;
+const TALL_ROW: f32 = 0.5;
 /// Breaks before a heading of level 1 to 3 are encouraged, so that pages
 /// start with a new section (plain TeX's `\beginsection` does the same).
 const SECTION: [f32; 3] = [-100.0, -60.0, -30.0];
@@ -490,8 +495,10 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
 /// of the document goes to keeping blocks together earlier on. The cube
 /// makes a line or two of space cost next to nothing, while half a page
 /// costs as much as a bad break. Dynamic programming finds the breaks with
-/// the least total cost; as a page can only start at the breakpoints that
-/// fit above its end, this takes time linear in the length of the document.
+/// the least total cost. For each breakpoint it tries the page starts that
+/// fit above it, so the time is the number of breakpoints times the number
+/// that fit on a page: linear in the length of the document, as a page
+/// holds a bounded number of them.
 pub fn plan_pages(breakpoints: &[Breakpoint], end: f32, page_h: f32) -> Vec<bool> {
     let n = breakpoints.len();
     if n == 0 {
@@ -1271,11 +1278,10 @@ impl Layout<'_> {
         }
     }
 
-    /// Set the penalty of the next break, unless it is already forbidden.
+    /// Set the penalty of the next break, keeping a higher one already set
+    /// (such as [`FORBID`]).
     fn penalize_next(&mut self, p: f32) {
-        if self.next_penalty.is_none_or(|q| q < FORBID) {
-            self.next_penalty = Some(p);
-        }
+        self.next_penalty = Some(self.next_penalty.map_or(p, |q| q.max(p)));
     }
 
     /// A place where the page may break, before content that is about to be
@@ -1849,15 +1855,20 @@ impl Layout<'_> {
                 (self.wrap(&toks, ctx.w, size), rtl)
             }
         };
-        let n = laid.len();
-        for (k, item) in laid.iter().enumerate() {
-            // Avoid leaving the first or last line of a paragraph alone.
+        // Avoid leaving the first or last line of a paragraph alone. Only
+        // text lines count, not images between them.
+        let n = laid.iter().filter(|i| matches!(i, Laid::Line(_))).count();
+        let mut k = 0;
+        for item in &laid {
             let mut penalty = 0.0;
-            if k == 1 {
-                penalty += CLUB;
-            }
-            if k > 0 && k + 1 == n {
-                penalty += WIDOW;
+            if let Laid::Line(_) = item {
+                if k == 1 {
+                    penalty += CLUB;
+                }
+                if k > 0 && k + 1 == n {
+                    penalty += WIDOW;
+                }
+                k += 1;
             }
             match item {
                 Laid::Line(line) => {
@@ -2239,8 +2250,23 @@ impl Layout<'_> {
         self.may_break(0.0);
         self.draw_marker(self.y - fs);
         self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, 0.8, RULE);
+        let text_h = self.top() - self.bottom();
         for (r, cells) in grid.iter().enumerate() {
             let nlines = cells.iter().map(|c| c.0.len()).max().unwrap_or(0).max(1);
+            let heights: Vec<f32> = (0..nlines)
+                .map(|k| {
+                    cells
+                        .iter()
+                        .filter_map(|c| c.0.get(k))
+                        .map(|l| self.line_height(l))
+                        .fold(size * LINE_SPACING, f32::max)
+                })
+                .collect();
+            let in_row = if 2.0 * pad + heights.iter().sum::<f32>() > TALL_ROW * text_h {
+                IN_TALL_ROW
+            } else {
+                IN_ROW
+            };
             let bg = r == 0;
             // The header stays with the first row.
             self.may_break(if r < 2 { FORBID } else { TABLE_ROW });
@@ -2248,13 +2274,8 @@ impl Layout<'_> {
                 self.fill_rect(ctx.x, self.y - pad, table_w, pad, CODE_BG);
             }
             self.y -= pad;
-            for k in 0..nlines {
-                let lh = cells
-                    .iter()
-                    .filter_map(|c| c.0.get(k))
-                    .map(|l| self.line_height(l))
-                    .fold(size * LINE_SPACING, f32::max);
-                self.may_break(if k == 0 { FORBID } else { IN_ROW });
+            for (k, &lh) in heights.iter().enumerate() {
+                self.may_break(if k == 0 { FORBID } else { in_row });
                 if bg {
                     self.fill_rect(ctx.x, self.y - lh, table_w, lh + 0.3, CODE_BG);
                 }
@@ -2603,6 +2624,42 @@ mod tests {
         // Forbidden breaks are only taken when nothing else fits.
         let (bps, end) = lines(&[FORBID; 15]);
         assert_eq!(breaks(&plan_pages(&bps, end, 100.0)), [10]);
+    }
+
+    #[test]
+    fn a_page_is_added_rather_than_breaking_where_it_is_forbidden() {
+        // Two full pages, but the break between them is forbidden: the
+        // first page ends a line early and a third page takes the rest.
+        let mut p = [0.0; 20];
+        p[10] = FORBID;
+        let (bps, end) = lines(&p);
+        assert_eq!(breaks(&plan_pages(&bps, end, 100.0)), [9, 19]);
+    }
+
+    #[test]
+    fn blocks_are_split_when_there_is_no_room_at_the_end() {
+        // The block of lines 8 to 14 would move to the second page whole
+        // if there were room at the end (see above), but with 20 lines that
+        // would take a third page, so it is split.
+        let mut p = [0.0; 20];
+        p[9..15].fill(IN_CODE);
+        let (bps, end) = lines(&p);
+        assert_eq!(breaks(&plan_pages(&bps, end, 100.0)), [10]);
+    }
+
+    #[test]
+    fn content_taller_than_a_page_gets_a_page_of_its_own() {
+        // Three lines, an image 150 high, and three more lines.
+        let bps: Vec<Breakpoint> = [0.0, -10.0, -20.0, -30.0, -180.0, -190.0]
+            .iter()
+            .map(|&y| Breakpoint {
+                above: y,
+                below: y,
+                penalty: 0.0,
+            })
+            .collect();
+        let plan = plan_pages(&bps, -200.0, 100.0);
+        assert_eq!(breaks(&plan), [3, 4]);
     }
 
     #[test]
