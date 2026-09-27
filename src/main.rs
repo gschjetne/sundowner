@@ -30,9 +30,6 @@ OPTIONS:
         --no-page-numbers   Do not number pages
         --no-images         Do not load image files (images must be relative paths
                             inside the input file's directory)
-        --simplified-chinese
-                            Set Chinese characters in their simplified forms
-                            (default: traditional; silk build only)
     -q, --quiet             Do not print warnings
         --licenses          Show the licenses of sundowner, its bundled fonts
                             and the Unicode data it includes
@@ -52,8 +49,7 @@ const TIER: &str = "This is the europa build: Latin, Greek and Cyrillic.\n";
 const TIER: &str = "\
 This is the silk build, which also bundles Frank Ruhl Libre and Noto Serif
 Hebrew for Hebrew, Amiri for Arabic, Noto Serif Armenian for Armenian, Noto
-Serif TC and SC for Chinese (traditional forms unless --simplified-chinese)
-and Japanese, and Gowun Batang for Korean.
+Serif SC for Chinese and Japanese, and Gowun Batang for Korean.
 ";
 
 const MM: f32 = 72.0 / 25.4;
@@ -76,7 +72,6 @@ struct Args {
     page_numbers: Option<bool>,
     images: bool,
     quiet: bool,
-    simplified_chinese: Option<bool>,
 }
 
 fn licenses() -> String {
@@ -108,7 +103,6 @@ fn parse_args() -> Result<Option<Args>, String> {
         page_numbers: None,
         images: true,
         quiet: false,
-        simplified_chinese: None,
     };
     let mut it = std::env::args_os().skip(1);
     let mut only_files = false;
@@ -160,7 +154,6 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--no-page-numbers" => a.page_numbers = Some(false),
             "--no-images" => a.images = false,
             "-q" | "--quiet" => a.quiet = true,
-            "--simplified-chinese" | "--commie" => a.simplified_chinese = Some(true),
             _ => return Err(format!("unknown option '{arg}' (see --help)")),
         }
     }
@@ -177,26 +170,17 @@ fn parse_args() -> Result<Option<Args>, String> {
 /// config), so fonts are parsed once per run.
 type ConfigCache = HashMap<Option<PathBuf>, Result<(Config, Arc<Fonts>), String>>;
 
-/// Load a configuration and its fonts; `simplified_chinese` is the
-/// command-line setting, which overrides the file's.
 fn load_config(
     path: Option<PathBuf>,
     cache: &mut ConfigCache,
     quiet: bool,
-    simplified_chinese: Option<bool>,
 ) -> Result<(Config, Arc<Fonts>), String> {
     cache
         .entry(path.clone())
         .or_insert_with(|| match &path {
-            None => Ok((
-                Config::default(),
-                Fonts::builtin_with(simplified_chinese.unwrap_or(false)),
-            )),
+            None => Ok((Config::default(), Fonts::builtin())),
             Some(p) => {
-                let mut cfg = config::load(p)?;
-                if let Some(s) = simplified_chinese {
-                    cfg.fonts.simplified_chinese = s;
-                }
+                let cfg = config::load(p)?;
                 let fonts = Fonts::load(&cfg.fonts).map_err(|e| format!("{}: {e}", p.display()))?;
                 if !quiet {
                     for w in &fonts.warnings {
@@ -297,7 +281,7 @@ fn convert_one(input: &str, args: &Args, cache: &mut ConfigCache) -> Result<(), 
         ConfigChoice::File(p) => Some(p.clone()),
         ConfigChoice::Nearest => base_dir.as_deref().and_then(config::find),
     };
-    let (cfg, fonts) = load_config(config_path, cache, args.quiet, args.simplified_chinese)?;
+    let (cfg, fonts) = load_config(config_path, cache, args.quiet)?;
     let options = build_options(args, &cfg, fonts, base_dir);
 
     let converted = match std::panic::catch_unwind(|| sundowner::convert(&text, &options)) {

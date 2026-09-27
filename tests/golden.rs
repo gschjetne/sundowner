@@ -533,33 +533,25 @@ fn arabic_is_joined_and_set_in_amiri() {
     assert_eq!(l, format!("١٢٣{}", logical("العدد")));
 }
 
-/// Chinese characters are set in traditional forms by default, with
-/// simplified characters that the traditional font lacks from the
-/// simplified one, and all in simplified forms on request.
+/// Chinese characters are set in their traditional forms, Japanese kanji
+/// that Noto Serif TC lacks in Noto Serif JP, and characters only
+/// simplified Chinese uses are missing (a simplified Chinese font is added
+/// as a fallback).
 #[cfg(feature = "silk")]
 #[test]
-fn chinese_is_traditional_unless_simplified_is_asked_for() {
-    // 中 and 国 are in both fonts, 这 and 们 only in the simplified one.
-    let src = "中国 这们";
-    let fonts = |out: &Output, text: &str| -> Vec<String> {
-        runs(out, 0)
-            .iter()
-            .filter(|x| x.text == text)
-            .map(|x| name_of(out, x))
-            .collect()
-    };
-    let out = render(src);
+fn chinese_is_traditional_and_japanese_is_complete() {
+    // 天 is in Noto Serif TC; 気 (Japanese for 氣) only in Noto Serif JP.
+    let out = render("天気 這們");
     assert!(out.warnings.is_empty(), "{:?}", out.warnings);
-    assert_eq!(fonts(&out, "中国"), ["NotoSerifTC-Regular"]);
-    assert_eq!(fonts(&out, "这们"), ["NotoSerifSC-Regular"]);
-    let out = layout::layout(
-        &markdown::parse(src),
-        &Options {
-            page_numbers: false,
-            fonts: Fonts::builtin_with(true),
-            ..Options::default()
-        },
-    );
-    assert_eq!(fonts(&out, "中国"), ["NotoSerifSC-Regular"]);
-    assert_eq!(fonts(&out, "这们"), ["NotoSerifSC-Regular"]);
+    let names: Vec<(String, String)> = runs(&out, 0)
+        .iter()
+        .map(|x| (x.text.clone(), name_of(&out, x)))
+        .collect();
+    let set_in = |text: &str| names.iter().find(|n| n.0 == text).map(|n| n.1.as_str());
+    assert_eq!(set_in("天"), Some("NotoSerifTC-Regular"));
+    assert_eq!(set_in("気"), Some("NotoSerifJP-Regular"));
+    assert_eq!(set_in("這們"), Some("NotoSerifTC-Regular"));
+    let out = render("这们");
+    assert_eq!(out.warnings.len(), 1);
+    assert!(out.warnings[0].contains("'这' (U+8FD9)"), "{}", out.warnings[0]);
 }

@@ -17,16 +17,16 @@ const SILK: [&str; 16] = [
     "NotoSerifHebrew-Bold.ttf",
     "NotoSerifArmenian-Regular.ttf",
     "NotoSerifArmenian-Bold.ttf",
-    "NotoSerifSC-Regular.ttf",
-    "NotoSerifSC-Bold.ttf",
+    "NotoSerifTC-Regular.ttf",
+    "NotoSerifTC-Bold.ttf",
+    "NotoSerifJP-Regular.ttf",
+    "NotoSerifJP-Bold.ttf",
     "GowunBatang-Regular.ttf",
     "GowunBatang-Bold.ttf",
     "Amiri-Regular.ttf",
     "Amiri-Bold.ttf",
     "Amiri-Italic.ttf",
     "Amiri-BoldItalic.ttf",
-    "NotoSerifTC-Regular.ttf",
-    "NotoSerifTC-Bold.ttf",
 ];
 
 fn main() {
