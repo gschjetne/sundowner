@@ -8,6 +8,7 @@ pub mod chars;
 pub mod config;
 pub mod flate;
 pub mod fonts;
+pub mod front_matter;
 pub mod gpos;
 pub mod gsub;
 pub mod image;
@@ -23,6 +24,7 @@ pub mod otl;
 pub mod pdf;
 pub mod position;
 pub mod ttf;
+pub mod yaml;
 
 pub use layout::Options;
 

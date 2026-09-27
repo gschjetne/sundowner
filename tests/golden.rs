@@ -642,3 +642,102 @@ fn chinese_is_traditional_and_japanese_is_complete() {
     assert_eq!(out.warnings.len(), 1);
     assert!(out.warnings[0].contains("'这' (U+8FD9)"), "{}", out.warnings[0]);
 }
+
+fn render_front(src: &str, front_matter: Option<bool>) -> Output {
+    let doc = markdown::parse(src);
+    layout::layout(
+        &doc,
+        &Options {
+            page_numbers: false,
+            front_matter,
+            ..Options::default()
+        },
+    )
+}
+
+const FRONT: &str = "---\ntitle: Notes\nauthor:\n  name: Ada\n  role: Writer\n---\n\nBody\n";
+
+#[test]
+fn front_matter_is_left_out_with_a_warning_unless_asked_for() {
+    let out = render_front(FRONT, None);
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(out.warnings[0].contains("--front-matter"));
+    let texts: Vec<String> = runs(&out, 0).into_iter().map(|r| r.text).collect();
+    assert_eq!(texts, ["Body"]);
+
+    let out = render_front(FRONT, Some(false));
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let texts: Vec<String> = runs(&out, 0).into_iter().map(|r| r.text).collect();
+    assert_eq!(texts, ["Body"]);
+
+    // Empty front matter needs no warning.
+    assert!(render_front("---\n---\nBody\n", None).warnings.is_empty());
+}
+
+#[test]
+fn front_matter_is_a_table_with_spanning_keys() {
+    let out = render_front(FRONT, Some(true));
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let r = runs(&out, 0);
+    let (title, notes, author, name, ada, role, writer, body) = (
+        run(&r, "title"),
+        run(&r, "Notes"),
+        run(&r, "author"),
+        run(&r, "name"),
+        run(&r, "Ada"),
+        run(&r, "role"),
+        run(&r, "Writer"),
+        run(&r, "Body"),
+    );
+    // Keys are bold, values regular.
+    assert_eq!((title.face, author.face, name.face), (BOLD, BOLD, BOLD));
+    assert_eq!((notes.face, ada.face, writer.face), (REGULAR, REGULAR, REGULAR));
+    // "author" spans the rows of its mapping, whose keys are one column in.
+    assert_eq!(title.x, author.x);
+    assert_eq!(author.y, name.y);
+    assert_eq!(name.x, role.x);
+    assert!(name.x > author.x && ada.x > name.x && ada.x == writer.x);
+    assert!(name.y > role.y);
+    // The top-level value spans the columns to the right edge.
+    assert_eq!(notes.x, name.x);
+    assert!(title.y > author.y && role.y > body.y);
+}
+
+#[test]
+fn front_matter_too_deep_or_unreadable_is_left_out_with_a_warning() {
+    // Nine columns; seven fit on A4.
+    let deep: String = (0..8).map(|k| format!("{}k{k}:\n", "  ".repeat(k))).collect();
+    let deep = format!("---\n{deep}{}x: y\n---\nBody\n", "  ".repeat(8));
+    let out = render_front(&deep, Some(true));
+    assert!(
+        out.warnings[0].contains("nested too deeply"),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(runs(&out, 0).len(), 1);
+
+    let bad = "---\na: &anchor x\n---\nBody\n";
+    let out = render_front(bad, Some(true));
+    assert!(out.warnings[0].contains("line 2: anchors"), "{:?}", out.warnings);
+    assert_eq!(runs(&out, 0).len(), 1);
+}
+
+#[test]
+fn front_matter_that_needs_several_pages_breaks_between_rows() {
+    let mut src = String::from("---\nlist:\n");
+    for k in 0..200 {
+        src.push_str(&format!("  - name: item{k}\n    value: v{k}\n"));
+    }
+    src.push_str("---\nBody\n");
+    let out = render_front(&src, Some(true));
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert!(out.pages.len() > 2);
+    // Each item's two rows stay together.
+    for k in 0..200 {
+        assert_eq!(
+            pages_of(&out, &format!("item{k}")),
+            pages_of(&out, &format!("v{k}")),
+            "item {k}"
+        );
+    }
+}

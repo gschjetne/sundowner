@@ -5,6 +5,7 @@ use crate::arabic;
 use crate::bidi;
 use crate::chars;
 use crate::fonts::{FaceId, Fonts};
+use crate::front_matter::{self, Table};
 use crate::gpos::Attachment;
 use crate::gsub::{mask, Glyph, Script};
 use crate::image::{self, Image};
@@ -12,6 +13,7 @@ use crate::inline::{self, Inline, Style};
 use crate::linebreak::{self, Break};
 use crate::markdown::{Align, Block, Document};
 use crate::normalize;
+use crate::yaml;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
@@ -64,6 +66,10 @@ const TABLE_ROW: f32 = 50.0;
 const IN_ROW: f32 = 1000.0;
 const IN_TALL_ROW: f32 = 100.0;
 const TALL_ROW: f32 = 0.5;
+/// Breaks in front matter cost this more than [`TABLE_ROW`] for each key
+/// that spans the rows on both sides, so they fall between the largest
+/// groups of rows that can be kept together.
+const IN_SPAN: f32 = 50.0;
 /// Breaks before a heading of level 1 to 3 are encouraged, so that pages
 /// start with a new section (plain TeX's `\beginsection` does the same).
 const SECTION: [f32; 3] = [-100.0, -60.0, -30.0];
@@ -86,6 +92,9 @@ pub struct Options {
     /// disables loading local images.
     pub base_dir: Option<PathBuf>,
     pub title: Option<String>,
+    /// Whether to show YAML front matter as a table. `None` leaves it out
+    /// with a warning, as nobody has said whether they want it.
+    pub front_matter: Option<bool>,
     /// Fonts and fallback chains used to set text.
     pub fonts: Arc<Fonts>,
 }
@@ -100,6 +109,7 @@ impl Default for Options {
             page_numbers: true,
             base_dir: None,
             title: None,
+            front_matter: None,
             fonts: Fonts::builtin(),
         }
     }
@@ -441,14 +451,22 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         tight: false,
         list_depth: 0,
     };
+    let front = l.front_matter(doc.front_matter.as_deref(), ctx);
     // Lay the document out twice: once to find where pages may break, and
     // again to break them where it is best. The second pass reuses the
     // first one's lines, shaping and images.
-    l.blocks(&doc.blocks, ctx);
+    let content = |l: &mut Layout| {
+        if let Some(t) = &front {
+            l.span_table(t, ctx);
+            l.gap(o.font_size * 1.5);
+        }
+        l.blocks(&doc.blocks, ctx);
+    };
+    content(&mut l);
     if let Pass::Measure(breakpoints) = &l.pass {
         let plan = plan_pages(breakpoints, l.y, l.top() - l.bottom());
         l.restart(plan);
-        l.blocks(&doc.blocks, ctx);
+        content(&mut l);
     }
     if o.page_numbers {
         l.number_pages();
@@ -2358,18 +2376,7 @@ impl Layout<'_> {
                 nat[c] = nat[c].max(total);
             }
         }
-        let avail = ctx.w - 2.0 * pad * cols as f32;
-        let (sum_nat, sum_min): (f32, f32) = (nat.iter().sum(), min.iter().sum());
-        let widths: Vec<f32> = if sum_nat <= avail {
-            nat.clone()
-        } else if sum_min < avail && sum_nat > sum_min {
-            let k = (avail - sum_min) / (sum_nat - sum_min);
-            (0..cols).map(|c| min[c] + (nat[c] - min[c]) * k).collect()
-        } else {
-            let k = avail / sum_min.max(1.0);
-            min.iter().map(|m| m * k).collect()
-        };
-        let widths: Vec<f32> = widths.iter().map(|w| w.max(size)).collect();
+        let widths = fit_columns(&nat, &min, ctx.w - 2.0 * pad * cols as f32, size);
         let table_w: f32 = widths.iter().map(|w| w + 2.0 * pad).sum();
         let grid = grid
             .into_iter()
@@ -2388,6 +2395,203 @@ impl Layout<'_> {
             })
             .collect();
         (widths, table_w, grid)
+    }
+
+    /// What to show of the front matter, if there is any: its table, if
+    /// it is wanted and can be shown. Warns otherwise, except when it was
+    /// turned off.
+    fn front_matter(&mut self, src: Option<&str>, ctx: Ctx) -> Option<Table> {
+        let src = src?;
+        if src.trim().is_empty() {
+            return None;
+        }
+        match self.o.front_matter {
+            Some(false) => return None,
+            None => {
+                self.warnings.push(
+                    "the YAML front matter is left out; use --front-matter to show it as a table, \
+                     or --no-front-matter to leave it out without this warning"
+                        .into(),
+                );
+                return None;
+            }
+            Some(true) => {}
+        }
+        // It starts on the second line of the file.
+        let node = match yaml::parse(src, 2) {
+            Ok(node) => node,
+            Err(e) => {
+                self.warnings.push(format!(
+                    "the YAML front matter is left out, as it could not be read: {e}"
+                ));
+                return None;
+            }
+        };
+        let cols = front_matter::columns(&node);
+        let fit = ((ctx.w / (front_matter::MIN_COLUMN_EM * self.o.font_size)) as usize).max(2);
+        if cols > fit {
+            self.warnings.push(format!(
+                "the YAML front matter is left out, as it is nested too deeply to fit the page: \
+                 it needs {cols} columns and {fit} fit"
+            ));
+            return None;
+        }
+        Some(front_matter::table(&node))
+    }
+
+    /// Draw a table whose cells may span rows and columns, as front matter
+    /// is shown. A cell's lines fill the rows it spans from the top; the
+    /// last of them grows if they do not fit. Rules between rows start at
+    /// the first column not spanned across them, and the page may break
+    /// between any two lines, preferably between rows that no key spans.
+    fn span_table(&mut self, t: &Table, ctx: Ctx) {
+        if t.cells.is_empty() {
+            return;
+        }
+        let fs = self.o.font_size;
+        let size = fs * 0.92;
+        let pad = fs * 0.45;
+        let toks: Vec<(Vec<Tok>, bool)> = t
+            .cells
+            .iter()
+            .map(|c| {
+                let mut inl = Vec::new();
+                for (k, line) in c.text.split('\n').enumerate() {
+                    if k > 0 {
+                        inl.push(Inline::Break);
+                    }
+                    inl.push(Inline::Text {
+                        text: line.to_string(),
+                        style: Style::default(),
+                        link: None,
+                    });
+                }
+                self.tokenize(&inl, size, ctx.color, c.key)
+            })
+            .collect();
+
+        // Natural and minimum widths as for tables, from the cells of one
+        // column first; a wider cell spanning columns widens the last.
+        let mut nat = vec![0.0f32; t.cols];
+        let mut min = vec![0.0f32; t.cols];
+        for spanning in [false, true] {
+            for (c, (toks, _)) in t.cells.iter().zip(&toks) {
+                if (c.cols > 1) != spanning {
+                    continue;
+                }
+                let (mut line, mut widest, mut longest) = (0.0f32, 0.0f32, 0.0f32);
+                for tok in toks {
+                    match tok {
+                        Tok::Word(word) => {
+                            line += word.width();
+                            longest = longest.max(word.width().min(ctx.w / t.cols as f32));
+                        }
+                        Tok::Space(w, _) => line += w,
+                        Tok::Break => widest = widest.max(std::mem::take(&mut line)),
+                        _ => {}
+                    }
+                }
+                widest = widest.max(line);
+                let last = c.col + c.cols - 1;
+                let inner = 2.0 * pad * (c.cols - 1) as f32;
+                let have_nat = nat[c.col..=last].iter().sum::<f32>() + inner;
+                let have_min = min[c.col..=last].iter().sum::<f32>() + inner;
+                nat[last] += (widest - have_nat).max(0.0);
+                min[last] += (longest - have_min).max(0.0);
+            }
+        }
+        let widths = fit_columns(&nat, &min, ctx.w - 2.0 * pad * t.cols as f32, size);
+        let x_at: Vec<f32> = widths
+            .iter()
+            .scan(ctx.x, |x, w| {
+                let at = *x;
+                *x += w + 2.0 * pad;
+                Some(at)
+            })
+            .collect();
+        let table_w: f32 = widths.iter().map(|w| w + 2.0 * pad).sum();
+        let lines: Vec<(Vec<Line>, bool)> = t
+            .cells
+            .iter()
+            .zip(toks)
+            .map(|(c, (toks, rtl))| {
+                let w = widths[c.col..c.col + c.cols].iter().sum::<f32>() + 2.0 * pad * (c.cols - 1) as f32;
+                let lines = self
+                    .wrap(&toks, w, size)
+                    .into_iter()
+                    .filter_map(|l| if let Laid::Line(l) = l { Some(l) } else { None })
+                    .collect();
+                (lines, rtl)
+            })
+            .collect();
+
+        // Line slots of each row, numbered through the table: a cell's k-th
+        // line is in slot `first[row] + k`.
+        // A row has as many as the cells ending in it still need.
+        let mut ending: Vec<Vec<usize>> = vec![Vec::new(); t.rows];
+        for (i, c) in t.cells.iter().enumerate() {
+            ending[c.row + c.rows - 1].push(i);
+        }
+        let mut first = vec![0usize; t.rows + 1];
+        for r in 0..t.rows {
+            let need = ending[r]
+                .iter()
+                .map(|&i| lines[i].0.len().saturating_sub(first[r] - first[t.cells[i].row]))
+                .max()
+                .unwrap_or(0);
+            first[r + 1] = first[r] + need.max(1);
+        }
+        // The lines in each slot: (cell, line).
+        let mut in_slot: Vec<Vec<(usize, usize)>> = vec![Vec::new(); first[t.rows]];
+        let mut slot_h = vec![size * LINE_SPACING; first[t.rows]];
+        for (i, (c, (ls, _))) in t.cells.iter().zip(&lines).enumerate() {
+            for (k, l) in ls.iter().enumerate() {
+                let s = first[c.row] + k;
+                in_slot[s].push((i, k));
+                slot_h[s] = slot_h[s].max(self.line_height(l));
+            }
+        }
+        // The first column of each row not spanned from a row above.
+        let mut start_col = vec![usize::MAX; t.rows + 1];
+        for c in &t.cells {
+            start_col[c.row] = start_col[c.row].min(c.col);
+        }
+
+        let text_h = self.top() - self.bottom();
+        self.may_break(0.0);
+        self.draw_marker(self.y - fs);
+        self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, 0.8, RULE);
+        for r in 0..t.rows {
+            let slots = first[r]..first[r + 1];
+            self.may_break(match r {
+                0 => FORBID,
+                _ => TABLE_ROW + IN_SPAN * start_col[r] as f32,
+            });
+            self.y -= pad;
+            let tall = 2.0 * pad + slot_h[slots.clone()].iter().sum::<f32>() > TALL_ROW * text_h;
+            for s in slots.clone() {
+                if s > slots.start {
+                    self.may_break(if tall { IN_TALL_ROW } else { IN_ROW });
+                }
+                let lh = slot_h[s];
+                for &(i, k) in &in_slot[s] {
+                    let (c, (ls, rtl)) = (&t.cells[i], &lines[i]);
+                    let line = &ls[k];
+                    let last = c.col + c.cols - 1;
+                    let w = x_at[last] + widths[last] - x_at[c.col];
+                    let off = if *rtl { (w - line.width).max(0.0) } else { 0.0 };
+                    self.draw_line(line, x_at[c.col] + pad + off, lh);
+                }
+                self.y -= lh;
+            }
+            self.y -= pad;
+            let (x0, lw) = if r + 1 == t.rows {
+                (ctx.x, 0.8)
+            } else {
+                (x_at[start_col[r + 1].min(t.cols - 1)], 0.5)
+            };
+            self.stroke_line(x0, self.y, ctx.x + table_w, self.y, lw, RULE);
+        }
     }
 
     fn number_pages(&mut self) {
@@ -2412,6 +2616,23 @@ impl Layout<'_> {
 /// Whether blocks read right-to-left: whether the first strong character
 /// of their first text (UAX #9 rules P2 and P3) is right-to-left. Code
 /// blocks and rules have no direction and are skipped.
+/// Column widths for a table: their natural (single-line) widths if they
+/// fit in `avail`, else shrunk toward their minimum (longest word) widths,
+/// and at least `least` each.
+fn fit_columns(nat: &[f32], min: &[f32], avail: f32, least: f32) -> Vec<f32> {
+    let (sum_nat, sum_min): (f32, f32) = (nat.iter().sum(), min.iter().sum());
+    let widths: Vec<f32> = if sum_nat <= avail {
+        nat.to_vec()
+    } else if sum_min < avail && sum_nat > sum_min {
+        let k = (avail - sum_min) / (sum_nat - sum_min);
+        nat.iter().zip(min).map(|(n, m)| m + (n - m) * k).collect()
+    } else {
+        let k = avail / sum_min.max(1.0);
+        min.iter().map(|m| m * k).collect()
+    };
+    widths.iter().map(|w| w.max(least)).collect()
+}
+
 fn blocks_rtl(blocks: &[Block]) -> bool {
     let text_rtl = |t: &str| bidi::first_strong(&t.chars().collect::<Vec<_>>());
     fn first(blocks: &[Block], text_rtl: &dyn Fn(&str) -> Option<bool>) -> Option<bool> {
