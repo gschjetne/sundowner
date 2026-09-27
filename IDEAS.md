@@ -3,75 +3,11 @@
 Features that would fit sundowner, with notes on how they would fit the
 code as it is. Nothing here is promised; it is a place to think ahead.
 
-## Justification, hyphenation and kashida
+## Justification and hyphenation
 
-Text is set ragged (flush left, or flush right for right-to-left
-paragraphs), and lines are filled greedily. These three belong together:
-justified text needs somewhere to put the leftover space on each line, and
-the better the line breaks, the less of it there is. Western scripts take
-it up in the spaces between words and cut it down with hyphenation; Arabic
-takes it up inside words, by lengthening the joins between letters
-(kashida). All three need to know where a line is best broken, so they are
-best built on one line breaker.
-
-### Line breaking
-
-- Replace the greedy `wrap` with total-fit line breaking (Knuth and Plass):
-  choose the breaks for the whole paragraph that minimize the sum of the
-  lines' badness, where badness grows with how far each line's spaces are
-  stretched or shrunk from their natural width. The feasible breaks are
-  the UAX #14 opportunities that `linebreak::opportunities` already
-  computes, so the Unicode rules still decide where a line may end.
-- Penalties: a break at a hyphen (soft or automatic) costs more than one
-  at a space; two hyphenated lines in a row cost extra; so does a very
-  loose line next to a very tight one.
-- Keep greedy breaking for ragged text, or use total-fit there too with a
-  fixed space width, which evens out the ragged edge.
-- Cost: the dynamic program is linear in practice with the usual active
-  node pruning. Documents of hundreds of pages must stay fast (the README
-  promises 600 pages in about 0.25 s).
-
-### Western justification
-
-- A `justify = true` setting (and `--justify`), off by default so output
-  stays what it is today.
-- The spaces between words are already frags without glyphs (see `wrap`),
-  so justifying a line means widening those frags before it is drawn.
-  Stretch limits come from the space width: for example shrink to 80 %
-  and stretch to 150 %, and more only when there is no better break.
-- Not justified: the last line of a paragraph, lines ending at a hard
-  break, headings, table cells, code and lines with a single word
-  (set those flush with the start).
-- Bidirectional text: widen the gaps before reordering, so the reordered
-  line comes out justified too.
-- CJK has no spaces: spread the space between characters instead, and
-  compress full-width punctuation first (as JLREQ and CLREQ describe:
-  `、。「」` are half empty).
-- Letter spacing as a last resort is not wanted for Latin; better an
-  underfull line.
-
-### Hyphenation
-
-- Liang's algorithm with the TeX hyphenation patterns (the `hyph-utf8`
-  collection). Patterns compile to a compact trie at build time, as the
-  Unicode tables are generated today, and ship only for the languages of
-  the build (so europa gets the Latin, Greek and Cyrillic ones). Check each
-  pattern file's license: most are MIT, LPPL or public domain, and each
-  one embedded needs its notice in `--licenses`.
-- Markdown does not say which language text is in, so this needs a `lang`
-  setting (config and command line), later perhaps a per-document one from
-  front matter. The same setting would be useful elsewhere: see
-  *Language-specific forms* below.
-- Hyphenation points become extra break opportunities that show a hyphen
-  when taken; soft hyphens already work this way (`Word::hyphen`), so the
-  drawing side is done.
-- Rules: minimum word length and characters before and after the hyphen
-  (TeX's `\lefthyphenmin` and `\righthyphenmin`, per language), never in
-  code, URLs or words with digits, and a limit on consecutive hyphenated
-  lines (a penalty in the line breaker).
-- The hyphen character depends on the script: `-` for Latin and Cyrillic,
-  the Armenian hyphen `֊` for Armenian. Hebrew is traditionally not
-  hyphenated.
+Paragraphs are justified, with breaks chosen by total fit (`total_fit` in
+`layout.rs`), and hyphenated by Liang's algorithm (`hyphenate.rs`) when
+the language is known; so far only English. What could follow:
 
 ### Kashida
 
@@ -92,8 +28,81 @@ best built on one line breaker.
   the slack still goes into the spaces.
 - Fonts with a `jalt` feature or stretchable glyph variants could use
   those instead of tatweel; worth trying with Amiri.
-- The line breaker needs to know how much a line can stretch by kashida,
-  so it counts the kashida points of each line as stretchability.
+- The line breaker takes it as stretch: `FitWord` would get the stretch
+  of its kashida points, which `fit_lines` adds to that of the spaces,
+  and `justify` would give each line's slack to the kashidas first.
+
+### More languages
+
+Patterns for the main European languages, from hyph-utf8 (sizes of the
+`.pat.txt` files; "gz" is gzip -9):
+
+| Language | Tag | Patterns | Size (gz) | License | Also needs |
+|---|---|---|---|---|---|
+| German | de-1996 | 36,709 | 265 KB (117) | MIT | traditional spelling (de-1901) splits "ck" as "k-k" and restores triple consonants ("Schiff-fahrt") |
+| French | fr | 1,216 | 9 KB (3) | MIT | hyphenate after an elision ("l'infor-mation"); no-break thin spaces before `;:!?` and inside « » |
+| Spanish | es | 4,694 | 39 KB (12) | MIT | |
+| Italian | it | 384 | 1 KB | LPPL | elisions, as French |
+| Portuguese | pt | 427 | 2 KB | BSD | repeat the hyphen of a compound at the start of the next line ("guarda-/-chuva") |
+| Catalan | ca | 869 | 5 KB | LPPL | "l·l" breaks as "l-/l"; elisions |
+| Dutch | nl | 12,724 | 81 KB (39) | MIT | |
+| Swedish | sv | 4,693 | 28 KB (14) | LPPL | |
+| Danish | da | 1,144 | 6 KB | LPPL | |
+| Norwegian | nb, nn | 27,448 | 188 KB (91) | permissive | the same file for both |
+| Finnish | fi | 286 | 1 KB | "freely distributed" | |
+| Icelandic | is | 4,188 | 25 KB (13) | LPPL | |
+| Estonian | et | 3,691 | 22 KB (11) | MIT | |
+| Latvian | lv | 11,583 | 82 KB (32) | LGPL or GPL | |
+| Lithuanian | lt | 1,546 | 8 KB | MIT | |
+| Polish | pl | 4,053 | 29 KB (10) | MIT | repeated hyphen, as Portuguese; one-letter words (w, z, i) should not end a line |
+| Czech | cs | 3,636 | 21 KB (10) | GPL 2+ | as Polish (v, k, s, z, o, u, a, i) |
+| Slovak | sk | 2,467 | 18 KB (7) | MIT | as Czech |
+| Hungarian | hu | 62,851 | 515 KB (193) | MPL 1.1 or GPL | long double consonants split as their letters: "asszony" as "asz-szony" |
+| Romanian | ro | 647 | 3 KB | none stated | |
+| Croatian | hr | 1,475 | 7 KB | LPPL | repeated hyphen |
+| Slovenian | sl | 1,068 | 5 KB | LPPL | repeated hyphen |
+| Serbian | sh-latn, sr-cyrl | 2,669 / 2,425 | 20 / 27 KB | LPPL / GPL | Cyrillic could come from the Latin patterns by transliteration (lj, nj, dž are љ, њ, џ) |
+| Russian | ru | 7,021 | 61 KB (21) | LPPL | |
+| Ukrainian | uk | 4,564 | 42 KB (13) | MIT | |
+| Belarusian | be | 3,298 | 27 KB (6) | MIT | |
+| Bulgarian | bg | 6,886 | 60 KB (17) | BSD-like | |
+| Greek | el-monoton, el-polyton | 573 / 1,208 | 3 / 11 KB | LPPL | choose by tag (`el`, `el-polyton`, `grc`) |
+| Welsh | cy | 6,728 | 42 KB (20) | LPPL | |
+| Irish | ga | 6,033 | 42 KB (19) | GPL 2+ | |
+| Turkish | tr | 597 | 2 KB | LPPL | |
+
+- Size: most are small; German, Norwegian and Hungarian are most of
+  the total (about 1.6 MB for all of these, 0.7 MB gzipped). They could
+  be stored compressed, as the silk fonts are, and inflated when a
+  document needs them; or only the small ones bundled in europa.
+  Building the trie at first use takes 1.5 ms for English, 15 ms for
+  German and 20 ms for Hungarian; looking up a word takes a few
+  microseconds whatever the language, so a precompiled trie (generated
+  like the Unicode tables) is only worth it for the big ones.
+- Licenses: GPL patterns (Czech, Macedonian, Serbian Cyrillic, Irish; and
+  Latvian and Hungarian, which offer it as one choice) cannot go into an
+  MIT binary as they are; Hungarian could use its MPL, and the others
+  would need their authors' permission or other patterns.
+- Hyphenation that changes the letters (German 1901, Hungarian, Catalan)
+  needs a word to show different text before and after the break: a
+  `Word` whose hyphen frag carries the replacement, and whose next piece
+  is shaped with the restored letter.
+- The rules around words: elisions (strip "l'", "d'", "dell'" before
+  hyphenating), the repeated hyphen, and no-break spaces after one-letter
+  words, all by language.
+- Per-passage language: HTML `lang` attributes on inline tags (now
+  dropped) could switch patterns for a quotation.
+
+### Other
+
+- Keep ligatures at hyphenation points, as TeX does: "of-fice" is not
+  hyphenated today, so that "office" keeps its "ffi". The word would be
+  shaped whole where it is not broken, and in pieces where it is.
+- CJK has no spaces: spread the space between characters instead, and
+  compress full-width punctuation first (as JLREQ and CLREQ describe:
+  `、。「」` are half empty). Today CJK lines are set flush with the start.
+- Hyphenate table cells, which are narrow; their column widths are chosen
+  from the longest word, which hyphenation would change.
 
 ## Page breaking
 
@@ -105,9 +114,9 @@ best built on one line breaker.
 
 ## Language-specific forms
 
-- With a `lang` setting (see Hyphenation), apply the font's `locl`
-  lookups for that language: Urdu, Sindhi, Kashmiri and Malay forms in
-  Amiri; Serbian and Bashkir Cyrillic and Turkish, Catalan, Dutch,
+- With the `lang` setting (see Justification and hyphenation), apply the
+  font's `locl` lookups for that language: Urdu, Sindhi, Kashmiri and
+  Malay forms in Amiri; Serbian and Bashkir Cyrillic and Turkish, Catalan, Dutch,
   Romanian and other Latin forms in Alegreya (such as Serbian italic
   letters, the Catalan `l·l` and the Dutch `ij`).
 - Regional forms of Chinese characters: the silk build uses the

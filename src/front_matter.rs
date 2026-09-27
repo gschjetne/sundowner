@@ -38,6 +38,18 @@ pub struct Table {
     pub cells: Vec<Cell>,
 }
 
+/// The document's language, from front matter's `lang` key, as Pandoc,
+/// Quarto and Jekyll read it: a BCP 47 tag such as `en` or `en-US`.
+pub fn language(src: &str) -> Option<String> {
+    let Ok(Node::Map(entries)) = crate::yaml::parse(src, 2) else {
+        return None;
+    };
+    entries.into_iter().find_map(|(k, v)| match v {
+        Node::Scalar(s) if k == "lang" && !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => None,
+    })
+}
+
 /// Columns needed to show `node`.
 pub fn columns(node: &Node) -> usize {
     match node {

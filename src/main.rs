@@ -31,6 +31,10 @@ OPTIONS:
         --front-matter      Show YAML front matter as a table at the start
         --no-front-matter   Leave YAML front matter out (the default, but
                             without a warning that it is left out)
+        --justify           Justify paragraphs (the default; overrides justify = false)
+        --no-justify        Set paragraphs ragged (flush left) instead of justified
+    -l, --lang <TAG>        Language of the text, such as en or en-US (default: the
+                            front matter's lang); English text is hyphenated
         --no-images         Do not load image files (images must be relative paths
                             inside the input file's directory)
     -q, --quiet             Do not print warnings
@@ -74,6 +78,8 @@ struct Args {
     title: Option<String>,
     page_numbers: Option<bool>,
     front_matter: Option<bool>,
+    justify: Option<bool>,
+    lang: Option<String>,
     images: bool,
     quiet: bool,
 }
@@ -85,6 +91,9 @@ fn licenses() -> String {
          License, Version 1.1. Their copyright notices and license follow.\n",
     );
     for (name, text) in FONT_LICENSES {
+        s.push_str(&format!("\n==== {name} ====\n\n{text}\n"));
+    }
+    for (name, text) in sundowner::hyphenate::LICENSES {
         s.push_str(&format!("\n==== {name} ====\n\n{text}\n"));
     }
     s.push_str(&format!(
@@ -106,6 +115,8 @@ fn parse_args() -> Result<Option<Args>, String> {
         title: None,
         page_numbers: None,
         front_matter: None,
+        justify: None,
+        lang: None,
         images: true,
         quiet: false,
     };
@@ -159,6 +170,9 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--no-page-numbers" => a.page_numbers = Some(false),
             "--front-matter" => a.front_matter = Some(true),
             "--no-front-matter" => a.front_matter = Some(false),
+            "--justify" => a.justify = Some(true),
+            "--no-justify" => a.justify = Some(false),
+            "-l" | "--lang" => a.lang = Some(config::parse_lang("--lang", &value()?)?),
             "--no-images" => a.images = false,
             "-q" | "--quiet" => a.quiet = true,
             _ => return Err(format!("unknown option '{arg}' (see --help)")),
@@ -217,6 +231,9 @@ fn build_options(args: &Args, cfg: &Config, fonts: Arc<Fonts>, base_dir: Option<
     }
     o.page_numbers = args.page_numbers.or(cfg.page_numbers).unwrap_or(true);
     o.front_matter = args.front_matter.or(cfg.front_matter);
+    o.justify = args.justify.or(cfg.justify).unwrap_or(true);
+    o.lang = args.lang.clone();
+    o.default_lang = cfg.lang.clone();
     o.title = args.title.clone();
     o.base_dir = if args.images { base_dir } else { None };
     // Keep a sensible text column no matter what margin and paper were chosen.

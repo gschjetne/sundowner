@@ -11,6 +11,7 @@ pub mod fonts;
 pub mod front_matter;
 pub mod gpos;
 pub mod gsub;
+pub mod hyphenate;
 pub mod image;
 pub mod inline;
 pub mod kern;
