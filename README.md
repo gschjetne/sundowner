@@ -57,6 +57,9 @@ cat in.md | sundowner > out.pdf    # stdin -> stdout
 -m, --margin <MM>       Page margin in millimetres (default 20)
 -t, --title <TEXT>      Document title (default: first level-1 heading)
     --no-page-numbers   Do not number pages
+    --front-matter      Show YAML front matter as a table at the start
+    --no-front-matter   Leave YAML front matter out (the default, but
+                        without a warning that it is left out)
     --no-images         Do not load image files
 -q, --quiet             Do not print warnings
     --licenses          Show the licenses of sundowner and its bundled fonts
@@ -84,6 +87,7 @@ paper = a4
 font-size = 11
 margin = 20
 page-numbers = true
+front-matter = false
 
 # Replace Alegreya for body text and headings, e.g. with a sans-serif
 [body]
@@ -155,6 +159,42 @@ CommonMark core plus the common GitHub extensions:
   file's directory. Transparent PNGs keep their transparency.
 - HTML comments are dropped, `<br>` becomes a line break, other inline tags
   are removed, and HTML entities are decoded.
+- YAML front matter (see below).
+
+### Front matter
+
+A document may start with YAML front matter, as Jekyll, Hugo and Pandoc
+read it: a `---` line, then YAML that starts with a `key:` line, then a
+`---` or `...` line. By default it is left out, with a warning unless
+`--no-front-matter` (or `front-matter = false` in `.sundowner`) says so.
+With `--front-matter` (or `front-matter = true`) it is shown as a table
+at the start of the document, for information: each level of nesting is
+a column, a key spans the rows of its value, and the items of a list are
+rows of their own (numbered, if they are mappings or lists themselves).
+Values are shown as written, as plain text.
+
+```yaml
+title: Field notes
+author:
+  name: A. Person
+  email: a@example.com
+tags: [birds, spring]
+```
+
+| | | |
+|---|---|---|
+| **title** | Field notes | |
+| **author** | **name** | A. Person |
+| | **email** | a@example.com |
+| **tags** | birds | |
+| | spring | |
+
+Each column needs 6 ems of the page's width (with the default margins
+and font size, seven columns fit on A4 and four on A5); front matter
+nested deeper than fits is left out with a warning. So is front matter that sundowner cannot read:
+it reads the YAML that front matter is written in (block and flow
+mappings and lists, plain, quoted and block scalars, comments), but not
+anchors, aliases or complex keys.
 
 The PDF also gets a bookmark outline built from the headings, clickable links,
 page numbers and a document title. Only `http:`, `https:` and `mailto:` links

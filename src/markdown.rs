@@ -46,6 +46,9 @@ pub struct Item {
 }
 
 pub struct Document {
+    /// YAML front matter: the lines between a `---` on the first line and
+    /// the next `---` or `...`, without them.
+    pub front_matter: Option<String>,
     pub blocks: Vec<Block>,
     /// Link reference definitions, keyed by normalized label.
     pub refs: HashMap<String, String>,
@@ -57,9 +60,32 @@ pub fn parse(src: &str) -> Document {
         .split('\n')
         .map(|l| expand_tabs(l.strip_suffix('\r').unwrap_or(l)))
         .collect();
+    let (front_matter, start) = front_matter(&lines);
     let mut refs = HashMap::new();
-    let blocks = parse_blocks(&lines, 0, &mut refs);
-    Document { blocks, refs }
+    let blocks = parse_blocks(&lines[start..], 0, &mut refs);
+    Document {
+        front_matter,
+        blocks,
+        refs,
+    }
+}
+
+/// Split off YAML front matter, as Jekyll, Hugo and Pandoc read it: a `---`
+/// line first, then YAML up to a line of `---` or `...`. It must start
+/// with a `key:` line (or be empty), so a document that starts with a
+/// thematic break is not mistaken for one. Returns the front matter and
+/// the line where the Markdown starts.
+fn front_matter(lines: &[String]) -> (Option<String>, usize) {
+    let is = |k: usize, marks: &[&str]| lines.get(k).is_some_and(|l| marks.contains(&l.trim_end()));
+    if !is(0, &["---"])
+        || !(is(1, &["---", "..."]) || lines.get(1).is_some_and(|l| crate::yaml::starts_mapping(l)))
+    {
+        return (None, 0);
+    }
+    match (1..lines.len()).find(|&k| is(k, &["---", "..."])) {
+        Some(end) => (Some(lines[1..end].join("\n")), end + 1),
+        None => (None, 0),
+    }
 }
 
 /// Normalize a link label for case-insensitive lookup.
@@ -664,6 +690,27 @@ mod tests {
         let d = parse("[x]: http://example.com \"t\"\n\n***\n");
         assert_eq!(d.refs.get("x").map(String::as_str), Some("http://example.com"));
         assert!(matches!(d.blocks[0], Block::Rule));
+    }
+
+    #[test]
+    fn front_matter() {
+        let d = parse("---\ntitle: x\ntags: [a]\n...\n# Heading\n");
+        assert_eq!(d.front_matter.as_deref(), Some("title: x\ntags: [a]"));
+        assert!(matches!(&d.blocks[..], [Block::Heading { level: 1, .. }]));
+        let d = parse("\u{FEFF}---\n---\ntext\n");
+        assert_eq!(d.front_matter.as_deref(), Some(""));
+        assert!(matches!(&d.blocks[..], [Block::Paragraph(_)]));
+        // Not front matter: a thematic break, a setext heading, or no end.
+        for src in [
+            "---\n# Title\n---\n",
+            "---\nSome text\n---\n",
+            "---\nkey: x\n",
+            " ---\nkey: x\n---\n",
+        ] {
+            let d = parse(src);
+            assert!(d.front_matter.is_none(), "{src:?}");
+            assert!(!d.blocks.is_empty(), "{src:?}");
+        }
     }
 
     #[test]

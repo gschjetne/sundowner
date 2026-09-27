@@ -173,6 +173,102 @@ fn extreme_options() {
     }
 }
 
+const YAML_PIECES: &[&str] = &[
+    "\n",
+    "\n  ",
+    "\n    ",
+    "\n- ",
+    "- ",
+    "k: ",
+    "key:",
+    ": ",
+    "[",
+    "]",
+    "{",
+    "}",
+    ", ",
+    "'",
+    "\"",
+    "\\",
+    "\\u12",
+    "|",
+    ">-",
+    "#",
+    " # c",
+    "&a",
+    "*a",
+    "!!str ",
+    "?",
+    "~",
+    "text",
+    "א",
+    "ب",
+    "\t",
+    "---",
+    "...",
+    "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+];
+
+/// Random front matter, shown as a table.
+fn random_front_matter(rounds: usize) {
+    let mut rng = Rng(0xf40_77e2);
+    let opts = Options {
+        front_matter: Some(true),
+        ..Options::default()
+    };
+    for _ in 0..rounds {
+        let len = 1 + rng.below(200);
+        let yaml: String = (0..len)
+            .map(|_| YAML_PIECES[rng.below(YAML_PIECES.len())])
+            .collect();
+        let doc = format!("---\nk: {yaml}\n---\n# Body\n");
+        assert_valid_pdf(&convert(&doc, &opts).pdf);
+    }
+}
+
+fn adversarial_front_matter(scale: usize) {
+    let front = |yaml: String| format!("---\n{yaml}\n---\nBody\n");
+    let cases = [
+        front(format!("k: {}", "[".repeat(100_000 / scale))),
+        front(format!(
+            "k: {}{}",
+            "[".repeat(100_000 / scale),
+            "]".repeat(100_000 / scale)
+        )),
+        front(format!("k: {}", "{a: ".repeat(50_000 / scale))),
+        front(
+            (0..5000 / scale)
+                .map(|i| format!("{}k:\n", " ".repeat(i)))
+                .collect(),
+        ),
+        front(
+            (0..5000 / scale)
+                .map(|i| format!("{}- \n", " ".repeat(i)))
+                .collect(),
+        ),
+        front(format!("k:\n{}", "- ".repeat(50_000 / scale))),
+        front((0..20_000 / scale).map(|i| format!("k{i}: v\n")).collect()),
+        front(format!("k: [{}]", "x, ".repeat(100_000 / scale))),
+        front(format!("k: \"{}", "\\\n".repeat(50_000 / scale))),
+        front(format!("k: |\n{}", "  line\n".repeat(100_000 / scale))),
+        front(format!("k: {}", "x".repeat(1_000_000 / scale))),
+        front(format!("k:\n{}", "  - a: b\n    c: d\n".repeat(10_000 / scale))),
+    ];
+    let opts = Options {
+        front_matter: Some(true),
+        ..Options::default()
+    };
+    for case in &cases {
+        let start = Instant::now();
+        assert_valid_pdf(&convert(case, &opts).pdf);
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "slow case: {:?}",
+            &case[..20.min(case.len())]
+        );
+    }
+}
+
 fn adversarial(scale: usize) {
     let cases = [
         "> ".repeat(100_000 / scale),
@@ -227,6 +323,28 @@ fn random_bytes_smoke() {
 #[test]
 fn adversarial_smoke() {
     adversarial(20);
+}
+
+#[test]
+fn random_front_matter_smoke() {
+    random_front_matter(300);
+}
+
+#[test]
+fn adversarial_front_matter_smoke() {
+    adversarial_front_matter(20);
+}
+
+#[test]
+#[ignore = "stress test; run with --release -- --include-ignored"]
+fn random_front_matter_stress() {
+    random_front_matter(5000);
+}
+
+#[test]
+#[ignore = "stress test; run with --release -- --include-ignored"]
+fn adversarial_front_matter_stress() {
+    adversarial_front_matter(1);
 }
 
 #[test]

@@ -28,6 +28,9 @@ OPTIONS:
     -m, --margin <MM>       Page margin in millimetres (default 20)
     -t, --title <TEXT>      Document title (default: first level-1 heading)
         --no-page-numbers   Do not number pages
+        --front-matter      Show YAML front matter as a table at the start
+        --no-front-matter   Leave YAML front matter out (the default, but
+                            without a warning that it is left out)
         --no-images         Do not load image files (images must be relative paths
                             inside the input file's directory)
     -q, --quiet             Do not print warnings
@@ -70,6 +73,7 @@ struct Args {
     margin: Option<f32>,
     title: Option<String>,
     page_numbers: Option<bool>,
+    front_matter: Option<bool>,
     images: bool,
     quiet: bool,
 }
@@ -101,6 +105,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         margin: None,
         title: None,
         page_numbers: None,
+        front_matter: None,
         images: true,
         quiet: false,
     };
@@ -152,6 +157,8 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-m" | "--margin" => a.margin = Some(config::parse_number("--margin", &value()?, 0.0, 100.0)?),
             "-t" | "--title" => a.title = Some(value()?),
             "--no-page-numbers" => a.page_numbers = Some(false),
+            "--front-matter" => a.front_matter = Some(true),
+            "--no-front-matter" => a.front_matter = Some(false),
             "--no-images" => a.images = false,
             "-q" | "--quiet" => a.quiet = true,
             _ => return Err(format!("unknown option '{arg}' (see --help)")),
@@ -209,6 +216,7 @@ fn build_options(args: &Args, cfg: &Config, fonts: Arc<Fonts>, base_dir: Option<
         o.margin = m * MM;
     }
     o.page_numbers = args.page_numbers.or(cfg.page_numbers).unwrap_or(true);
+    o.front_matter = args.front_matter.or(cfg.front_matter);
     o.title = args.title.clone();
     o.base_dir = if args.images { base_dir } else { None };
     // Keep a sensible text column no matter what margin and paper were chosen.

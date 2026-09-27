@@ -6,6 +6,7 @@
 //! font-size = 11
 //! margin = 20
 //! page-numbers = true
+//! front-matter = false
 //!
 //! # Replace the bundled Alegreya for body text and headings
 //! [body]
@@ -43,6 +44,7 @@ pub struct Config {
     /// Margin in millimetres.
     pub margin: Option<f32>,
     pub page_numbers: Option<bool>,
+    pub front_matter: Option<bool>,
     pub fonts: FontSpec,
 }
 
@@ -54,6 +56,14 @@ pub fn parse_number(what: &str, v: &str, lo: f32, hi: f32) -> Result<f32, String
         _ => Err(format!(
             "{what}: expected a number between {lo} and {hi}, got '{v}'"
         )),
+    }
+}
+
+fn parse_bool(what: &str, v: &str) -> Result<bool, String> {
+    match v {
+        "true" | "yes" | "on" => Ok(true),
+        "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("{what}: expected true or false, got '{v}'")),
     }
 }
 
@@ -146,17 +156,8 @@ pub fn parse(text: &str, base: &Path) -> Result<Config, String> {
                     cfg.font_size = Some(parse_number("font-size", value, 4.0, 72.0).map_err(err)?)
                 }
                 "margin" => cfg.margin = Some(parse_number("margin", value, 0.0, 100.0).map_err(err)?),
-                "page-numbers" => {
-                    cfg.page_numbers = Some(match value {
-                        "true" | "yes" | "on" => true,
-                        "false" | "no" | "off" => false,
-                        _ => {
-                            return Err(err(format!(
-                                "page-numbers: expected true or false, got '{value}'"
-                            )))
-                        }
-                    })
-                }
+                "page-numbers" => cfg.page_numbers = Some(parse_bool(key, value).map_err(err)?),
+                "front-matter" => cfg.front_matter = Some(parse_bool(key, value).map_err(err)?),
                 _ => return Err(err(format!("unknown setting '{key}'"))),
             },
             Section::Body | Section::Mono | Section::Fallback => {
@@ -222,7 +223,7 @@ mod tests {
     #[test]
     fn parses_full_config() {
         let c = parse(
-            "# comment\npaper = letter\nfont-size = 12\nmargin = 25\npage-numbers = off\n\n\
+            "# comment\npaper = letter\nfont-size = 12\nmargin = 25\npage-numbers = off\nfront-matter = yes\n\n\
              [body]\nregular = \"a b.ttf\"\nbold = b.ttf\n[mono]\nregular = /abs/m.ttf\n\
              [fallback]\nregular = cjk.ttc#2\n[fallback]\nregular = emoji.ttf\n",
             Path::new("/cfg"),
@@ -231,6 +232,7 @@ mod tests {
         assert_eq!(c.font_size, Some(12.0));
         assert_eq!(c.margin, Some(25.0));
         assert_eq!(c.page_numbers, Some(false));
+        assert_eq!(c.front_matter, Some(true));
         assert!(c.paper.is_some());
         let body = c.fonts.body.unwrap();
         assert_eq!(body.regular, Some((PathBuf::from("/cfg/a b.ttf"), 0)));
@@ -253,6 +255,10 @@ mod tests {
             ("\n[weird]", "line 2: unknown section"),
             ("[body]\nfancy = x.ttf", "line 2: unknown font style"),
             ("font-size = 1000", "line 1: font-size"),
+            (
+                "front-matter = maybe",
+                "line 1: front-matter: expected true or false",
+            ),
             ("[fallback]\nbold = x.ttf", "no 'regular'"),
             ("just text", "expected 'key = value'"),
         ] {
