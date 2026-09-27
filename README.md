@@ -251,6 +251,21 @@ and `#anchor` links become clickable; other links are shown as plain text.
   the whole paragraph, across style changes. A soft hyphen (U+00AD) marks
   a possible break, and shows a hyphen only if the line breaks there. There
   is no automatic hyphenation.
+- **Page breaking** chooses the breaks for the whole document at once, as
+  Knuth and Plass's algorithm chooses the line breaks of a paragraph. Each
+  place a page may break has a penalty: after the first or before the last
+  line of a paragraph (widows and orphans), inside a code block, quote,
+  list item or table (a table row is kept together unless it is taller
+  than half a page), and above all right after a heading, while breaks
+  before a section heading are encouraged. Each page also costs the cube
+  of its empty fraction, except the last page, whose empty space is free.
+  So when there is room at the end of the document, a block that would be
+  split moves whole to the next page, and the space it leaves falls at the
+  bottom of a page instead of the end of the document. A page costs more
+  than any bad break except one right after a heading or a table's header
+  row, so avoiding bad breaks does not add pages. The document is laid out
+  twice: once to find the breaks, and again to set the pages, reusing the
+  lines of the first pass.
 - **Compact output.** Content streams are compressed with a small built-in
   DEFLATE encoder (LZ77 with short hash chains and the fixed Huffman code).
   This is simple and fast but compresses less than zlib or gzip at their
@@ -275,8 +290,8 @@ and `#anchor` links become clickable; other links are shown as plain text.
 
   The test suite converts thousands of random and adversarial documents and
   checks the resulting PDF structure.
-- **Fast.** About 550 KB of Markdown (600 pages) converts in about 0.25 s
-  using about 20 MB of memory.
+- **Fast.** About 550 KB of Markdown (600 pages) converts in about 0.3 s
+  using about 40 MB of memory.
 
 ## Limitations
 

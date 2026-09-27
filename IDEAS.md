@@ -95,6 +95,14 @@ best built on one line breaker.
 - The line breaker needs to know how much a line can stretch by kashida,
   so it counts the kashida points of each line as stretchability.
 
+## Page breaking
+
+- Repeat a table's header row at the top of each page it continues on.
+  The page breaker would count the header's height at every break between
+  rows.
+- An explicit page break, for example a `<!-- pagebreak -->` comment: a
+  breakpoint with a penalty that forces a break (TeX's `\penalty-10000`).
+
 ## Language-specific forms
 
 - With a `lang` setting (see Hyphenation), apply the font's `locl`

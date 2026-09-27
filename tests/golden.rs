@@ -181,6 +181,93 @@ fn long_documents_break_pages() {
     }
 }
 
+/// The page each run of `text` is on.
+fn pages_of(out: &Output, text: &str) -> Vec<usize> {
+    (0..out.pages.len())
+        .flat_map(|p| {
+            runs(out, p)
+                .into_iter()
+                .filter(|r| r.text == text)
+                .map(move |_| p)
+        })
+        .collect()
+}
+
+/// Paragraphs that fill most of the first page.
+fn filler(n: usize) -> String {
+    (0..n).map(|k| format!("filler{k}\n\n")).collect()
+}
+
+#[test]
+fn code_blocks_that_fit_on_the_next_page_are_not_split() {
+    // With 28 paragraphs above it, the code block does not fit on the first
+    // page; it moves to the second page whole instead of being split.
+    let code: String = (0..10).map(|k| format!("line{k}\n")).collect();
+    let out = render(&format!("{}```\n{code}```\n\nafter\n", filler(28)));
+    assert_eq!(out.pages.len(), 2);
+    assert_eq!(pages_of(&out, "filler27"), [0]);
+    for k in 0..10 {
+        assert_eq!(pages_of(&out, &format!("line{k}")), [1], "line{k}");
+    }
+}
+
+#[test]
+fn headings_stay_with_the_text_after_them() {
+    for n in 26..32 {
+        let out = render(&format!(
+            "{}## Heading\n\nSectionstart and more words.\n",
+            filler(n)
+        ));
+        let heading = pages_of(&out, "Heading");
+        assert_eq!(heading.len(), 1);
+        assert_eq!(heading, pages_of(&out, "Sectionstart"), "{n} paragraphs");
+    }
+}
+
+#[test]
+fn page_breaks_use_space_left_at_the_end() {
+    // A long code block is split only where it has to be.
+    let code: String = (0..80).map(|k| format!("line{k}\n")).collect();
+    let out = render(&format!("{}```\n{code}```\n", filler(20)));
+    // How many lines of code a page holds.
+    let full = render(&format!("```\n{code}```\n"));
+    let per_page = (0..80)
+        .filter(|k| pages_of(&full, &format!("line{k}")) == [0])
+        .count();
+    assert!(per_page < 80);
+    // The block starts at the top of the second page, fills it, and the
+    // rest goes on the third: it is split once, where it has to be.
+    let page: Vec<usize> = (0..80)
+        .map(|k| pages_of(&out, &format!("line{k}"))[..][0])
+        .collect();
+    let expected: Vec<usize> = (0..80).map(|k| if k < per_page { 1 } else { 2 }).collect();
+    assert_eq!(page, expected);
+    assert_eq!(out.pages.len(), 3);
+}
+
+#[test]
+fn table_rows_taller_than_half_a_page_are_split() {
+    // A row of a few lines moves to the next page whole rather than being
+    // split; a row taller than half the text area is split like a quote,
+    // so it starts right after a few paragraphs above it rather than
+    // leaving most of their page empty.
+    let row = |words: usize| -> String {
+        let text: Vec<String> = (0..words).map(|k| format!("w{k}")).collect();
+        format!("| a | b |\n|---|---|\n| start | {} |\n", text.join(" "))
+    };
+    let mut moved = false;
+    for n in 20..34 {
+        let out = render(&format!("{}{}", filler(n), row(60)));
+        let start = pages_of(&out, "start");
+        assert_eq!(start, pages_of(&out, "w59"), "{n} paragraphs");
+        moved |= start != pages_of(&out, &format!("filler{}", n - 1));
+    }
+    assert!(moved);
+    let out = render(&format!("{}{}", filler(12), row(800)));
+    assert_eq!(pages_of(&out, "filler11"), [0]);
+    assert_eq!(pages_of(&out, "start"), [0]);
+}
+
 #[test]
 fn every_script_in_the_bundled_fonts_uses_real_glyphs() {
     let out = render("Καλημέρα Съешь Łódź “q” € `код κώδικας Łódź ἀρχὴ` *`курсив`* **_`ᾠδή`_**");
