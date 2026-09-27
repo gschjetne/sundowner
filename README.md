@@ -60,6 +60,7 @@ cat in.md | sundowner > out.pdf    # stdin -> stdout
     --front-matter      Show YAML front matter as a table at the start
     --no-front-matter   Leave YAML front matter out (the default, but
                         without a warning that it is left out)
+    --justify           Justify paragraphs (the default; overrides justify = false)
     --no-justify        Set paragraphs ragged (flush left) instead of justified
 -l, --lang <TAG>        Language of the text, such as en or en-US (default: the
                         front matter's lang); English text is hyphenated
@@ -92,8 +93,10 @@ margin = 20
 page-numbers = true
 front-matter = false
 justify = true
-# Language of documents whose front matter does not give one
-lang = en-US
+# Language of documents whose front matter does not give one. Every such
+# document under this file is then hyphenated as that language, so set it
+# only where all of them are, e.g. in the folder of an English book.
+# lang = en-US
 
 # Replace Alegreya for body text and headings, e.g. with a sans-serif
 [body]

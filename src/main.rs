@@ -31,6 +31,7 @@ OPTIONS:
         --front-matter      Show YAML front matter as a table at the start
         --no-front-matter   Leave YAML front matter out (the default, but
                             without a warning that it is left out)
+        --justify           Justify paragraphs (the default; overrides justify = false)
         --no-justify        Set paragraphs ragged (flush left) instead of justified
     -l, --lang <TAG>        Language of the text, such as en or en-US (default: the
                             front matter's lang); English text is hyphenated

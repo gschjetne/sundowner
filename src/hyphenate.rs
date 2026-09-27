@@ -209,6 +209,10 @@ impl Patterns {
     }
 }
 
+/// The lowercase form of a letter, for looking it up in the patterns. This
+/// is right for English; languages whose case mapping depends on the
+/// language (Turkish dotted and dotless i) or changes the number of letters
+/// (German ẞ) need more than this.
 fn lower(c: char) -> char {
     c.to_lowercase().next().unwrap_or(c)
 }
