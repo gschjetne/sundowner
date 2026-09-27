@@ -60,6 +60,9 @@ cat in.md | sundowner > out.pdf    # stdin -> stdout
     --front-matter      Show YAML front matter as a table at the start
     --no-front-matter   Leave YAML front matter out (the default, but
                         without a warning that it is left out)
+    --no-justify        Set paragraphs ragged (flush left) instead of justified
+-l, --lang <TAG>        Language of the text, such as en or en-US (default: the
+                        front matter's lang); English text is hyphenated
     --no-images         Do not load image files
 -q, --quiet             Do not print warnings
     --licenses          Show the licenses of sundowner and its bundled fonts
@@ -88,6 +91,9 @@ font-size = 11
 margin = 20
 page-numbers = true
 front-matter = false
+justify = true
+# Language of documents whose front matter does not give one
+lang = en-US
 
 # Replace Alegreya for body text and headings, e.g. with a sans-serif
 [body]
@@ -189,6 +195,10 @@ tags: [birds, spring]
 | **tags** | birds | |
 | | spring | |
 
+A `lang` key (a language tag such as `en` or `en-US`, as Pandoc, Quarto
+and Jekyll read it) gives the document's language, whether or not the
+front matter is shown; see *Justification and hyphenation* below.
+
 Each column needs 6 ems of the page's width (with the default margins
 and font size, seven columns fit on A4 and four on A5); front matter
 nested deeper than fits is left out with a warning. So is front matter that sundowner cannot read:
@@ -289,8 +299,40 @@ and `#anchor` links become clickable; other links are shown as plain text.
   closing punctuation (`word !`, `« quote »`), inside numbers such as
   `$12.50`, or at no-break spaces. Break opportunities are computed over
   the whole paragraph, across style changes. A soft hyphen (U+00AD) marks
-  a possible break, and shows a hyphen only if the line breaks there. There
-  is no automatic hyphenation.
+  a possible break, and shows a hyphen only if the line breaks there.
+- **Justification and hyphenation.** Paragraphs are justified: every line
+  but the last (and lines before a hard line break) is set flush with both
+  margins by widening or narrowing the spaces between its words. Where
+  their lines break is chosen for the whole paragraph at once, by Knuth
+  and Plass's total-fit algorithm as TeX does it: of all the ways to break
+  a paragraph, the one whose spaces stretch or shrink the least (each
+  line's badness grows with the cube of it), with extra cost for
+  hyphenated lines, two of them in a row, and very loose lines next to
+  tight ones. Spaces may shrink to 75 % of their width, and are widened as
+  far as needed, up to four times their width; a line that would need
+  more (as when a long URL follows it) is set flush with the start
+  instead. Headings, table cells and code are not justified, and
+  `--no-justify` sets paragraphs ragged, with the breaks still chosen for
+  an even edge. Right-to-left paragraphs are justified too, before they
+  are reordered; Arabic by widening its spaces, not yet by kashida.
+
+  Text is hyphenated if its language is known (from `--lang`, the front
+  matter's `lang`, or `lang` in `.sundowner`, in that order), by Liang's
+  algorithm with the TeX hyphenation patterns of
+  [hyph-utf8](https://github.com/hyphenation/tex-hyphen): so far for
+  English, with the American patterns for every `en` tag. Hyphenation is
+  never guessed, as patterns for one language break the words of another
+  in the wrong places. Only whole words are hyphenated, with at least two
+  letters before the hyphen and three after it: not code, words with
+  digits or capitals after the first letter (acronyms, camel case), words
+  joined by a hyphen or slash, or URLs. Nor is a word hyphenated where it
+  would split a ligature (not "of-fice", which would lose its "ffi").
+  Without hyphenation, at A4 with the default margins and font size
+  (about 95 characters a line), the spaces of a justified line of prose
+  are typically 1.15 times their width, and 1 line in 10 has them wider
+  than 1.5 times; with English hyphenation, 1 line in 50, with a hyphen at
+  the end of 1 line in 10. On narrow pages such as A5, hyphenation matters
+  more: without it, a third of the lines have spaces wider than 1.5 times.
 - **Page breaking** chooses the breaks for the whole document at once, as
   Knuth and Plass's algorithm chooses the line breaks of a paragraph. Each
   place a page may break has a penalty: after the first or before the last
@@ -331,16 +373,16 @@ and `#anchor` links become clickable; other links are shown as plain text.
   The test suite converts thousands of random and adversarial documents and
   checks the resulting PDF structure.
 - **Fast.** About 550 KB of Markdown (600 pages) converts in about 0.3 s
-  using about 40 MB of memory.
+  using about 40 MB of memory. Justification adds about 5 % to that, and
+  hyphenation 15 to 20 %.
 
 ## Limitations
 
 - **Scripts.** Latin, Greek, Cyrillic, Armenian, Hebrew, Arabic and CJK
   render correctly. There is none of the shaping that Syriac, N'Ko, the
-  Indic scripts, Thai or Mongolian need. Arabic text is not justified by
-  stretching (kashida), and letters do not take language-specific forms
-  (such as Urdu's or Sindhi's), as Markdown does not say which language
-  text is in. Fonts without OpenType Arabic features are not shaped from
+  Indic scripts, Thai or Mongolian need. Arabic text is justified by
+  widening its spaces, not by lengthening its joins (kashida), and letters
+  do not take language-specific forms (such as Urdu's or Sindhi's). Fonts without OpenType Arabic features are not shaped from
   the presentation forms.
 - **Traditional Chinese characters.** Markdown does not say which
   language text is in, so the silk build sets Chinese characters in one
@@ -382,8 +424,13 @@ and `#anchor` links become clickable; other links are shown as plain text.
 - Remote images, interlaced PNGs and formats other than PNG and JPEG are not
   embedded. They appear as an italic `[image: …]` placeholder with a warning.
 
+- **Hyphenation** is only for English so far, and for the whole
+  document: a passage in another language is hyphenated as if it were
+  English, where its letters are ones English uses. CJK text, which has
+  no spaces to widen, is not justified.
+
 [`IDEAS.md`](IDEAS.md) collects features that may come later, such as
-justification, hyphenation and kashida.
+kashida and hyphenation for more languages.
 
 ## Building
 
@@ -429,6 +476,8 @@ and the minimum Rust version.
 The code is licensed under the MIT License (see `LICENSE`). The bundled
 fonts in `fonts/` are licensed under the SIL Open Font License 1.1. See
 [`fonts/README.md`](fonts/README.md) for their sources, changes and license
-compliance, or run `sundowner --licenses`. The line breaking,
+compliance, or run `sundowner --licenses`. The hyphenation patterns in
+`hyph/` come with their own permissive licenses; see
+[`hyph/README.md`](hyph/README.md). The line breaking,
 normalization and bidirectional tables and their test data are derived from the Unicode
 Character Database, under the Unicode License v3 (see `LICENSE-UNICODE`).

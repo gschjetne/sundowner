@@ -8,6 +8,7 @@ use crate::fonts::{FaceId, Fonts};
 use crate::front_matter::{self, Table};
 use crate::gpos::Attachment;
 use crate::gsub::{mask, Glyph, Script};
+use crate::hyphenate::{self, Patterns};
 use crate::image::{self, Image};
 use crate::inline::{self, Inline, Style};
 use crate::linebreak::{self, Break};
@@ -26,8 +27,9 @@ const LINE_SPACING: f32 = 1.4;
 const MAX_RUN: usize = 1024;
 /// Most combining marks kept with one base character.
 const MAX_CLUSTER: usize = 32;
-/// Most entries kept in the shaping cache.
-const SHAPE_CACHE_SIZE: usize = 20_000;
+/// Most entries kept in the shaping and hyphenation caches: enough for the
+/// words of a novel and their syllables.
+const SHAPE_CACHE_SIZE: usize = 50_000;
 const TEXT: Color = (0.11, 0.11, 0.12);
 const MUTED: Color = (0.4, 0.4, 0.43);
 const LINK: Color = (0.02, 0.35, 0.75);
@@ -97,6 +99,14 @@ pub struct Options {
     pub front_matter: Option<bool>,
     /// Fonts and fallback chains used to set text.
     pub fonts: Arc<Fonts>,
+    /// Whether paragraphs are justified (set flush on both sides).
+    pub justify: bool,
+    /// The language of the text (a BCP 47 tag such as `en-US`), from the
+    /// command line: it overrides the front matter's `lang`.
+    pub lang: Option<String>,
+    /// The language to assume when neither the command line nor the front
+    /// matter gives one (from `.sundowner`).
+    pub default_lang: Option<String>,
 }
 
 impl Default for Options {
@@ -111,6 +121,9 @@ impl Default for Options {
             title: None,
             front_matter: None,
             fonts: Fonts::builtin(),
+            justify: true,
+            lang: None,
+            default_lang: None,
         }
     }
 }
@@ -228,14 +241,31 @@ enum Slot {
 struct Word {
     frags: Vec<Frag>,
     /// A hyphen to show if the line breaks after this word (it ends with a
-    /// soft hyphen).
+    /// soft hyphen or at a hyphenation point).
     hyphen: Option<Frag>,
+    /// The kerning added to the last frag for the word that continues it
+    /// without a space, in 1/1000 em; taken off again if the line breaks
+    /// between them.
+    join_kern: f32,
 }
 
 impl Word {
     fn width(&self) -> f32 {
         self.frags.iter().map(|f| f.width).sum()
     }
+}
+
+/// How the lines of a paragraph are broken and set.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fill {
+    /// Each line takes as many words as fit; set flush with the start.
+    Greedy,
+    /// The breaks are chosen for the whole paragraph (see [`total_fit`]),
+    /// for an even ragged edge; set flush with the start.
+    Ragged,
+    /// The breaks are chosen for the whole paragraph, and the spaces of
+    /// each line but the last widened or narrowed to fill it.
+    Justify,
 }
 
 enum Tok {
@@ -385,6 +415,14 @@ struct Layout<'a> {
     /// Shaped text by (text, style bits, size). Documents repeat the same
     /// words constantly, so this avoids most shaping work.
     shape_cache: RefCell<HashMap<(String, u8, u32), Runs>>,
+    /// Hyphenation patterns for the document's language, if it is known
+    /// and sundowner has them.
+    hyph: Option<&'static Patterns>,
+    /// Hyphenation points of words (lowercase).
+    hyph_cache: RefCell<HashMap<String, Rc<[usize]>>>,
+    /// Whether a word may be split between two letters, in a style (bold
+    /// and italic bits), without changing its glyphs.
+    split_cache: RefCell<HashMap<(char, char, u8), bool>>,
 }
 
 impl<'a> Layout<'a> {
@@ -415,6 +453,9 @@ impl<'a> Layout<'a> {
             missing: RefCell::new(BTreeSet::new()),
             kern_cache: RefCell::new(HashMap::new()),
             shape_cache: RefCell::new(HashMap::new()),
+            hyph: None,
+            hyph_cache: RefCell::new(HashMap::new()),
+            split_cache: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -452,6 +493,26 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         list_depth: 0,
     };
     let front = l.front_matter(doc.front_matter.as_deref(), ctx);
+    let lang = o
+        .lang
+        .clone()
+        .or_else(|| doc.front_matter.as_deref().and_then(front_matter::language))
+        .or_else(|| o.default_lang.clone());
+    if let Some(lang) = lang {
+        if !hyphenate::valid_tag(&lang) {
+            l.warnings.push(format!(
+                "the front matter's lang '{lang}' is not a language tag (such as en or en-US), \
+                 so text is not hyphenated"
+            ));
+        } else if let Some(p) = hyphenate::for_language(&lang) {
+            l.hyph = Some(p);
+        } else {
+            l.warnings.push(format!(
+                "there are no hyphenation patterns for the language '{lang}', so text is not \
+                 hyphenated (only English is hyphenated so far)"
+            ));
+        }
+    }
     // Lay the document out twice: once to find where pages may break, and
     // again to break them where it is best. The second pass reuses the
     // first one's lines, shaping and images.
@@ -692,6 +753,264 @@ type Runs = Vec<(FaceId, Vec<G>, f32)>;
 /// Glyph runs in logical order with their embedding levels:
 /// `(level, face, glyphs, width)`.
 type LevelRuns = Vec<(u8, FaceId, Vec<G>, f32)>;
+
+/// How much wider (as a fraction of their width) the spaces of a justified
+/// line may become, as far as the choice of breaks is concerned: at this
+/// stretch a line is loose, with a badness of 100.
+const STRETCH: f32 = 0.5;
+/// How much narrower the spaces of a justified line may become: never
+/// more than this.
+const SHRINK: f32 = 0.25;
+/// The most the spaces of a justified line are widened, as a fraction of
+/// their width. A line that would need more, as when a long word or URL
+/// follows it, is set flush with the start instead.
+const MAX_GROWTH: f32 = 3.0;
+/// The stretch of a ragged line, in ems: a line this much short of the
+/// measure has a badness of 100.
+const RAGGED_STRETCH: f32 = 3.0;
+/// Demerits of every line, so that fewer lines are better (TeX's
+/// `\linepenalty`).
+const LINE_PENALTY: f64 = 10.0;
+/// Penalty of a break at a hyphen that is not in the text (`\hyphenpenalty`).
+const HYPHEN_PENALTY: f64 = 100.0;
+/// Demerits of two hyphenated lines in a row (`\doublehyphendemerits`).
+const DOUBLE_HYPHEN: f64 = 10_000.0;
+/// Demerits of hyphenating the last full line (`\finalhyphendemerits`).
+const FINAL_HYPHEN: f64 = 5_000.0;
+/// Demerits of a tight or decent line next to a very loose one, or a
+/// tight one next to a loose one (`\adjdemerits`).
+const ADJACENT_FITNESS: f64 = 10_000.0;
+/// How far (as a multiple of its stretch) a line may be short of the
+/// measure to be considered at all.
+const HOPELESS: f64 = 12.0;
+/// Badness of a line that is too wide however it is set: a word longer
+/// than the line, which will be split.
+const OVERFULL: f64 = 1e6;
+
+/// A word of a paragraph, for [`total_fit`].
+struct FitWord {
+    /// Its token.
+    tok: usize,
+    width: f32,
+    /// The width of the spaces before it; zero if it continues the word
+    /// before it (the line may break between them all the same).
+    space: f32,
+    /// The width of the hyphen shown if the line breaks after it.
+    hyphen: f32,
+}
+
+/// Choose where the lines of a paragraph break, by Knuth and Plass's
+/// total-fit algorithm: of all the ways to break it, the one with the
+/// least total demerits, which grow with the square of each line's
+/// badness and the penalty of the break that ends it. A line's badness
+/// grows with the cube of how far its spaces must stretch (or shrink) to
+/// fill it: [`STRETCH`] and [`SHRINK`] when `justify`, or else as if each
+/// line had [`RAGGED_STRETCH`]. Hyphens, and very loose lines next to
+/// tight ones, cost extra, as in TeX. The last line, and lines before a
+/// hard line break, may be as short as they like.
+///
+/// Returns, for each token, whether a line breaks before it. Each hard
+/// line break or image starts over. For each word, only the lines that
+/// end with it and fit are tried, so the time is linear in the number of
+/// words (times the words on a line).
+fn total_fit(toks: &[Tok], max_w: f32, size: f32, justify: bool) -> Vec<bool> {
+    let mut out = vec![false; toks.len()];
+    let mut words: Vec<FitWord> = Vec::new();
+    let mut space = 0.0;
+    for (i, t) in toks.iter().enumerate() {
+        match t {
+            Tok::Word(w) => {
+                words.push(FitWord {
+                    tok: i,
+                    width: w.width(),
+                    space: if words.is_empty() { 0.0 } else { space },
+                    hyphen: w.hyphen.as_ref().map_or(0.0, |h| h.width),
+                });
+                space = 0.0;
+            }
+            Tok::Space(w, _) => space += w,
+            Tok::Break | Tok::Image { .. } => {
+                fit_lines(&words, max_w, size, justify, &mut out);
+                words.clear();
+                space = 0.0;
+            }
+        }
+    }
+    fit_lines(&words, max_w, size, justify, &mut out);
+    out
+}
+
+/// [`total_fit`] for the words between hard line breaks.
+fn fit_lines(words: &[FitWord], max_w: f32, size: f32, justify: bool, out: &mut [bool]) {
+    let n = words.len();
+    if n < 2 {
+        return;
+    }
+    // Where each word starts on one endless line, and the stretch and
+    // shrink of the spaces before it.
+    let mut pos = Vec::with_capacity(n);
+    let mut stretch = Vec::with_capacity(n);
+    let mut shrink = Vec::with_capacity(n);
+    let (mut x, mut st, mut sh) = (0.0f32, 0.0f32, 0.0f32);
+    for (k, w) in words.iter().enumerate() {
+        if k > 0 {
+            x += words[k - 1].width + w.space;
+            st += w.space * STRETCH;
+            sh += w.space * SHRINK;
+        }
+        pos.push(x);
+        stretch.push(st);
+        shrink.push(sh);
+    }
+    // Whether the line may break after word k, showing a hyphen.
+    let hyphenated = |k: usize| k + 1 < n && words[k + 1].space == 0.0 && words[k].hyphen > 0.0;
+
+    // best[k][c]: the least demerits of the lines up to a break after word
+    // k whose last line has fitness class c (tight, decent, loose, very
+    // loose), where that line starts, and the class of the line before.
+    const NONE: (f64, usize, usize) = (f64::INFINITY, 0, 1);
+    let mut best: Vec<[(f64, usize, usize); 4]> = vec![[NONE; 4]; n];
+    for b in 0..n {
+        let last = b + 1 == n;
+        let hyph = hyphenated(b);
+        for a in (0..=b).rev() {
+            let natural = pos[b] + words[b].width - pos[a] + if hyph { words[b].hyphen } else { 0.0 };
+            let (st, sh) = if justify {
+                (stretch[b] - stretch[a], shrink[b] - shrink[a])
+            } else {
+                (RAGGED_STRETCH * size, 0.0)
+            };
+            let slack = max_w - natural;
+            // The line's badness and fitness class.
+            let (badness, class): (f64, usize) = if slack < -sh || (last && slack < 0.0) {
+                if a < b {
+                    break;
+                }
+                (OVERFULL, 1)
+            } else if last {
+                (0.0, 1)
+            } else if slack < 0.0 {
+                let r = f64::from(-slack / sh);
+                (100.0 * r.powi(3), if r > 0.5 { 0 } else { 1 })
+            } else {
+                // A line without spaces cannot be stretched, but is best
+                // nearly full.
+                let r = f64::from(slack / if st > 0.0 { st } else { max_w * 0.02 });
+                if r > HOPELESS && a < b {
+                    // Lines this loose are never the best; skipping them
+                    // saves most of the time. A line of one word is always
+                    // tried, so there is always a way to break.
+                    continue;
+                }
+                (
+                    100.0 * r.powi(3),
+                    if r <= 0.5 {
+                        1
+                    } else if r <= 1.0 {
+                        2
+                    } else {
+                        3
+                    },
+                )
+            };
+            let mut line = (LINE_PENALTY + badness).powi(2);
+            if hyph {
+                line += HYPHEN_PENALTY.powi(2);
+            }
+            let before = a.checked_sub(1);
+            let prev_hyph = before.is_some_and(hyphenated);
+            if prev_hyph && hyph {
+                line += DOUBLE_HYPHEN;
+            }
+            if prev_hyph && last {
+                line += FINAL_HYPHEN;
+            }
+            for pc in 0..4 {
+                let prev = match before {
+                    Some(p) => best[p][pc].0,
+                    None if pc == 1 => 0.0,
+                    None => f64::INFINITY,
+                };
+                if prev == f64::INFINITY {
+                    continue;
+                }
+                let mut d = prev + line;
+                if justify && class.abs_diff(pc) > 1 {
+                    d += ADJACENT_FITNESS;
+                }
+                if d < best[b][class].0 {
+                    best[b][class] = (d, a, pc);
+                }
+            }
+        }
+    }
+    // Follow the best breaks back from the end.
+    let mut c = (0..4)
+        .min_by(|&x, &y| best[n - 1][x].0.total_cmp(&best[n - 1][y].0))
+        .unwrap_or(1);
+    let mut b = n - 1;
+    loop {
+        let (_, a, pc) = best[b][c];
+        if a == 0 {
+            break;
+        }
+        out[words[a].tok] = true;
+        b = a - 1;
+        c = pc;
+    }
+}
+
+/// Widen (or narrow) the spaces between the words of a line, `gaps`, so
+/// that it fills `max_w`; unless that would widen them by more than
+/// [`MAX_GROWTH`].
+fn justify(line: &mut Line, gaps: &[usize], max_w: f32) {
+    let spaces: f32 = gaps.iter().map(|&k| line.frags[k].1.width).sum();
+    let slack = max_w - line.width;
+    if spaces <= 0.0 || slack / spaces > MAX_GROWTH {
+        return;
+    }
+    let scale = 1.0 + slack / spaces;
+    for &k in gaps {
+        line.frags[k].1.width *= scale;
+    }
+    let mut x = line.frags.first().map_or(0.0, |f| f.0);
+    for (fx, f) in &mut line.frags {
+        *fx = x;
+        x += f.width;
+    }
+    line.width = x;
+}
+
+fn lower(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+/// Add `k` (in 1/1000 em) to the advance of the last base glyph of `f`, as
+/// kerning with the glyph that follows it.
+fn kern_last(f: &mut Frag, k: f32) {
+    if k == 0.0 {
+        return;
+    }
+    let Some(b) = f.glyphs.iter().rposition(|g| g.adv != 0.0) else {
+        return;
+    };
+    f.glyphs[b].adv += k;
+    if f.level % 2 == 1 {
+        // Right to left (see `right_to_left`), the glyph keeps its
+        // place and the next one moves; so do the marks after it.
+        f.glyphs[b].dx += k;
+        for g in &mut f.glyphs[b + 1..] {
+            g.dx += k;
+        }
+    } else {
+        // Marks after the base are placed relative to the pen, which
+        // the kerning just moved; keep them where they were.
+        for g in &mut f.glyphs[b + 1..] {
+            g.dx -= k;
+        }
+    }
+    f.width += k * f.size / 1000.0;
+}
 
 pub fn slugify(s: &str) -> String {
     let mut out = String::new();
@@ -1108,33 +1427,17 @@ impl Layout<'_> {
     ///
     /// Like `shape_run`, this looks past marks: the pair is the last base
     /// glyph (non-zero advance) and `next`, not a trailing combining mark.
-    fn kern_join(&self, f: &mut Frag, next: &G) {
+    /// Returns the kerning, in 1/1000 em.
+    fn kern_join(&self, f: &mut Frag, next: &G) -> f32 {
         if next.adv == 0.0 {
-            return;
+            return 0.0;
         }
         let Some(b) = f.glyphs.iter().rposition(|g| g.adv != 0.0) else {
-            return;
+            return 0.0;
         };
         let k = self.kern_1000(f.face, f.glyphs[b].id, next.id);
-        if k == 0.0 {
-            return;
-        }
-        f.glyphs[b].adv += k;
-        if f.level % 2 == 1 {
-            // Right to left (see `right_to_left`), the glyph keeps its
-            // place and the next one moves; so do the marks after it.
-            f.glyphs[b].dx += k;
-            for g in &mut f.glyphs[b + 1..] {
-                g.dx += k;
-            }
-        } else {
-            // Marks after the base are placed relative to the pen, which
-            // the kerning just moved; keep them where they were.
-            for g in &mut f.glyphs[b + 1..] {
-                g.dx -= k;
-            }
-        }
-        f.width += k * f.size / 1000.0;
+        kern_last(f, k);
+        k
     }
 
     /// Kerning between two glyphs of a face, in 1/1000 em.
@@ -1372,7 +1675,14 @@ impl Layout<'_> {
     /// #9), also over the whole paragraph; text changes frags where the
     /// level changes. The second result says whether the paragraph is
     /// right-to-left (its first strong character is).
-    fn tokenize(&self, inlines: &[Inline], size: f32, color: Color, force_bold: bool) -> (Vec<Tok>, bool) {
+    fn tokenize(
+        &self,
+        inlines: &[Inline],
+        size: f32,
+        color: Color,
+        force_bold: bool,
+        hyphenate: bool,
+    ) -> (Vec<Tok>, bool) {
         // The paragraph as one character sequence. Hard breaks and images
         // stand in as LINE SEPARATOR and OBJECT REPLACEMENT CHARACTER, which
         // have the right line breaking classes.
@@ -1427,13 +1737,18 @@ impl Layout<'_> {
                 }
             }
         }
-        let breaks = linebreak::opportunities(&text);
+        let mut breaks = linebreak::opportunities(&text);
         let (levels, rtl) = if bidi::needs_resolving(&text) {
             let l = bidi::resolve(&text, None);
             (l.levels.clone(), l.rtl())
         } else {
             (vec![0; text.len()], false)
         };
+        // Hyphenation points: break opportunities that show a hyphen.
+        let mut hyphens = vec![false; text.len()];
+        if let Some(p) = self.hyph.filter(|_| hyphenate) {
+            self.hyphenate(p, &text, &slots, &styles, &levels, &mut breaks, &mut hyphens);
+        }
 
         let mut toks = Vec::new();
         let mut word = Word::default();
@@ -1489,7 +1804,7 @@ impl Layout<'_> {
                     if breaks[i] != Break::No {
                         // A soft hyphen right before the opportunity shows as
                         // a hyphen if the line breaks there.
-                        if pending.is_none() && i > 0 && text[i - 1] == '\u{AD}' {
+                        if pending.is_none() && i > 0 && (text[i - 1] == '\u{AD}' || hyphens[i]) {
                             if let Slot::Text(h) = slots[i - 1] {
                                 word.hyphen = self.hyphen(&styles[h], levels[i - 1]);
                             }
@@ -1525,7 +1840,7 @@ impl Layout<'_> {
                             if let Some(Tok::Word(prev)) = toks.last_mut() {
                                 if let Some(f) = prev.frags.last_mut().filter(|f| f.same_run(face, st, level))
                                 {
-                                    self.kern_join(f, &glyphs[0]);
+                                    prev.join_kern = self.kern_join(f, &glyphs[0]);
                                 }
                             }
                         }
@@ -1547,6 +1862,117 @@ impl Layout<'_> {
         (toks, rtl)
     }
 
+    /// Find where the words of a paragraph may be hyphenated, and make
+    /// those places break opportunities (`breaks`) that show a hyphen
+    /// (`hyphens`).
+    ///
+    /// A word is text between spaces (or the ends of the paragraph) with no
+    /// break opportunity in it, in one style, though punctuation around it
+    /// may be in another: so not a word joined to another by a hyphen or
+    /// slash, or part of a URL. Punctuation around it is left aside, and
+    /// what remains must be letters the patterns know, with no capitals
+    /// after the first (so not acronyms or camel case), and not code. A place where splitting the word would change its
+    /// glyphs, such as in the "ffi" ligature of "office", is left out, as
+    /// the word would then look different where it is not broken.
+    #[allow(clippy::too_many_arguments)]
+    fn hyphenate(
+        &self,
+        p: &Patterns,
+        text: &[char],
+        slots: &[Slot],
+        styles: &[TextStyle],
+        levels: &[u8],
+        breaks: &mut [Break],
+        hyphens: &mut [bool],
+    ) {
+        let n = text.len();
+        let is_space = |k: usize| matches!(slots[k], Slot::Space(_) | Slot::Break | Slot::Image(_));
+        let mut lowered = String::new();
+        let mut i = 0;
+        while i < n {
+            let Slot::Text(k) = slots[i] else {
+                i += 1;
+                continue;
+            };
+            let mut j = i + 1;
+            while j < n && slots[j] == Slot::Text(k) && breaks[j] == Break::No {
+                j += 1;
+            }
+            let (start, end) = (i, j);
+            i = j;
+            // Only whole words: between spaces, or punctuation in another
+            // style that the line may not break before or after.
+            let open =
+                |k: usize, c: usize| is_space(c) || (breaks[k] == Break::No && !text[c].is_alphanumeric());
+            if (start > 0 && !open(start, start - 1)) || (end < n && !open(end, end)) {
+                continue;
+            }
+            let st = &styles[k];
+            if st.style.code || levels[start..end].iter().any(|&l| l != levels[start]) {
+                continue;
+            }
+            let word = &text[start..end];
+            let Some(a) = word.iter().position(|c| c.is_alphabetic()) else {
+                continue;
+            };
+            let b = word
+                .iter()
+                .rposition(|c| c.is_alphabetic())
+                .expect("a letter exists")
+                + 1;
+            let core = &word[a..b];
+            if core.len() < p.left + p.right
+                || core[1..].iter().any(|c| c.is_uppercase())
+                || !core.iter().all(|&c| p.knows(lower(c)))
+            {
+                continue;
+            }
+            lowered.clear();
+            lowered.extend(core.iter().map(|&c| lower(c)));
+            let cached = self.hyph_cache.borrow().get(lowered.as_str()).cloned();
+            let points = cached.unwrap_or_else(|| {
+                let chars: Vec<char> = lowered.chars().collect();
+                let points: Rc<[usize]> = p.points(&chars).into();
+                let mut cache = self.hyph_cache.borrow_mut();
+                if cache.len() >= SHAPE_CACHE_SIZE {
+                    cache.clear();
+                }
+                cache.insert(lowered.clone(), points.clone());
+                points
+            });
+            for &q in points.iter() {
+                let q = a + q;
+                if !self.splits(word[q - 1], word[q], st) {
+                    continue;
+                }
+                breaks[start + q] = Break::Allowed;
+                hyphens[start + q] = true;
+            }
+        }
+    }
+
+    /// Whether a word in style `st` may be split between the letters `x`
+    /// and `y` without changing its glyphs: whether they are set the same
+    /// together (as in a ligature such as "fi") as apart.
+    fn splits(&self, x: char, y: char, st: &TextStyle) -> bool {
+        let (bold, italic) = (st.style.bold, st.style.italic);
+        let key = (x, y, (bold as u8) << 1 | italic as u8);
+        if let Some(&ok) = self.split_cache.borrow().get(&key) {
+            return ok;
+        }
+        let ids = |t: &str| -> Vec<u16> {
+            self.shape(t, false, bold, italic, st.size)
+                .into_iter()
+                .flat_map(|(_, g, _)| g.into_iter().map(|g| g.id))
+                .collect()
+        };
+        let mut apart = ids(x.encode_utf8(&mut [0; 4]));
+        apart.extend(ids(y.encode_utf8(&mut [0; 4])));
+        let ok = ids(&format!("{x}{y}")) == apart;
+        self.split_cache.borrow_mut().insert(key, ok);
+        ok
+    }
+
     /// The hyphen shown where a line breaks at a soft hyphen.
     fn hyphen(&self, st: &TextStyle, level: u8) -> Option<Frag> {
         let (mono, bold, italic) = (st.style.code, st.style.bold, st.style.italic);
@@ -1555,8 +1981,19 @@ impl Layout<'_> {
         Some(st.frag(glyphs, w, face, level))
     }
 
-    fn wrap(&self, toks: &[Tok], max_w: f32, base_size: f32) -> Vec<Laid> {
+    /// Break a paragraph into lines of at most `max_w`, and justify them
+    /// if `fill` says so.
+    fn wrap(&self, toks: &[Tok], max_w: f32, base_size: f32, fill: Fill) -> Vec<Laid> {
         let max_w = max_w.max(1.0);
+        // Where the lines break: before the words marked here, or, filling
+        // greedily, before each word that does not fit.
+        let chosen = match fill {
+            Fill::Greedy => None,
+            Fill::Ragged => Some(total_fit(toks, max_w, base_size, false)),
+            Fill::Justify => Some(total_fit(toks, max_w, base_size, true)),
+        };
+        // The spaces between words on the current line (frag indices).
+        let mut gaps: Vec<usize> = Vec::new();
         let mut out = Vec::new();
         let new_line = || Line {
             size: base_size,
@@ -1586,6 +2023,7 @@ impl Layout<'_> {
                 Tok::Break => {
                     out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
                     placed.clear();
+                    gaps.clear();
                     space = 0.0;
                 }
                 Tok::Image { alt, src } => {
@@ -1597,16 +2035,21 @@ impl Layout<'_> {
                         src: src.clone(),
                     });
                     placed.clear();
+                    gaps.clear();
                     space = 0.0;
                 }
                 Tok::Word(word) => {
                     let w = word.width();
-                    if !line.frags.is_empty() && line.width + space + w > max_w {
+                    let fits = match &chosen {
+                        Some(breaks) => !breaks[i],
+                        None => line.width + space + w <= max_w,
+                    };
+                    if !line.frags.is_empty() && !fits {
                         // Break before this word. If the last word on the line
                         // needs a hyphen that does not fit, it moves to the
                         // next line too.
                         let mut restart = i;
-                        while placed.len() > 1 {
+                        while chosen.is_none() && placed.len() > 1 {
                             let &(ti, nfrags, before) = placed.last().expect("placed is not empty");
                             let hyphen = match &toks[ti] {
                                 Tok::Word(prev) => prev.hyphen.as_ref(),
@@ -1622,18 +2065,31 @@ impl Layout<'_> {
                             restart = ti;
                         }
                         if let Some(&(ti, ..)) = placed.last() {
-                            if let Tok::Word(Word { hyphen: Some(h), .. }) = &toks[ti] {
-                                if let Some((_, last)) = line.frags.last_mut().filter(|(_, l)| l.joins(h)) {
+                            if let Tok::Word(Word {
+                                hyphen: Some(h),
+                                join_kern,
+                                ..
+                            }) = &toks[ti]
+                            {
+                                if let Some((_, last)) = line.frags.last_mut() {
+                                    // Kern with the hyphen, not the text after the break.
                                     let before = last.width;
-                                    self.kern_join(last, &h.glyphs[0]);
+                                    kern_last(last, -join_kern);
+                                    if last.joins(h) {
+                                        self.kern_join(last, &h.glyphs[0]);
+                                    }
                                     line.width += last.width - before;
                                 }
                                 let x = line.width;
                                 push_frag(&mut line, x, h.clone());
                             }
                         }
+                        if fill == Fill::Justify {
+                            justify(&mut line, &gaps, max_w);
+                        }
                         out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
                         placed.clear();
+                        gaps.clear();
                         space = 0.0;
                         if restart != i {
                             i = restart;
@@ -1661,6 +2117,7 @@ impl Layout<'_> {
                                     }
                                     out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
                                     placed.clear();
+                                    gaps.clear();
                                     start = k;
                                     x = 0.0;
                                     acc = 0.0;
@@ -1689,6 +2146,7 @@ impl Layout<'_> {
                                 strike: false,
                                 link: None,
                             };
+                            gaps.push(line.frags.len());
                             push_frag(&mut line, x, gap);
                             x += space;
                         }
@@ -1849,7 +2307,11 @@ impl Layout<'_> {
     }
 
     /// Lay out a run of inline content as wrapped lines.
-    fn text_block(&mut self, inlines: &[Inline], size: f32, ctx: Ctx, bold: bool) {
+    ///
+    /// Paragraphs (`body`) are justified, or else broken as ragged lines
+    /// by total fit, and hyphenated if the language is known; other text,
+    /// such as headings, is ragged and broken greedily.
+    fn text_block(&mut self, inlines: &[Inline], size: f32, ctx: Ctx, bold: bool, body: bool) {
         // Images that cannot be loaded become inline placeholder text.
         let mut owned = Vec::new();
         let inlines = if inlines.iter().any(|i| matches!(i, Inline::Image { .. })) {
@@ -1869,8 +2331,13 @@ impl Layout<'_> {
         let (laid, rtl) = match laidout {
             Some(Laidout::Text(laid, rtl)) => (laid, rtl),
             _ => {
-                let (toks, rtl) = self.tokenize(inlines, size, ctx.color, bold);
-                (self.wrap(&toks, ctx.w, size), rtl)
+                let (toks, rtl) = self.tokenize(inlines, size, ctx.color, bold, body);
+                let fill = match (body, self.o.justify) {
+                    (false, _) => Fill::Greedy,
+                    (true, false) => Fill::Ragged,
+                    (true, true) => Fill::Justify,
+                };
+                (self.wrap(&toks, ctx.w, size, fill), rtl)
             }
         };
         // Avoid leaving the first or last line of a paragraph alone. Only
@@ -1944,7 +2411,7 @@ impl Layout<'_> {
     fn image(&mut self, alt: &str, src: &str, ctx: Ctx, penalty: f32) {
         let Some(idx) = self.load_image(src) else {
             self.penalize_next(self.keep + penalty);
-            return self.text_block(&[placeholder(alt, src)], self.o.font_size, ctx, false);
+            return self.text_block(&[placeholder(alt, src)], self.o.font_size, ctx, false, false);
         };
         let (pw, ph) = (self.images[idx].width as f32, self.images[idx].height as f32);
         // Treat pixels as 96 dpi, then shrink to fit the column and page.
@@ -1982,7 +2449,7 @@ impl Layout<'_> {
                 Block::Heading { level, text } => self.heading(*level, text, ctx),
                 Block::Paragraph(raw) => {
                     let inl = inline::parse(raw, self.refs);
-                    self.text_block(&inl, fs, ctx, false);
+                    self.text_block(&inl, fs, ctx, false, true);
                     self.gap(para_gap);
                 }
                 Block::Code(lines) => {
@@ -2058,7 +2525,7 @@ impl Layout<'_> {
         // Keep the heading's lines together, and with the text after it.
         let keep = std::mem::replace(&mut self.keep, FORBID);
         self.next_penalty = Some(FORBID);
-        self.text_block(&inl, size, Ctx { color, ..ctx }, true);
+        self.text_block(&inl, size, Ctx { color, ..ctx }, true, false);
         self.keep = keep;
         self.next_penalty = Some(FORBID);
         if level <= 2 {
@@ -2348,7 +2815,7 @@ impl Layout<'_> {
                     };
                 }
             }
-            l.tokenize(&inl, size, ctx.color, bold)
+            l.tokenize(&inl, size, ctx.color, bold, false)
         };
         let mut grid: Vec<Vec<(Vec<Tok>, bool)>> = Vec::with_capacity(rows.len() + 1);
         grid.push(header.iter().map(|c| cell_toks(self, c, true)).collect());
@@ -2385,7 +2852,7 @@ impl Layout<'_> {
                     .enumerate()
                     .map(|(c, (toks, rtl))| {
                         let lines = self
-                            .wrap(&toks, widths[c], size)
+                            .wrap(&toks, widths[c], size, Fill::Greedy)
                             .into_iter()
                             .filter_map(|l| if let Laid::Line(l) = l { Some(l) } else { None })
                             .collect();
@@ -2466,7 +2933,7 @@ impl Layout<'_> {
                         link: None,
                     });
                 }
-                self.tokenize(&inl, size, ctx.color, c.key)
+                self.tokenize(&inl, size, ctx.color, c.key, false)
             })
             .collect();
 
@@ -2517,7 +2984,7 @@ impl Layout<'_> {
             .map(|(c, (toks, rtl))| {
                 let w = widths[c.col..c.col + c.cols].iter().sum::<f32>() + 2.0 * pad * (c.cols - 1) as f32;
                 let lines = self
-                    .wrap(&toks, w, size)
+                    .wrap(&toks, w, size, Fill::Greedy)
                     .into_iter()
                     .filter_map(|l| if let Laid::Line(l) = l { Some(l) } else { None })
                     .collect();

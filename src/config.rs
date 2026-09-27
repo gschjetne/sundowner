@@ -7,6 +7,8 @@
 //! margin = 20
 //! page-numbers = true
 //! front-matter = false
+//! justify = true
+//! lang = en-US
 //!
 //! # Replace the bundled Alegreya for body text and headings
 //! [body]
@@ -45,6 +47,9 @@ pub struct Config {
     pub margin: Option<f32>,
     pub page_numbers: Option<bool>,
     pub front_matter: Option<bool>,
+    pub justify: Option<bool>,
+    /// The language of documents that do not give one in front matter.
+    pub lang: Option<String>,
     pub fonts: FontSpec,
 }
 
@@ -64,6 +69,18 @@ fn parse_bool(what: &str, v: &str) -> Result<bool, String> {
         "true" | "yes" | "on" => Ok(true),
         "false" | "no" | "off" => Ok(false),
         _ => Err(format!("{what}: expected true or false, got '{v}'")),
+    }
+}
+
+/// A BCP 47 language tag, such as `en` or `en-US`.
+pub fn parse_lang(what: &str, v: &str) -> Result<String, String> {
+    let v = v.trim();
+    if crate::hyphenate::valid_tag(v) {
+        Ok(v.to_string())
+    } else {
+        Err(format!(
+            "{what}: expected a language tag such as en or en-US, got '{v}'"
+        ))
     }
 }
 
@@ -158,6 +175,8 @@ pub fn parse(text: &str, base: &Path) -> Result<Config, String> {
                 "margin" => cfg.margin = Some(parse_number("margin", value, 0.0, 100.0).map_err(err)?),
                 "page-numbers" => cfg.page_numbers = Some(parse_bool(key, value).map_err(err)?),
                 "front-matter" => cfg.front_matter = Some(parse_bool(key, value).map_err(err)?),
+                "justify" => cfg.justify = Some(parse_bool(key, value).map_err(err)?),
+                "lang" => cfg.lang = Some(parse_lang("lang", value).map_err(err)?),
                 _ => return Err(err(format!("unknown setting '{key}'"))),
             },
             Section::Body | Section::Mono | Section::Fallback => {
@@ -223,7 +242,8 @@ mod tests {
     #[test]
     fn parses_full_config() {
         let c = parse(
-            "# comment\npaper = letter\nfont-size = 12\nmargin = 25\npage-numbers = off\nfront-matter = yes\n\n\
+            "# comment\npaper = letter\nfont-size = 12\nmargin = 25\npage-numbers = off\nfront-matter = yes\n\
+             justify = no\nlang = en-GB\n\n\
              [body]\nregular = \"a b.ttf\"\nbold = b.ttf\n[mono]\nregular = /abs/m.ttf\n\
              [fallback]\nregular = cjk.ttc#2\n[fallback]\nregular = emoji.ttf\n",
             Path::new("/cfg"),
@@ -233,6 +253,8 @@ mod tests {
         assert_eq!(c.margin, Some(25.0));
         assert_eq!(c.page_numbers, Some(false));
         assert_eq!(c.front_matter, Some(true));
+        assert_eq!(c.justify, Some(false));
+        assert_eq!(c.lang.as_deref(), Some("en-GB"));
         assert!(c.paper.is_some());
         let body = c.fonts.body.unwrap();
         assert_eq!(body.regular, Some((PathBuf::from("/cfg/a b.ttf"), 0)));
@@ -260,6 +282,7 @@ mod tests {
                 "line 1: front-matter: expected true or false",
             ),
             ("[fallback]\nbold = x.ttf", "no 'regular'"),
+            ("lang = en US", "line 1: lang: expected a language tag"),
             ("just text", "expected 'key = value'"),
         ] {
             let e = parse(src, Path::new(".")).unwrap_err();

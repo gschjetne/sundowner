@@ -741,3 +741,210 @@ fn front_matter_that_needs_several_pages_breaks_between_rows() {
         );
     }
 }
+
+/// The width of `text` set in the regular body font at the default size.
+fn width(text: &str) -> f32 {
+    let o = Options::default();
+    let em: f32 = layout::shape_text(text, false, false, false, &o)
+        .iter()
+        .flat_map(|(_, g)| g)
+        .map(|g| g.1)
+        .sum();
+    em * o.font_size / 1000.0
+}
+
+/// Each line of the first page, top to bottom: where its first run starts
+/// and its last one (by position) ends, and its text.
+fn line_edges(out: &Output) -> Vec<(f32, f32, String)> {
+    let mut r = runs(out, 0);
+    r.sort_by(|a, b| b.y.total_cmp(&a.y).then(a.x.total_cmp(&b.x)));
+    let mut lines: Vec<(f32, Vec<&Run>)> = Vec::new();
+    for run in &r {
+        match lines.last_mut() {
+            Some((y, l)) if *y == run.y => l.push(run),
+            _ => lines.push((run.y, vec![run])),
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(_, l)| {
+            let last = l[l.len() - 1];
+            let text: Vec<&str> = l.iter().map(|r| r.text.as_str()).collect();
+            (l[0].x, last.x + width(&last.text), text.join(" "))
+        })
+        .collect()
+}
+
+const PROSE: &str = "Typographers soon discovered that the appearance of a page depends on \
+    countless small decisions. The width of the column, the size of the type, the spacing \
+    between words and lines, and the treatment of the margins all influence readability. \
+    Justified setting, in which every line except the last extends to both margins, gives a \
+    formal and orderly impression, but it requires careful management of the spaces between \
+    words.";
+
+fn render_with(src: &str, o: Options) -> Output {
+    layout::layout(
+        &markdown::parse(src),
+        &Options {
+            page_numbers: false,
+            ..o
+        },
+    )
+}
+
+#[test]
+fn paragraphs_are_justified_except_their_last_lines() {
+    let o = Options::default();
+    let (left, right) = (o.margin, o.page_width - o.margin);
+    let src = format!("{PROSE}\n\n{PROSE}  \nAfter a hard break.");
+    let lines = line_edges(&render(&src));
+    // Two paragraphs of several lines, the second with a hard break.
+    let n = lines.len();
+    assert!(n >= 8, "{lines:?}");
+    let ends = |k: usize| (lines[k].1 - right).abs() < 0.05;
+    for (k, (start, _, text)) in lines.iter().enumerate() {
+        assert_eq!(*start, left, "{text}");
+        let last = text.ends_with("words.") || k + 1 == n;
+        assert_eq!(ends(k), !last, "line {k}: {text:?} ends at {}", lines[k].1);
+    }
+
+    // Unless justification is turned off.
+    let lines = line_edges(&render_with(&src, Options { justify: false, ..o }));
+    assert!(
+        lines.iter().all(|l| l.0 == left && l.1 < right - 0.05),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn headings_and_table_cells_are_not_justified() {
+    let o = Options::default();
+    let right = o.page_width - o.margin;
+    let heading = format!("## {}", &PROSE[..200]);
+    let lines = line_edges(&render(&heading));
+    assert!(
+        lines.len() >= 2 && lines.iter().all(|l| l.1 < right - 0.05),
+        "{lines:?}"
+    );
+    let table = format!("| a | b |\n|---|---|\n| {PROSE} | x |\n");
+    let lines = line_edges(&render(&table));
+    assert!(lines.len() >= 3, "{lines:?}");
+    let ends: Vec<f32> = lines[1..lines.len() - 1].iter().map(|l| l.1).collect();
+    assert!(ends.windows(2).any(|w| (w[0] - w[1]).abs() > 1.0), "{lines:?}");
+}
+
+#[test]
+fn right_to_left_paragraphs_are_justified_too() {
+    let o = Options::default();
+    let (left, right) = (o.margin, o.page_width - o.margin);
+    let words = ["שלום", "עולם", "ספר", "מילים", "ארוכות", "קצת"];
+    let src: Vec<&str> = (0..120).map(|k| words[k % words.len()]).collect();
+    let lines = line_edges(&render(&src.join(" ")));
+    assert!(lines.len() >= 3, "{lines:?}");
+    for (k, (start, end, text)) in lines.iter().enumerate() {
+        // Flush right, and (but for the last line) flush left. (The width
+        // measured here is only close for right-to-left text.)
+        assert!((end - right).abs() < 0.5, "{text}: {end}");
+        assert_eq!(
+            (start - left).abs() < 0.05,
+            k + 1 < lines.len(),
+            "{text}: {start}"
+        );
+    }
+}
+
+/// The lines of `src` set `width` wide, in language `lang`.
+fn hyphenated(src: &str, width: f32, lang: Option<&str>) -> Vec<String> {
+    lines(&render_with(
+        src,
+        Options {
+            page_width: width,
+            margin: 10.0,
+            lang: lang.map(String::from),
+            ..Options::default()
+        },
+    ))
+}
+
+#[test]
+fn english_is_hyphenated_when_the_language_is_given() {
+    let src = "Characteristically, internationalization notwithstanding considerable \
+               standardization remains extraordinarily complicated and unpredictable.";
+    let plain = src.replace(' ', "");
+    for width in [120.0, 150.0, 200.0] {
+        let l = hyphenated(src, width, None);
+        assert!(l.iter().all(|x| !x.ends_with('-')), "{l:?}");
+        let l = hyphenated(src, width, Some("en-US"));
+        assert!(l.iter().any(|x| x.ends_with('-')), "{l:?}");
+        // Only the breaks show hyphens, and the text stays the same.
+        assert_eq!(l.concat().replace([' ', '-'], ""), plain, "{l:?}");
+        // At syllables, with at least two letters before the hyphen and
+        // three after it.
+        for (a, b) in l.iter().zip(&l[1..]) {
+            if let Some(a) = a.strip_suffix('-') {
+                let before = a.rsplit(' ').next().unwrap();
+                let after = b.split([' ', '.', ',']).next().unwrap();
+                assert!(before.chars().count() >= 2 && after.chars().count() >= 3, "{l:?}");
+            }
+        }
+    }
+    // The front matter's lang does the same, and the command line's wins.
+    let front = format!("---\nlang: en\n---\n\n{src}");
+    let l = lines(&render_front_narrow(&front, None));
+    assert!(l.iter().any(|x| x.ends_with('-')), "{l:?}");
+    let out = render_front_narrow(&front, Some("sv"));
+    assert!(lines(&out).iter().all(|x| !x.ends_with('-')));
+    assert!(
+        out.warnings.iter().any(|w| w.contains("'sv'")),
+        "{:?}",
+        out.warnings
+    );
+}
+
+fn render_front_narrow(src: &str, lang: Option<&str>) -> Output {
+    render_with(
+        src,
+        Options {
+            page_width: 150.0,
+            margin: 10.0,
+            front_matter: Some(false),
+            lang: lang.map(String::from),
+            ..Options::default()
+        },
+    )
+}
+
+#[test]
+fn only_plain_words_are_hyphenated() {
+    // Not code, acronyms, camel case, words joined by a hyphen or slash,
+    // or URLs; and never inside a ligature ("of-fice" would lose its
+    // "ffi").
+    for src in [
+        "`internationalization` `internationalization`",
+        "INTERNATIONALIZATION INTERNATIONALIZATION",
+        "InternationalizationRules InternationalizationRules",
+        "state-of-the-internationalization and/internationalization",
+        "https://example.com/internationalization/standardization",
+        "office office office office office office office",
+    ] {
+        for width in [60.0, 80.0, 100.0, 120.0] {
+            // No hyphens are added.
+            let l = hyphenated(src, width, Some("en"));
+            assert_eq!(l.concat().replace(' ', ""), src.replace(['`', ' '], ""), "{l:?}");
+        }
+    }
+    // Capitalized words are hyphenated.
+    let l = hyphenated("Internationalization Internationalization", 80.0, Some("en"));
+    assert!(l.iter().any(|x| x.ends_with('-')), "{l:?}");
+}
+
+#[test]
+fn emphasized_and_linked_words_are_hyphenated() {
+    for src in [
+        "*Internationalization*, *internationalization*.",
+        "[Internationalization](https://example.com), \"internationalization\"",
+    ] {
+        let l = hyphenated(src, 80.0, Some("en"));
+        assert!(l.iter().any(|x| x.ends_with('-')), "{l:?}");
+    }
+}
