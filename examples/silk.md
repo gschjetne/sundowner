@@ -36,7 +36,7 @@ Latin, Greek and Cyrillic of the default *europa* build.
 
 ## 中文
 
-丝绸之路是连接中国与地中海世界的古代商路，得名于**丝绸**贸易。
+絲綢之路是連接中國與地中海世界的古代商路，得名於**絲綢**貿易。
 
 ## 日本語
 
