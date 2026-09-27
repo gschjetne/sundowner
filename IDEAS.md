@@ -102,10 +102,12 @@ best built on one line breaker.
   Amiri; Serbian and Bashkir Cyrillic and Turkish, Catalan, Dutch,
   Romanian and other Latin forms in Alegreya (such as Serbian italic
   letters, the Catalan `l·l` and the Dutch `ij`).
-- Regional forms of Chinese characters: the silk build uses the mainland
-  China forms of Noto Serif SC for everything. A Japanese, Traditional
-  Chinese or Korean `lang` could select Noto Serif JP, TC or KR, perhaps as
-  an optional larger build, since each is 10 to 15 MB.
+- Regional forms of Chinese characters: the silk build uses the
+  traditional (Taiwan) forms of Noto Serif TC for everything, with only the
+  kanji it lacks from Noto Serif JP. A Japanese, simplified Chinese or
+  Korean `lang` could select Noto Serif JP, SC or KR, perhaps as an
+  optional larger build, since each is 10 to 15 MB; today such fonts are
+  added as fallbacks.
 
 ## More scripts
 

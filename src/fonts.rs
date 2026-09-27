@@ -117,8 +117,10 @@ pub const BUNDLED: &[Bundled] = bundled!(
     silk!("NotoSerifHebrew-Bold.ttf"),
     silk!("NotoSerifArmenian-Regular.ttf"),
     silk!("NotoSerifArmenian-Bold.ttf"),
-    silk!("NotoSerifSC-Regular.ttf"),
-    silk!("NotoSerifSC-Bold.ttf"),
+    silk!("NotoSerifTC-Regular.ttf"),
+    silk!("NotoSerifTC-Bold.ttf"),
+    silk!("NotoSerifJP-Regular.ttf"),
+    silk!("NotoSerifJP-Bold.ttf"),
     silk!("GowunBatang-Regular.ttf"),
     silk!("GowunBatang-Bold.ttf"),
     silk!("Amiri-Regular.ttf"),
@@ -141,6 +143,11 @@ type TierFamily = (&'static str, bool);
 /// ones come before Cousine, so Hebrew is not set in Cousine. The others
 /// come after it, so the symbols, box drawing characters and Latin letters
 /// that Cousine has keep coming from it (and do not unpack a large font).
+///
+/// Chinese characters are set in their traditional forms (Noto Serif TC);
+/// Noto Serif JP, cut down to the Japanese kanji TC lacks, completes
+/// Japanese. Characters only simplified Chinese uses are not bundled: a
+/// simplified Chinese font can be added as a fallback.
 #[cfg(not(feature = "silk"))]
 const TIER_FAMILIES: &[TierFamily] = &[];
 #[cfg(feature = "silk")]
@@ -149,7 +156,8 @@ const TIER_FAMILIES: &[TierFamily] = &[
     ("silk/NotoSerifHebrew", true),
     ("silk/NotoSerifArmenian", true),
     ("silk/Amiri", false),
-    ("silk/NotoSerifSC", false),
+    ("silk/NotoSerifTC", false),
+    ("silk/NotoSerifJP", false),
     ("silk/GowunBatang", false),
 ];
 
@@ -195,8 +203,14 @@ pub const FONT_LICENSES: &[(&str, &str)] = &[
     ),
     #[cfg(feature = "silk")]
     (
-        "Noto Serif SC (Regular, Bold; static instances generated from the variable font)",
-        include_str!("../fonts/silk/OFL-NotoSerifSC.txt"),
+        "Noto Serif TC (Regular, Bold; static instances generated from the variable font)",
+        include_str!("../fonts/silk/OFL-NotoSerifTC.txt"),
+    ),
+    #[cfg(feature = "silk")]
+    (
+        "Noto Serif JP (Regular, Bold; static instances generated from the variable font, cut down \
+         to the Japanese kanji that Noto Serif TC lacks)",
+        include_str!("../fonts/silk/OFL-NotoSerifJP.txt"),
     ),
     #[cfg(feature = "silk")]
     (
@@ -603,12 +617,11 @@ mod tests {
                 '\u{60C}', '\u{61B}', '\u{61F}', '\u{67E}', '\u{686}', '\u{698}', '\u{6AF}', '\u{6CC}',
             ])
             .collect();
-        let cases: [(&str, &[char], &str); 7] = [
+        let cases: [(&str, &[char], &str); 6] = [
             ("Hebrew", &hebrew, "FrankRuhlLibre"),
             ("cantillation", &chars(0x591..=0x5AF), "NotoSerifHebrew"),
             ("Armenian", &armenian, "NotoSerifArmenian"),
-            ("Han", &han, "NotoSerifSC"),
-            ("kana", &kana, "NotoSerifSC"),
+            ("kana", &kana, "NotoSerifTC"),
             ("Hangul", &chars(0xAC00..=0xD7A3), "GowunBatang"),
             ("Arabic", &arabic, "Amiri"),
         ];
@@ -633,6 +646,37 @@ mod tests {
                     );
                 }
             }
+        }
+        // Chinese characters: in Noto Serif TC where it has them, else in
+        // the Japanese kanji of Noto Serif JP, else not at all.
+        let in_family = |face: FaceId, family: &str| f.faces[face].postscript_name.starts_with(family);
+        let (mut traditional, mut japanese) = (0, 0);
+        for bold in [false, true] {
+            for &c in &han {
+                match f.resolve(c, false, bold, false) {
+                    Some((face, _)) if in_family(face, "NotoSerifTC") => traditional += 1,
+                    Some((face, _)) if in_family(face, "NotoSerifJP") => japanese += 1,
+                    Some((face, _)) => panic!("U+{:04X} set in {}", c as u32, f.faces[face].postscript_name),
+                    None => {}
+                }
+            }
+        }
+        assert!(
+            traditional > 2 * 15_000 && japanese > 2 * 700,
+            "{traditional} {japanese}"
+        );
+        // Kanji simplified in Japan come from Noto Serif JP; characters only
+        // simplified Chinese uses are not bundled.
+        for c in "気楽図読変帰対経済単歩黒戦".chars() {
+            let (face, _) = f.resolve(c, false, false, false).unwrap();
+            assert!(in_family(face, "NotoSerifJP"), "{c}");
+        }
+        for c in "這們氣樂".chars() {
+            let (face, _) = f.resolve(c, false, false, false).unwrap();
+            assert!(in_family(face, "NotoSerifTC"), "{c}");
+        }
+        for c in "这们语说".chars() {
+            assert!(f.resolve(c, false, false, false).is_none(), "{c}");
         }
     }
 

@@ -16,7 +16,7 @@ sundowner comes in two builds, which differ only in the fonts they bundle:
 | Build | Scripts | Size |
 |-------|---------|------|
 | **europa** (default) | Latin, Greek, Cyrillic: the alphabets on euro banknotes | 3.2 MB |
-| **silk** (`--features silk`) | also Hebrew, Arabic, Armenian, Chinese, Japanese and Korean: the scripts along the Silk Road | 28 MB |
+| **silk** (`--features silk`) | also Hebrew, Arabic, Armenian, Chinese, Japanese and Korean: the scripts along the Silk Road | 22 MB |
 
 The silk build adds fonts in the same humanist, broad-nib spirit as
 Alegreya, as far as each writing system has one:
@@ -27,8 +27,9 @@ cantillation marks, which Frank Ruhl Libre lacks),
 Bulaq press, for Arabic (and Persian, Urdu and other languages written in
 Arabic script),
 [Noto Serif Armenian](https://github.com/notofonts/armenian),
-[Noto Serif SC](https://github.com/notofonts/noto-cjk), a Song/Mincho
-face, for Chinese characters and Japanese kana, and
+[Noto Serif TC](https://github.com/notofonts/noto-cjk), a Song/Mincho
+face, for Chinese characters (in their traditional forms) and Japanese
+kana, with the Japanese kanji it lacks from Noto Serif JP, and
 [Gowun Batang](https://github.com/yangheeryu/Gowun-Batang), a
 brush-inspired Batang, for Korean. Amiri has regular, bold, italic and
 bold italic; the others have regular and bold, and italic text uses the
@@ -112,7 +113,8 @@ regular = fonts/NotoEmoji-Regular.ttf
   that has a glyph for it:
   - body text: `[body]`, then the `[fallback]` fonts, then the bundled fonts:
     Alegreya, (silk: Frank Ruhl Libre, Noto Serif Hebrew, Noto Serif
-    Armenian), Cousine, (silk: Amiri, Noto Serif SC, Gowun Batang)
+    Armenian), Cousine, (silk: Amiri, Noto Serif TC, Noto Serif JP,
+    Gowun Batang)
   - code: `[mono]`, then the `[fallback]` fonts, then the body font, then
     the bundled fonts
 
@@ -285,17 +287,38 @@ and `#anchor` links become clickable; other links are shown as plain text.
   (such as Urdu's or Sindhi's), as Markdown does not say which language
   text is in. Fonts without OpenType Arabic features are not shaped from
   the presentation forms.
-- **One style of Chinese characters.** The silk build bundles one Han
-  font, Noto Serif SC, which covers all of CJK Unified Ideographs and
-  Extension A (but little of Extension B and later), so Japanese and
-  traditional Chinese text are covered apart from rare characters, but characters that look
-  different in Japan, Taiwan or Hong Kong use their mainland China forms.
-  Add Noto Serif JP, TC or HK as a `[fallback]` for the regional forms.
-  There is no vertical text.
+- **Traditional Chinese characters.** Markdown does not say which
+  language text is in, so the silk build sets Chinese characters in one
+  style: the traditional (Taiwan) forms of Noto Serif TC. Japanese text is
+  complete too: the kanji that were simplified in Japan (such as 気, 楽
+  and 読), which Noto Serif TC lacks, come from Noto Serif JP, which is
+  bundled cut down to just those. Kanji that Japan and Taiwan share keep
+  their Taiwan shapes, and there is no vertical text.
+
+  Simplified Chinese characters that traditional Chinese does not use
+  (such as 这, 们 and 语) are not bundled, and are shown as boxes with a
+  warning. For simplified Chinese, add
+  [Noto Serif SC](https://fonts.google.com/noto/specimen/Noto+Serif+SC)
+  (or another simplified Chinese font) as a fallback in `.sundowner`:
+
+  ```ini
+  [fallback]
+  regular = fonts/NotoSerifSC-Regular.ttf
+  bold = fonts/NotoSerifSC-Bold.ttf
+  ```
+
+  Fallbacks come before the bundled fonts, so all Chinese characters
+  (and kana and full-width punctuation) are then set in Noto Serif SC,
+  in mainland China forms, while Latin text stays in Alegreya. Noto Serif
+  JP added the same way sets Japanese entirely in Japanese forms, and
+  Noto Serif HK in Hong Kong ones. As `.sundowner` is looked up from each
+  document's directory, a folder of simplified Chinese documents can have
+  its own; `-c` picks one for a single document, and `--no-config` goes
+  back to the bundled fonts.
 - **Cantillation marks** in Hebrew come from Noto Serif Hebrew, so in
   cantillated (biblical) text the letters that carry them are set in Noto
   Serif Hebrew and the others in Frank Ruhl Libre.
-- **CJK in code** is set in Noto Serif SC, which is proportional, so CJK
+- **CJK in code** is set in Noto Serif TC, which is proportional, so CJK
   characters in code do not line up in columns. Add a monospaced CJK font
   as `[mono]` or `[fallback]` if that matters.
 - **Marks on ligatures** attach to the ligature's last component. A mark
@@ -315,7 +338,7 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 # -> target/x86_64-unknown-linux-musl/release/sundowner
 
-# The silk build (about 27 MB)
+# The silk build (about 22 MB)
 cargo build --release --target x86_64-unknown-linux-musl --features silk
 
 # Regular build for the host platform

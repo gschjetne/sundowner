@@ -472,11 +472,11 @@ fn silk_sets_each_script_in_its_family() {
     hebrew.sort();
     assert_eq!(hebrew, ["FrankRuhlLibre-Bold", "FrankRuhlLibre-Regular"]);
     assert_eq!(name(run(&r, "Հայերեն")), "NotoSerifArmenian-Regular");
-    assert_eq!(name(run(&r, "ひらがな")), "NotoSerifSC-Regular");
+    assert_eq!(name(run(&r, "ひらがな")), "NotoSerifTC-Regular");
     assert_eq!(name(run(&r, "한국어")), "GowunBatang-Regular");
     let mut han: Vec<String> = r.iter().filter(|x| x.text == "中文").map(name).collect();
     han.sort();
-    assert_eq!(han, ["NotoSerifSC-Bold", "NotoSerifSC-Regular"]);
+    assert_eq!(han, ["NotoSerifTC-Bold", "NotoSerifTC-Regular"]);
     // Cantillation marks, which Frank Ruhl Libre lacks, come from Noto
     // Serif Hebrew together with their letter.
     let out = render("בָּרָ֣א");
@@ -531,4 +531,27 @@ fn arabic_is_joined_and_set_in_amiri() {
     // Right to left and flush right, with Arabic-Indic digits left to right.
     let l = lines(&render("العدد ١٢٣"))[0].replace(' ', "");
     assert_eq!(l, format!("١٢٣{}", logical("العدد")));
+}
+
+/// Chinese characters are set in their traditional forms, Japanese kanji
+/// that Noto Serif TC lacks in Noto Serif JP, and characters only
+/// simplified Chinese uses are missing (a simplified Chinese font is added
+/// as a fallback).
+#[cfg(feature = "silk")]
+#[test]
+fn chinese_is_traditional_and_japanese_is_complete() {
+    // 天 is in Noto Serif TC; 気 (Japanese for 氣) only in Noto Serif JP.
+    let out = render("天気 這們");
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let names: Vec<(String, String)> = runs(&out, 0)
+        .iter()
+        .map(|x| (x.text.clone(), name_of(&out, x)))
+        .collect();
+    let set_in = |text: &str| names.iter().find(|n| n.0 == text).map(|n| n.1.as_str());
+    assert_eq!(set_in("天"), Some("NotoSerifTC-Regular"));
+    assert_eq!(set_in("気"), Some("NotoSerifJP-Regular"));
+    assert_eq!(set_in("這們"), Some("NotoSerifTC-Regular"));
+    let out = render("这们");
+    assert_eq!(out.warnings.len(), 1);
+    assert!(out.warnings[0].contains("'这' (U+8FD9)"), "{}", out.warnings[0]);
 }
