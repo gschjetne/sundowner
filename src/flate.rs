@@ -43,6 +43,7 @@ struct BitWriter {
 
 impl BitWriter {
     fn put(&mut self, value: u32, bits: u32) {
+        debug_assert!(bits <= 32 && self.n + bits <= 64);
         self.acc |= (value as u64) << self.n;
         self.n += bits;
         while self.n >= 8 {
@@ -346,9 +347,11 @@ fn write_block(w: &mut BitWriter, syms: &[Sym], raw: &[u8], last: bool) {
     let fixed_dist = [5u8; 30];
     let fixed = 3 + cost(&fixed_lit, &fixed_dist) + extra;
     // Stored blocks hold at most 65535 bytes, each with a header of 3 bits,
-    // padding to a byte and 4 bytes of lengths.
+    // padding to a byte and 4 bytes of lengths. The first header starts
+    // where the last block ended; the others at a byte boundary.
     let chunks = raw.len().div_ceil(65535).max(1);
-    let stored = 8 * (raw.len() + 5 * chunks) as u64;
+    let first_pad = (8 - (w.n + 3) % 8) % 8;
+    let stored = 3 + first_pad as u64 + 32 + 8 * raw.len() as u64 + 40 * (chunks as u64 - 1);
 
     if stored < dynamic.min(fixed) {
         let mut rest = raw;
@@ -627,9 +630,12 @@ struct Huffman {
 
 impl Huffman {
     fn new(lengths: &[u8]) -> Result<Huffman, Error> {
+        if lengths.iter().any(|&l| l > 15) {
+            return Err("bad code length");
+        }
         let mut counts = [0u16; 16];
         for &l in lengths {
-            counts[l as usize & 15] += 1;
+            counts[l as usize] += 1;
         }
         counts[0] = 0;
         let mut left: i32 = 1;
@@ -646,14 +652,13 @@ impl Huffman {
         let mut symbols = vec![0u16; lengths.len()];
         for (sym, &l) in lengths.iter().enumerate() {
             if l != 0 {
-                let o = &mut offs[l as usize & 15];
+                let o = &mut offs[l as usize];
                 symbols[*o as usize] = sym as u16;
                 *o += 1;
             }
         }
         let mut fast = vec![0u16; 1 << FAST_BITS];
-        let lengths: Vec<u8> = lengths.iter().map(|&l| l & 15).collect();
-        for (sym, (&l, code)) in lengths.iter().zip(canonical_codes(&lengths)).enumerate() {
+        for (sym, (&l, code)) in lengths.iter().zip(canonical_codes(lengths)).enumerate() {
             if l == 0 || l as u32 > FAST_BITS {
                 continue;
             }
@@ -830,6 +835,13 @@ pub fn zlib_decompress(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
             _ => return Err("bad block type"),
         }
         if last == 1 {
+            // The Adler-32 checksum follows, from the next byte boundary.
+            r.consume(r.n % 8)?;
+            let p = r.pos - (r.n / 8) as usize;
+            let sum = r.data.get(p..p + 4).ok_or("truncated zlib checksum")?;
+            if u32::from_be_bytes(sum.try_into().expect("4 bytes")) != adler32(&out) {
+                return Err("zlib checksum mismatch");
+            }
             return Ok(out);
         }
     }
@@ -956,6 +968,17 @@ mod tests {
             data.truncate(2 + (rng(&mut seed) as usize) % (z.len() - 1));
             let _ = zlib_decompress(&data, 1 << 16);
         }
+    }
+
+    #[test]
+    fn rejects_bad_lengths_and_checksums() {
+        assert!(Huffman::new(&[1, 16]).is_err());
+        let mut z = zlib_compress(b"hello hello hello");
+        assert!(zlib_decompress(&z, 1 << 10).is_ok());
+        let n = z.len();
+        z[n - 1] ^= 1;
+        assert_eq!(zlib_decompress(&z, 1 << 10), Err("zlib checksum mismatch"));
+        assert!(zlib_decompress(&z[..n - 2], 1 << 10).is_err());
     }
 
     #[test]

@@ -256,7 +256,8 @@ archiving; see *Tagged PDF* and *PDF/A* below.
   glyphs, some of which stand for no text of their own. It holds XMP
   metadata (the title, language and producer, as in its document
   information) and an sRGB output intent with a 1 KB ICC profile that
-  sundowner generates. Its file identifier is a hash of its contents, so
+  sundowner generates. Its file identifier is a hash of its contents (up to the
+  cross-reference stream, which holds it), so
   identical input still gives byte-identical output. A CMYK JPEG cannot be
   in a PDF/A file with RGB colours; such a PDF is not declared PDF/A, with
   a warning. The example documents pass [veraPDF](https://verapdf.org)'s
