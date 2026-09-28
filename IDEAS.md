@@ -158,7 +158,3 @@ Patterns for the main European languages, from hyph-utf8 (sizes of the
   logical text rather than the visual order.
 - PDF/A for archiving: the fonts are embedded already; it also needs
   output intents and XMP metadata.
-- Dynamic Huffman codes in the DEFLATE encoder: smaller PDFs, and a
-  smaller silk binary, since `build.rs` compresses the silk fonts with it.
-  A faster inflater would also cut the time to unpack a CJK font on first
-  use (about 0.15 s).

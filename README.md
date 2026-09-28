@@ -16,7 +16,7 @@ sundowner comes in two builds, which differ only in the fonts they bundle:
 | Build | Scripts | Size |
 |-------|---------|------|
 | **europa** (default) | Latin, Greek, Cyrillic: the alphabets on euro banknotes | 3.2 MB |
-| **silk** (`--features silk`) | also Hebrew, Arabic, Armenian, Chinese, Japanese and Korean: the scripts along the Silk Road | 22 MB |
+| **silk** (`--features silk`) | also Hebrew, Arabic, Armenian, Chinese, Japanese and Korean: the scripts along the Silk Road | 20 MB |
 
 The silk build adds fonts in the same humanist, broad-nib spirit as
 Alegreya, as far as each writing system has one:
@@ -351,10 +351,12 @@ and `#anchor` links become clickable; other links are shown as plain text.
   row, so avoiding bad breaks does not add pages. The document is laid out
   twice: once to find the breaks, and again to set the pages, reusing the
   lines of the first pass.
-- **Compact output.** Content streams are compressed with a small built-in
-  DEFLATE encoder (LZ77 with short hash chains and the fixed Huffman code).
-  This is simple and fast but compresses less than zlib or gzip at their
-  default settings.
+- **Compact output.** Content streams and fonts are compressed with a
+  small built-in DEFLATE encoder: LZ77 with hash chains and lazy matching,
+  and each block coded with Huffman codes built for it (length-limited by
+  package-merge), the fixed code, or stored, whichever is smallest. It
+  compresses as well as zlib at its highest level, to within a fraction
+  of a percent.
 - **Crash-proof.**
   - No `unsafe` code.
   - Nesting depth is capped.
@@ -443,7 +445,7 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
 # -> target/x86_64-unknown-linux-musl/release/sundowner
 
-# The silk build (about 22 MB)
+# The silk build (about 20 MB)
 cargo build --release --target x86_64-unknown-linux-musl --features silk
 
 # Regular build for the host platform
@@ -456,7 +458,7 @@ cargo test --release --features silk -- --include-ignored
 
 The silk fonts are compressed by `build.rs`, with sundowner's own DEFLATE
 encoder, when the feature is enabled; this adds a few seconds to the
-build. A document that uses them pays about 0.15 s to unpack each of the
+build. A document that uses them pays about 0.08 s to unpack each of the
 large CJK fonts it needs.
 
 The Unicode tables in `src/linebreak_table.rs`, `src/normalize_table.rs`
