@@ -114,23 +114,42 @@ fn random_doc(rng: &mut Rng, len: usize) -> String {
     (0..len).map(|_| PIECES[rng.below(PIECES.len())]).collect()
 }
 
-/// Check the xref table: every offset must point at the matching object.
+/// Check the cross-reference stream: every offset must point at the
+/// matching object, and every object in an object stream must be in one.
 fn assert_valid_pdf(pdf: &[u8]) {
-    assert!(pdf.starts_with(b"%PDF-1.4\n"));
+    assert!(pdf.starts_with(b"%PDF-1.7\n"));
     assert!(pdf.ends_with(b"%%EOF\n"));
-    let tail = std::str::from_utf8(&pdf[pdf.len().saturating_sub(64)..]).unwrap_or("");
-    let sx = tail.rsplit("startxref\n").next().unwrap();
+    let sx = pdf.windows(10).rposition(|w| w == b"startxref\n").unwrap() + 10;
+    let sx = std::str::from_utf8(&pdf[sx..]).unwrap();
     let xref: usize = sx.lines().next().unwrap().trim().parse().unwrap();
-    let table = std::str::from_utf8(&pdf[xref..]).unwrap();
-    let mut lines = table.lines();
-    assert_eq!(lines.next(), Some("xref"));
-    let count: usize = lines.next().unwrap().split(' ').nth(1).unwrap().parse().unwrap();
-    lines.next();
-    for id in 1..count {
-        let entry = lines.next().unwrap();
-        let off: usize = entry[..10].parse().unwrap();
-        let expect = format!("{id} 0 obj");
-        assert!(pdf[off..].starts_with(expect.as_bytes()), "object {id} misplaced");
+    let stream_at = xref + pdf[xref..].windows(7).position(|w| w == b"stream\n").unwrap() + 7;
+    let head = std::str::from_utf8(&pdf[xref..stream_at]).unwrap();
+    let value = |key: &str| -> usize {
+        let v = head.split(key).nth(1).unwrap().trim_start();
+        v[..v.find([' ', '>']).unwrap()].parse().unwrap()
+    };
+    assert!(
+        head.contains("/Type /XRef") && head.contains("/W [1 4 2]"),
+        "{head}"
+    );
+    let (size, len) = (value("/Size "), value("/Length "));
+    let rows = sundowner::flate::zlib_decompress(&pdf[stream_at..stream_at + len], 1 << 30).unwrap();
+    assert_eq!(rows.len(), 7 * size);
+    let row = |id: usize| -> (u8, usize, usize) {
+        let r = &rows[7 * id..7 * id + 7];
+        let a = u32::from_be_bytes([r[1], r[2], r[3], r[4]]) as usize;
+        (r[0], a, u16::from_be_bytes([r[5], r[6]]) as usize)
+    };
+    assert_eq!(row(0).0, 0);
+    for id in 1..size {
+        match row(id) {
+            (1, off, _) => {
+                let expect = format!("{id} 0 obj");
+                assert!(pdf[off..].starts_with(expect.as_bytes()), "object {id} misplaced");
+            }
+            (2, stm, _) => assert_eq!(row(stm).0, 1, "object {id} in a missing object stream"),
+            other => panic!("object {id}: {other:?}"),
+        }
     }
 }
 

@@ -23,7 +23,9 @@ pub mod normalize;
 pub mod normalize_table;
 pub mod otl;
 pub mod pdf;
+pub mod pdfa;
 pub mod position;
+pub mod tags;
 pub mod ttf;
 pub mod yaml;
 
@@ -41,8 +43,10 @@ pub fn convert(markdown: &str, options: &Options) -> Converted {
     let doc = markdown::parse(markdown);
     let out = layout::layout(&doc, options);
     let pdf = pdf::write(&out, options.page_width, options.page_height);
-    Converted {
-        pdf,
-        warnings: out.warnings,
+    let archival = pdfa::conformance(&out);
+    let mut warnings = out.warnings;
+    if let Err(why) = archival {
+        warnings.push(format!("the PDF is not PDF/A, as {why}"));
     }
+    Converted { pdf, warnings }
 }

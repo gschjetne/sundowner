@@ -153,8 +153,13 @@ Patterns for the main European languages, from hyph-utf8 (sizes of the
 
 ## Output
 
-- Tagged PDF, with the reading order and `ActualText` of right-to-left
-  and ligated text, so that copying, searching and screen readers get the
-  logical text rather than the visual order.
-- PDF/A for archiving: the fonts are embedded already; it also needs
-  output intents and XMP metadata.
+- Declare PDF/UA-1 (ISO 14289-1) when a document meets it: when its
+  language is known, its headings do not skip levels and its images have
+  alt text. The declaration (`pdfuaid:part` in the XMP metadata) needs an
+  extension schema description there, as PDF/A-2 only knows its own
+  schemas.
+- More of the structure: a `BBox` for figures, for reflowing viewers;
+  `Code` elements for inline code; and `Lang` on elements, for passages
+  in another language (the HTML `lang` attributes that are now dropped).
+- CMYK JPEGs in PDF/A: convert them to RGB (which means decoding the
+  JPEG), or give them an ICC-based colour space.
