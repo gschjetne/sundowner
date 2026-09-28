@@ -4,6 +4,7 @@
 use sundowner::fonts::Fonts;
 use sundowner::layout::{self, Options, Output, Target};
 use sundowner::markdown;
+use sundowner::tags::Kid;
 
 /// One text-showing operation: face, position and the text it draws.
 #[derive(Debug)]
@@ -68,6 +69,23 @@ fn find(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .windows(needle.len())
         .position(|w| w == needle)
         .map(|p| p + from)
+}
+
+/// The text of a PDF file, followed by that of its object streams
+/// (inflated), where most of its objects are.
+fn pdf_text(pdf: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(pdf).into_owned();
+    let mut from = 0;
+    while let Some(p) = find(pdf, from, b"/Type /ObjStm") {
+        let at = find(pdf, p, b"/Length ").expect("a length") + 8;
+        let end = find(pdf, at, b" ").expect("a number");
+        let len: usize = std::str::from_utf8(&pdf[at..end]).unwrap().parse().unwrap();
+        let start = find(pdf, end, b"stream\n").expect("a stream") + 7;
+        let data = sundowner::flate::zlib_decompress(&pdf[start..start + len], 1 << 30).unwrap();
+        text.push_str(&String::from_utf8_lossy(&data));
+        from = start + len;
+    }
+    text
 }
 
 fn run<'a>(runs: &'a [Run], text: &str) -> &'a Run {
@@ -158,7 +176,7 @@ fn internal_and_external_links() {
         &Options::default(),
     )
     .pdf;
-    let text = String::from_utf8_lossy(&pdf);
+    let text = pdf_text(&pdf);
     assert_eq!(
         text.matches("/Subtype /Link").count(),
         2,
@@ -285,20 +303,28 @@ fn every_script_in_the_bundled_fonts_uses_real_glyphs() {
 }
 
 #[test]
-fn uncovered_characters_warn_and_use_notdef() {
+fn uncovered_characters_warn_and_show_as_boxes() {
     let out = render("กข 🎉");
     assert_eq!(out.warnings.len(), 1);
     assert!(out.warnings[0].contains("U+0E01") && out.warnings[0].contains("U+1F389"));
-    let r = runs(&out, 0);
-    assert!(r.iter().all(|x| x.face == REGULAR));
-    // The glyph is .notdef (ID 0), which maps back to the first missing character.
+    // They are set in the regular face as .notdef (ID 0), but drawn as the
+    // outline of a box, as PDF/A does not allow .notdef to be shown...
     assert!(out.used[REGULAR].contains_key(&0));
+    let ops = String::from_utf8_lossy(&out.pages[0].ops).to_string();
+    assert!(!ops.contains("<0000>"), "{ops}");
+    assert_eq!(ops.matches(" re S\n").count(), 3, "{ops}");
+    // ...each with an invisible space that carries its text.
+    let space = format!("<{:04X}>", Fonts::builtin().faces[REGULAR].glyph(' ').unwrap());
+    assert_eq!(ops.matches(&format!("{space} Tj 0 Tr")).count(), 3, "{ops}");
+    for text in ["<FEFF0E01>", "<FEFF0E02>", "<FEFFD83CDF89>"] {
+        assert!(ops.contains(&format!("/ActualText {text}")), "{text} in {ops}");
+    }
 }
 
 #[test]
 fn fonts_are_embedded_subsets_with_unicode_maps() {
     let pdf = sundowner::convert("Hello **bold** `code`", &Options::default()).pdf;
-    let text = String::from_utf8_lossy(&pdf);
+    let text = pdf_text(&pdf);
     assert_eq!(
         text.matches("/Subtype /Type0").count(),
         3,
@@ -365,6 +391,9 @@ fn lines(out: &Output) -> Vec<String> {
     let mut lines: Vec<(f32, String)> = Vec::new();
     for run in r {
         match lines.last_mut() {
+            // A hyphen shown where a line breaks inside a word is drawn on
+            // its own (with the soft hyphen as its text).
+            Some((y, text)) if *y == run.y && run.text == "-" => text.push('-'),
             Some((y, text)) if *y == run.y => {
                 text.push(' ');
                 text.push_str(&run.text);
@@ -947,4 +976,179 @@ fn emphasized_and_linked_words_are_hyphenated() {
         let l = hyphenated(src, 80.0, Some("en"));
         assert!(l.iter().any(|x| x.ends_with('-')), "{l:?}");
     }
+}
+
+// ---------------------------------------------------------------- tagged PDF
+
+/// The structure tree from element `id` down, without its content, as
+/// `Document(H1 P(Link))`.
+fn tree(out: &Output, id: usize) -> String {
+    let e = &out.structure[id];
+    let kids: Vec<String> = e
+        .kids
+        .iter()
+        .filter_map(|k| match k {
+            Kid::Elem(c) => Some(tree(out, *c)),
+            _ => None,
+        })
+        .collect();
+    if kids.is_empty() {
+        e.tag.to_string()
+    } else {
+        format!("{}({})", e.tag, kids.join(" "))
+    }
+}
+
+#[test]
+fn the_structure_tree_follows_the_blocks() {
+    let out = render(
+        "# Title\n\nSome [linked text](https://example.com) here.\n\n1. one\n2. two\n   - nested\n\n\
+         > quoted\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```\ncode\n```\n\n---\n\n###### Last\n",
+    );
+    assert_eq!(
+        tree(&out, 0),
+        "Document(H1 P(Link) L(LI(Lbl LBody(P)) LI(Lbl LBody(P L(LI(Lbl LBody(P)))))) \
+         BlockQuote(P) Table(TR(TH TH) TR(TD TD)) Code H6)"
+    );
+    let attrs = |tag: &str| -> Vec<&str> {
+        out.structure
+            .iter()
+            .filter(|e| e.tag == tag)
+            .map(|e| e.attrs.as_str())
+            .collect()
+    };
+    assert_eq!(attrs("TH"), ["/O /Table /Scope /Column"; 2]);
+    assert_eq!(
+        attrs("L"),
+        [
+            "/O /List /ListNumbering /Decimal",
+            "/O /List /ListNumbering /Disc"
+        ]
+    );
+    // The link's annotation is in its element.
+    let link = out.structure.iter().find(|e| e.tag == "Link").unwrap();
+    assert!(link.kids.contains(&Kid::Link { page: 0, index: 0 }));
+    assert_eq!(out.structure[out.pages[0].links[0].elem].tag, "Link");
+}
+
+#[test]
+fn content_is_marked_as_its_element_or_as_an_artifact() {
+    let out = layout::layout(
+        &markdown::parse("# Title\n\n`code` and ~~struck~~ text\n\n> quote\n\n- [x] done\n\n---\n"),
+        &Options::default(),
+    );
+    let ops = String::from_utf8_lossy(&out.pages[0].ops).to_string();
+    // Every marked-content sequence is closed, and belongs to the element
+    // that refers to it.
+    assert_eq!(
+        ops.matches(" BDC\n").count() + ops.matches(" BMC\n").count(),
+        ops.matches("EMC\n").count()
+    );
+    for (mcid, &elem) in out.marked[0].iter().enumerate() {
+        let tag = out.structure[elem].tag;
+        assert!(
+            ops.contains(&format!("/{tag} <</MCID {mcid}>> BDC")),
+            "{tag} {mcid}"
+        );
+        assert!(out.structure[elem].kids.contains(&Kid::Content { page: 0, mcid }));
+    }
+    // Backgrounds, rules, the quote's bar and the page number are artifacts;
+    // the check box is the list item's label, with its text.
+    assert!(ops.contains("/Artifact BMC"));
+    assert!(ops.contains("/Artifact <</Type /Pagination /Subtype /Footer>> BDC"));
+    assert!(ops.contains("/Span <</ActualText <FEFF2611>>> BDC"));
+    // Nothing is drawn outside marked content.
+    let mut depth = 0i32;
+    for line in ops.lines() {
+        if line.ends_with(" BDC") || line.ends_with(" BMC") {
+            depth += 1;
+        } else if line == "EMC" {
+            depth -= 1;
+        } else {
+            assert!(depth > 0, "unmarked: {line}");
+        }
+    }
+}
+
+#[test]
+fn right_to_left_text_is_placed_in_reading_order() {
+    // Drawn right to left, the text before the link is drawn last; it is
+    // still read first.
+    let out = render("שלום [עולם](https://example.com) ומה שלומך");
+    let p = out.structure.iter().find(|e| e.tag == "P").unwrap();
+    let mcid = |k: &Kid| match k {
+        Kid::Content { mcid, .. } => *mcid,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(p.kids.len(), 3, "{:?}", p.kids);
+    assert!(matches!(p.kids[1], Kid::Elem(e) if out.structure[e].tag == "Link"));
+    assert!(mcid(&p.kids[0]) > mcid(&p.kids[2]), "{:?}", p.kids);
+}
+
+#[test]
+fn hyphens_at_breaks_stand_for_soft_hyphens() {
+    let l = hyphenated(PROSE, 120.0, Some("en"));
+    assert!(l.iter().any(|x| x.ends_with('-')));
+    let out = render_with(
+        PROSE,
+        Options {
+            page_width: 120.0,
+            margin: 10.0,
+            lang: Some("en".into()),
+            ..Options::default()
+        },
+    );
+    let ops = String::from_utf8_lossy(&out.pages[0].ops).to_string();
+    assert!(ops.contains("/Span <</ActualText <FEFF00AD>>> BDC"), "{ops}");
+    assert_eq!(out.lang.as_deref(), Some("en"));
+}
+
+#[test]
+fn documents_are_pdfa_and_tagged() {
+    let src = "---\nlang: en-GB\n---\n# A \"Title\" & (more)\n\nText.\n";
+    let pdf = sundowner::convert(src, &Options::default()).pdf;
+    let text = pdf_text(&pdf);
+    for part in [
+        "/MarkInfo << /Marked true >>",
+        "/StructTreeRoot",
+        "/ParentTree",
+        "/StructParents 0",
+        "/Lang (en-GB)",
+        "/DisplayDocTitle true",
+        "/OutputIntents",
+        "/S /GTS_PDFA1",
+        "/ID [<",
+        "<pdfaid:part>2</pdfaid:part>",
+        "<pdfaid:conformance>A</pdfaid:conformance>",
+        "<rdf:li xml:lang=\"x-default\">A &quot;Title&quot; &amp; (more)</rdf:li>",
+        "<rdf:li>en-GB</rdf:li>",
+        "/Title (A \"Title\" & \\(more\\))",
+    ] {
+        assert!(text.contains(part), "no {part}");
+    }
+}
+
+#[test]
+fn cmyk_images_are_not_pdfa() {
+    let dir = std::env::temp_dir().join(format!("sundowner-cmyk-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A JPEG's header is enough: SOI, and SOF0 with four components.
+    let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xC0, 0, 20, 8, 0, 4, 0, 4, 4];
+    jpeg.extend([1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0, 4, 0x11, 0]);
+    std::fs::write(dir.join("c.jpg"), jpeg).unwrap();
+    let o = Options {
+        base_dir: Some(dir.clone()),
+        ..Options::default()
+    };
+    let c = sundowner::convert("![CMYK](c.jpg)", &o);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        c.warnings.iter().any(|w| w.contains("not PDF/A")),
+        "{:?}",
+        c.warnings
+    );
+    let text = pdf_text(&c.pdf);
+    assert!(text.contains("/DeviceCMYK") && !text.contains("pdfaid:part"));
+    // It is still tagged, as a figure.
+    assert!(text.contains("/S /Figure") && text.contains("/Alt (CMYK)"));
 }

@@ -14,6 +14,7 @@ use crate::inline::{self, Inline, Style};
 use crate::linebreak::{self, Break};
 use crate::markdown::{Align, Block, Document};
 use crate::normalize;
+use crate::tags::{self, Tagger};
 use crate::yaml;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -130,13 +131,15 @@ impl Default for Options {
 
 /// A positioned glyph. Distances are in 1/1000 em: `adv` moves the pen to
 /// the next glyph (including kerning; zero for marks), and the glyph is
-/// drawn offset by `dx`, `dy` from the pen (marks on their base).
+/// drawn offset by `dx`, `dy` from the pen (marks on their base). `text`
+/// is the text it stands for, in [`Layout::texts`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct G {
     id: u16,
     adv: f32,
     dx: f32,
     dy: f32,
+    text: u32,
 }
 
 /// A run of text in a single font, size, color, link and bidirectional
@@ -300,6 +303,8 @@ pub enum Target {
 pub struct LinkArea {
     pub rect: [f32; 4],
     pub target: Target,
+    /// Its `Link` structure element.
+    pub elem: usize,
 }
 
 #[derive(Default)]
@@ -328,6 +333,13 @@ pub struct Output {
     /// and later glyphs of a character), for font subsetting and the
     /// ToUnicode map.
     pub used: Vec<BTreeMap<u16, String>>,
+    /// The structure tree: its elements, the root first.
+    pub structure: Vec<tags::Elem>,
+    /// For each page, the structure element of each marked-content
+    /// sequence on it, by MCID.
+    pub marked: Vec<Vec<usize>>,
+    /// The language of the text (a BCP 47 tag), if it is known.
+    pub lang: Option<String>,
 }
 
 enum MarkerKind {
@@ -337,6 +349,8 @@ enum MarkerKind {
 
 struct Marker {
     kind: MarkerKind,
+    /// Its `Lbl` structure element.
+    lbl: usize,
     /// Where the marker ends (left-to-right items) or starts (right-to-left
     /// items).
     edge: f32,
@@ -408,6 +422,9 @@ struct Layout<'a> {
     slug_counts: HashMap<String, usize>,
     warnings: Vec<String>,
     used: RefCell<Vec<BTreeMap<u16, String>>>,
+    /// The same, as the index in [`Layout::texts`] of each glyph's text, by
+    /// face and glyph ID, for drawing (see [`draw_glyphs`]).
+    mapped: RefCell<Vec<Vec<u32>>>,
     missing: RefCell<BTreeSet<char>>,
     /// Kerning per glyph pair in 1/1000 em. Text repeats the same pairs
     /// constantly, so this avoids most GPOS lookups.
@@ -423,6 +440,14 @@ struct Layout<'a> {
     /// Whether a word may be split between two letters, in a style (bold
     /// and italic bits), without changing its glyphs.
     split_cache: RefCell<HashMap<(char, char, u8), bool>>,
+    /// The texts glyphs stand for ([`G::text`]), each once; the first is
+    /// empty.
+    texts: RefCell<(Vec<String>, HashMap<String, u32>)>,
+    /// The structure tree, built in the second pass.
+    tags: Tagger,
+    /// The `Link` element that text of the last link drawn went to: its
+    /// target, the element, and the element it is in.
+    last_link: Option<(Rc<str>, usize, usize)>,
 }
 
 impl<'a> Layout<'a> {
@@ -450,13 +475,42 @@ impl<'a> Layout<'a> {
             slug_counts: HashMap::new(),
             warnings: Vec::new(),
             used: RefCell::new(vec![BTreeMap::new(); o.fonts.faces.len()]),
+            mapped: RefCell::new(vec![Vec::new(); o.fonts.faces.len()]),
             missing: RefCell::new(BTreeSet::new()),
             kern_cache: RefCell::new(HashMap::new()),
             shape_cache: RefCell::new(HashMap::new()),
             hyph: None,
             hyph_cache: RefCell::new(HashMap::new()),
             split_cache: RefCell::new(HashMap::new()),
+            texts: RefCell::new((vec![String::new()], HashMap::new())),
+            tags: Tagger::default(),
+            last_link: None,
         }
+    }
+
+    /// Record that glyph `gid` of `face` maps to text `text` (an index in
+    /// [`Layout::texts`]) in the ToUnicode map.
+    fn map_glyph(&self, face: FaceId, gid: u16, text: u32) {
+        let m = &mut self.mapped.borrow_mut()[face];
+        if m.len() <= gid as usize {
+            m.resize(gid as usize + 1, 0);
+        }
+        m[gid as usize] = text;
+    }
+
+    /// The index of `text` in [`Layout::texts`].
+    fn intern(&self, text: &str) -> u32 {
+        if text.is_empty() {
+            return 0;
+        }
+        let mut t = self.texts.borrow_mut();
+        if let Some(&k) = t.1.get(text) {
+            return k;
+        }
+        let k = t.0.len() as u32;
+        t.0.push(text.to_string());
+        t.1.insert(text.to_string(), k);
+        k
     }
 }
 
@@ -498,6 +552,7 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         .clone()
         .or_else(|| doc.front_matter.as_deref().and_then(front_matter::language))
         .or_else(|| o.default_lang.clone());
+    let mut known_lang = None;
     if let Some(lang) = lang {
         if !hyphenate::valid_tag(&lang) {
             l.warnings.push(format!(
@@ -506,11 +561,13 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
             ));
         } else if let Some(p) = hyphenate::for_language(&lang) {
             l.hyph = Some(p);
+            known_lang = Some(lang);
         } else {
             l.warnings.push(format!(
                 "there are no hyphenation patterns for the language '{lang}', so text is not \
                  hyphenated (only English is hyphenated so far)"
             ));
+            known_lang = Some(lang);
         }
     }
     // Lay the document out twice: once to find where pages may break, and
@@ -529,6 +586,7 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         l.restart(plan);
         content(&mut l);
     }
+    l.unmark();
     if o.page_numbers {
         l.number_pages();
     }
@@ -560,6 +618,9 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
         warnings: l.warnings,
         fonts: o.fonts.clone(),
         used: l.used.into_inner(),
+        marked: std::mem::take(&mut l.tags.marked),
+        structure: l.tags.finish(),
+        lang: known_lang,
     }
 }
 
@@ -648,6 +709,73 @@ fn nums(out: &mut Vec<u8>, vs: &[f32]) {
     for v in vs {
         num(out, *v);
         out.push(b' ');
+    }
+}
+
+/// Draw glyphs of `face` (in visual order), with the text each stands for
+/// (in `texts`) wherever the font's Unicode map (`mapped`: each glyph's
+/// text in the ToUnicode map) does not give it, as the `ActualText` of a
+/// span holding just that glyph, so that readers still put the text in
+/// order themselves. That is a hyphen shown where a line breaks at a
+/// hyphenation point (a soft hyphen), a glyph that stands for other text
+/// elsewhere, and a character no font has (glyph 0, `.notdef`), which is
+/// drawn as the outline of a box, as PDF/A does not allow `.notdef` to be
+/// shown, with an invisible space in it: readers take the text of glyphs,
+/// not of paths.
+#[allow(clippy::too_many_arguments)]
+fn draw_glyphs(
+    ops: &mut Vec<u8>,
+    texts: &[String],
+    mapped: &[u32],
+    font: &crate::ttf::Face,
+    face: FaceId,
+    size: f32,
+    (x, y): (f32, f32),
+    c: Color,
+    glyphs: &[G],
+) {
+    let width = |g: u16| font.advance_1000(g);
+    let text = |g: &G| texts[g.text as usize].as_str();
+    let special = |g: &G| g.id == 0 || mapped.get(g.id as usize).copied().unwrap_or(0) != g.text;
+    if !glyphs.iter().any(special) {
+        glyph_ops(ops, face, size, x, y, c, glyphs, width);
+        return;
+    }
+    let at = |pen: f32| x + pen * size / 1000.0;
+    // The first glyph not drawn yet, and the pen before it and now.
+    let (mut start, mut start_pen, mut pen) = (0, 0.0, 0.0);
+    for (k, g) in glyphs.iter().enumerate() {
+        if special(g) {
+            if k > start {
+                glyph_ops(ops, face, size, at(start_pen), y, c, &glyphs[start..k], width);
+            }
+            tags::begin_actual_text(ops, text(g));
+            if g.id == 0 {
+                let w = if g.adv > 0.0 { g.adv } else { 500.0 } * size / 1000.0;
+                let (bx, by) = (at(pen + g.dx), y + g.dy * size / 1000.0);
+                nums(ops, &[c.0, c.1, c.2]);
+                ops.extend_from_slice(b"RG ");
+                num(ops, size * 0.05);
+                ops.extend_from_slice(b" w ");
+                nums(ops, &[bx + w * 0.12, by, w * 0.76, size * 0.68]);
+                ops.extend_from_slice(b"re S\n");
+                if let Some(space) = font.glyph(' ') {
+                    let _ = write!(ops, "BT 3 Tr /F{face} ");
+                    num(ops, size);
+                    ops.extend_from_slice(b" Tf ");
+                    nums(ops, &[bx, by]);
+                    let _ = writeln!(ops, "Td <{space:04X}> Tj 0 Tr ET");
+                }
+            } else {
+                glyph_ops(ops, face, size, at(pen), y, c, std::slice::from_ref(g), width);
+            }
+            ops.extend_from_slice(b"EMC\n");
+            (start, start_pen) = (k + 1, pen + g.adv);
+        }
+        pen += g.adv;
+    }
+    if start < glyphs.len() {
+        glyph_ops(ops, face, size, at(start_pen), y, c, &glyphs[start..], width);
     }
 }
 
@@ -1275,7 +1403,18 @@ impl Layout<'_> {
                 if c != ' ' {
                     self.missing.borrow_mut().insert(c);
                 }
-                items.push((self.fonts().primary(mono, bold, italic), 0, c));
+                let face = self.fonts().primary(mono, bold, italic);
+                // The box drawn for it holds an invisible space, which
+                // carries its text (see `draw_glyphs`).
+                if let Some(space) = self.fonts().faces[face].glyph(' ') {
+                    let entry = &mut self.used.borrow_mut()[face];
+                    let entry = entry.entry(space).or_default();
+                    if entry.is_empty() {
+                        *entry = " ".into();
+                        self.map_glyph(face, space, self.intern(" "));
+                    }
+                }
+                items.push((face, 0, c));
             }
         }
     }
@@ -1306,6 +1445,7 @@ impl Layout<'_> {
             })
             .collect();
         font.substitute(script, &mut glyphs);
+        let mut texts = Vec::with_capacity(glyphs.len());
         let mut used = self.used.borrow_mut();
         for (k, g) in glyphs.iter().enumerate() {
             // The first glyph of a cluster represents all of its characters.
@@ -1325,9 +1465,12 @@ impl Layout<'_> {
             } else {
                 String::new()
             };
+            let id = self.intern(&text);
+            texts.push(id);
             let entry = used[face].entry(g.id).or_default();
-            if entry.is_empty() {
+            if entry.is_empty() && !text.is_empty() {
                 *entry = text;
+                self.map_glyph(face, g.id, id);
             }
         }
         drop(used);
@@ -1364,11 +1507,13 @@ impl Layout<'_> {
             let out: Vec<G> = ids
                 .iter()
                 .zip(pos)
-                .map(|(&id, p)| G {
+                .zip(&texts)
+                .map(|((&id, p), &text)| G {
                     id,
                     adv: p.x_advance as f32 * scale,
                     dx: p.x_offset as f32 * scale,
                     dy: p.y_offset as f32 * scale,
+                    text,
                 })
                 .collect();
             let width = out.iter().map(|g| g.adv).sum::<f32>() * size / 1000.0;
@@ -1377,11 +1522,13 @@ impl Layout<'_> {
         let mut out: Vec<G> = glyphs
             .iter()
             .zip(&marks)
-            .map(|(g, &mark)| G {
+            .zip(&texts)
+            .map(|((g, &mark), &text)| G {
                 id: g.id,
                 adv: if mark { 0.0 } else { font.advance_1000(g.id) },
                 dx: 0.0,
                 dy: 0.0,
+                text,
             })
             .collect();
         // Kerning between neighbouring glyphs, looking past marks.
@@ -1488,23 +1635,6 @@ impl Layout<'_> {
         out
     }
 
-    /// Put runs from [`Layout::shape_levels`] into visual order (UAX #9
-    /// rule L2), turning right-to-left runs around.
-    fn visual_runs(&self, runs: LevelRuns) -> Runs {
-        let levels: Vec<u8> = runs.iter().map(|r| r.0).collect();
-        let mut slots: Vec<Option<_>> = runs.into_iter().map(Some).collect();
-        bidi::visual_order(&levels)
-            .into_iter()
-            .filter_map(|k| slots[k].take())
-            .map(|(level, face, glyphs, w)| {
-                if level % 2 == 0 {
-                    return (face, glyphs, w);
-                }
-                (face, right_to_left(&glyphs), w)
-            })
-            .collect()
-    }
-
     fn measure(&self, text: &str, mono: bool, bold: bool, italic: bool, size: f32) -> f32 {
         self.shape(text, mono, bold, italic, size)
             .iter()
@@ -1512,19 +1642,79 @@ impl Layout<'_> {
             .sum()
     }
 
-    fn show_runs(&mut self, runs: &Runs, size: f32, x: f32, y: f32, c: Color) {
+    /// Draw glyphs, given in visual order, as content of the structure
+    /// element `elem` (see [`draw_glyphs`]).
+    #[allow(clippy::too_many_arguments)]
+    fn show(&mut self, elem: usize, face: FaceId, size: f32, x: f32, y: f32, c: Color, glyphs: &[G]) {
+        self.mark(elem);
+        let fonts = self.o.fonts.clone();
+        let (texts, mapped) = (self.texts.borrow(), self.mapped.borrow());
+        let page = self.pages.len() - 1;
+        let ops = &mut self.pages[page].ops;
+        draw_glyphs(
+            ops,
+            &texts.0,
+            &mapped[face],
+            &fonts.faces[face],
+            face,
+            size,
+            (x, y),
+            c,
+            glyphs,
+        );
+    }
+
+    /// Draw a line of runs from [`Layout::shape_levels`] from `x` on, as
+    /// content of `elem`, in visual order (UAX #9 rule L2), with
+    /// right-to-left runs turned around.
+    #[allow(clippy::too_many_arguments)]
+    fn show_levels(&mut self, elem: usize, runs: &LevelRuns, size: f32, x: f32, y: f32, c: Color) {
         if !self.drawing() {
             return;
         }
+        let levels: Vec<u8> = runs.iter().map(|r| r.0).collect();
         let mut x = x;
-        for (face, glyphs, w) in runs {
-            let fonts = self.o.fonts.clone();
-            let font = &fonts.faces[*face];
-            glyph_ops(&mut self.page().ops, *face, size, x, y, c, glyphs, |g| {
-                font.advance_1000(g)
-            });
+        for k in bidi::visual_order(&levels) {
+            let (level, face, glyphs, w) = &runs[k];
+            if level % 2 == 1 {
+                self.show(elem, *face, size, x, y, c, &right_to_left(glyphs));
+            } else {
+                self.show(elem, *face, size, x, y, c, glyphs);
+            }
             x += w;
         }
+    }
+
+    /// Mark what is drawn next on the current page as content of the
+    /// structure element `elem`.
+    fn mark(&mut self, elem: usize) {
+        let page = self.pages.len() - 1;
+        self.tags.mark(&mut self.pages[page].ops, page, elem);
+    }
+
+    /// Mark what is drawn next on the current page as an artifact.
+    fn mark_artifact(&mut self) {
+        let page = self.pages.len() - 1;
+        self.tags.artifact(&mut self.pages[page].ops);
+    }
+
+    /// End the marked content open on the current page.
+    fn unmark(&mut self) {
+        let page = self.pages.len() - 1;
+        self.tags.close(&mut self.pages[page].ops);
+    }
+
+    /// The `Link` element for text linking to `url` in the element
+    /// `parent`: that of the text before, if it links there too.
+    fn link_elem(&mut self, url: &Rc<str>, parent: usize) -> usize {
+        if let Some((u, e, p)) = &self.last_link {
+            if u == url && *p == parent {
+                return *e;
+            }
+        }
+        let e = self.tags.add(parent, "Link");
+        self.last_link = Some((url.clone(), e, parent));
+        e
     }
 
     fn top(&self) -> f32 {
@@ -1544,6 +1734,7 @@ impl Layout<'_> {
     }
 
     fn new_page(&mut self) {
+        self.unmark();
         self.page_ends.push(self.y);
         self.pages.push(Page::default());
         self.y = self.top();
@@ -1566,6 +1757,8 @@ impl Layout<'_> {
         self.headings.clear();
         self.anchors.clear();
         self.slug_counts.clear();
+        self.tags = Tagger::default();
+        self.last_link = None;
     }
 
     fn gap(&mut self, h: f32) {
@@ -1637,10 +1830,12 @@ impl Layout<'_> {
         self.at_top = false;
     }
 
+    /// Fill a rectangle, as an artifact (a background).
     fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, c: Color) {
         if !self.drawing() {
             return;
         }
+        self.mark_artifact();
         let ops = &mut self.page().ops;
         nums(ops, &[c.0, c.1, c.2]);
         ops.extend_from_slice(b"rg ");
@@ -1648,10 +1843,12 @@ impl Layout<'_> {
         ops.extend_from_slice(b"re f\n");
     }
 
+    /// Stroke a line, as an artifact (a rule).
     fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, c: Color) {
         if !self.drawing() {
             return;
         }
+        self.mark_artifact();
         let ops = &mut self.page().ops;
         nums(ops, &[c.0, c.1, c.2]);
         ops.extend_from_slice(b"RG ");
@@ -1977,7 +2174,13 @@ impl Layout<'_> {
     fn hyphen(&self, st: &TextStyle, level: u8) -> Option<Frag> {
         let (mono, bold, italic) = (st.style.code, st.style.bold, st.style.italic);
         let runs = self.shape("-", mono, bold, italic, st.size);
-        let (face, glyphs, w) = runs.into_iter().next()?;
+        let (face, mut glyphs, w) = runs.into_iter().next()?;
+        // It stands for the soft hyphen of the text (or the hyphenation
+        // point), as a hyphen shown only where a line breaks.
+        let soft = self.intern("\u{AD}");
+        for g in &mut glyphs {
+            g.text = soft;
+        }
         Some(st.frag(glyphs, w, face, level))
     }
 
@@ -2190,13 +2393,23 @@ impl Layout<'_> {
             }
             frags.push((*x, f.clone()));
         }
-        if frags.iter().any(|(_, f)| f.level > 0) {
-            frags = self.reorder(frags);
+        // Where each frag goes: placed left to right in visual order (UAX
+        // #9 rule L2), from the first one's place.
+        let levels: Vec<u8> = frags.iter().map(|(_, f)| f.level).collect();
+        let order = bidi::visual_order(&levels);
+        let mut xs: Vec<f32> = frags.iter().map(|(fx, _)| *fx).collect();
+        if levels.iter().any(|&l| l > 0) {
+            let mut at = frags.first().map_or(0.0, |f| f.0);
+            for &k in &order {
+                xs[k] = at;
+                at += frags[k].1.width;
+            }
         }
-        for (fx, f) in &frags {
+        for &k in &order {
+            let f = &frags[k].1;
             if f.code {
                 self.fill_rect(
-                    x + fx - 1.5,
+                    x + xs[k] - 1.5,
                     baseline - f.size * 0.28,
                     f.width + 3.0,
                     f.size * 1.2,
@@ -2204,22 +2417,41 @@ impl Layout<'_> {
                 );
             }
         }
-        for (fx, f) in &frags {
-            let fx = x + fx;
+        // Linked text goes to a `Link` element, found in logical order.
+        // The text is drawn in visual order, which is what readers expect
+        // (they reorder right-to-left text themselves), and placed in its
+        // elements in logical order.
+        self.tags.next_place();
+        let parent = self.tags.current();
+        let mut elems = vec![parent; frags.len()];
+        for (k, (_, f)) in frags.iter().enumerate() {
+            self.tags.place(k as u32);
+            elems[k] = match &f.link {
+                Some(url) => self.link_elem(url, parent),
+                None => {
+                    if !f.glyphs.is_empty() {
+                        self.last_link = None;
+                    }
+                    parent
+                }
+            };
+        }
+        for &k in &order {
+            let f = &frags[k].1;
             if !f.glyphs.is_empty() {
-                let fonts = self.o.fonts.clone();
-                let font = &fonts.faces[f.face];
-                glyph_ops(
-                    &mut self.page().ops,
-                    f.face,
-                    f.size,
-                    fx,
-                    baseline,
-                    f.color,
-                    &f.glyphs,
-                    |g| font.advance_1000(g),
-                );
+                self.tags.place(k as u32);
+                let fx = x + xs[k];
+                if f.level % 2 == 1 {
+                    let turned = right_to_left(&f.glyphs);
+                    self.show(elems[k], f.face, f.size, fx, baseline, f.color, &turned);
+                } else {
+                    self.show(elems[k], f.face, f.size, fx, baseline, f.color, &f.glyphs);
+                }
             }
+        }
+        for &k in &order {
+            self.tags.place(k as u32);
+            let (f, fx) = (&frags[k].1, x + xs[k]);
             if f.strike {
                 let sy = baseline + f.size * 0.3;
                 self.stroke_line(fx, sy, fx + f.width, sy, f.size * 0.06, f.color);
@@ -2235,6 +2467,8 @@ impl Layout<'_> {
                     Some(a) => Target::Anchor(a.to_string()),
                     None => Target::Uri(url.to_string()),
                 };
+                let elem = elems[k];
+                let page_index = self.pages.len() - 1;
                 let page = self.page();
                 // Merge with the previous area when it continues the same link.
                 if let Some(prev) = page.links.last_mut() {
@@ -2242,33 +2476,21 @@ impl Layout<'_> {
                         (Target::Uri(a), Target::Uri(b)) | (Target::Anchor(a), Target::Anchor(b)) => a == b,
                         _ => false,
                     };
-                    if same && (prev.rect[1] - rect[1]).abs() < 0.01 && rect[0] - prev.rect[2] < f.size {
+                    if same
+                        && prev.elem == elem
+                        && (prev.rect[1] - rect[1]).abs() < 0.01
+                        && rect[0] - prev.rect[2] < f.size
+                    {
                         prev.rect[2] = rect[2];
                         continue;
                     }
                 }
-                page.links.push(LinkArea { rect, target });
+                page.links.push(LinkArea { rect, target, elem });
+                let index = page.links.len() - 1;
+                self.tags.add_link(elem, page_index, index);
             }
         }
-    }
-
-    /// Put the frags of a line, in logical order, into visual order (UAX #9
-    /// rule L2), turning right-to-left frags around.
-    fn reorder(&self, frags: Vec<(f32, Frag)>) -> Vec<(f32, Frag)> {
-        let levels: Vec<u8> = frags.iter().map(|(_, f)| f.level).collect();
-        let mut x = frags.first().map_or(0.0, |f| f.0);
-        let mut slots: Vec<Option<Frag>> = frags.into_iter().map(|(_, f)| Some(f)).collect();
-        let mut out = Vec::with_capacity(slots.len());
-        for k in bidi::visual_order(&levels) {
-            let Some(mut f) = slots[k].take() else { continue };
-            if f.level % 2 == 1 {
-                f.glyphs = right_to_left(&f.glyphs);
-            }
-            let w = f.width;
-            out.push((x, f));
-            x += w;
-        }
-        out
+        self.tags.next_place();
     }
 
     fn draw_marker(&mut self, baseline: f32) {
@@ -2278,16 +2500,18 @@ impl Layout<'_> {
         }
         match m.kind {
             MarkerKind::Text(t) => {
-                let runs = self.visual_runs(self.shape_levels(&t, false, false, false, m.size, Some(m.rtl)));
-                let w: f32 = runs.iter().map(|r| r.2).sum();
+                let runs = self.shape_levels(&t, false, false, false, m.size, Some(m.rtl));
+                let w: f32 = runs.iter().map(|r| r.3).sum();
                 let x = if m.rtl { m.edge } else { m.edge - w };
-                self.show_runs(&runs, m.size, x, baseline, m.color);
+                self.show_levels(m.lbl, &runs, m.size, x, baseline, m.color);
             }
             MarkerKind::Check(checked) => {
                 let s = m.size * 0.72;
                 let x = if m.rtl { m.edge } else { m.edge - s };
                 let y = baseline - m.size * 0.05;
+                self.mark(m.lbl);
                 let ops = &mut self.page().ops;
+                tags::begin_actual_text(ops, if checked { "\u{2611}" } else { "\u{2610}" });
                 nums(ops, &[m.color.0, m.color.1, m.color.2]);
                 ops.extend_from_slice(b"RG 0.8 w ");
                 nums(ops, &[x, y, s, s]);
@@ -2302,6 +2526,7 @@ impl Layout<'_> {
                     nums(ops, &[x + s * 0.82, y + s * 0.85]);
                     ops.extend_from_slice(b"l S\n");
                 }
+                self.page().ops.extend_from_slice(b"EMC\n");
             }
         }
     }
@@ -2431,6 +2656,15 @@ impl Layout<'_> {
         self.draw_marker(self.y - self.o.font_size);
         let y = self.y - h - 2.0;
         if self.drawing() {
+            // An image without a description is decoration.
+            let alt = alt.trim();
+            if alt.is_empty() {
+                self.mark_artifact();
+            } else {
+                let figure = self.tags.add(self.tags.current(), "Figure");
+                self.tags.elems[figure].alt = Some(alt.to_string());
+                self.mark(figure);
+            }
             let ops = &mut self.page().ops;
             ops.extend_from_slice(b"q ");
             nums(ops, &[w, 0.0, 0.0, h, ctx.x, y]);
@@ -2449,7 +2683,9 @@ impl Layout<'_> {
                 Block::Heading { level, text } => self.heading(*level, text, ctx),
                 Block::Paragraph(raw) => {
                     let inl = inline::parse(raw, self.refs);
+                    self.tags.begin("P");
                     self.text_block(&inl, fs, ctx, false, true);
+                    self.tags.end();
                     self.gap(para_gap);
                 }
                 Block::Code(lines) => {
@@ -2525,7 +2761,10 @@ impl Layout<'_> {
         // Keep the heading's lines together, and with the text after it.
         let keep = std::mem::replace(&mut self.keep, FORBID);
         self.next_penalty = Some(FORBID);
+        self.tags
+            .begin(["H1", "H2", "H3", "H4", "H5", "H6"][(level.clamp(1, 6) - 1) as usize]);
         self.text_block(&inl, size, Ctx { color, ..ctx }, true, false);
+        self.tags.end();
         self.keep = keep;
         self.next_penalty = Some(FORBID);
         if level <= 2 {
@@ -2551,6 +2790,7 @@ impl Layout<'_> {
         let avail = (ctx.w - 2.0 * pad).max(size);
 
         self.may_break(0.0);
+        let code = self.tags.begin("Code");
         let top_y = self.y;
         self.fill_rect(ctx.x, top_y - pad, ctx.w, pad, CODE_BG);
         self.draw_marker(top_y - pad - lh / 2.0 - size * 0.26);
@@ -2577,8 +2817,8 @@ impl Layout<'_> {
             if self.drawing() {
                 self.fill_rect(ctx.x, self.y - lh, ctx.w, lh + 0.3, CODE_BG);
                 let baseline = self.y - lh / 2.0 - size * 0.26;
-                let runs = self.visual_runs(std::mem::take(chunk));
-                self.show_runs(&runs, size, ctx.x + pad, baseline, ctx.color);
+                let runs = std::mem::take(chunk);
+                self.show_levels(code, &runs, size, ctx.x + pad, baseline, ctx.color);
             }
             self.y -= lh;
         }
@@ -2586,6 +2826,7 @@ impl Layout<'_> {
         self.keep_laidout(slot, Laidout::Code(chunks));
         self.fill_rect(ctx.x, self.y - pad, ctx.w, pad + 0.3, CODE_BG);
         self.y -= pad;
+        self.tags.end();
     }
 
     /// Shape the lines of a code block, and wrap long lines at the glyph
@@ -2638,7 +2879,9 @@ impl Layout<'_> {
         let keep = self.keep;
         self.keep += IN_QUOTE;
         self.next_penalty = Some(FORBID);
+        self.tags.begin("BlockQuote");
         self.blocks(inner, child);
+        self.tags.end();
         self.keep = keep;
         self.pending_gap = 0.0;
         let end = (self.pages.len() - 1, self.y);
@@ -2654,11 +2897,23 @@ impl Layout<'_> {
             let top = if p == start.0 { start.1 } else { self.top() };
             let bot = if p == end.0 { end.1 } else { self.page_ends[p] };
             if top - bot > 0.5 {
+                // The bar is an artifact. Earlier pages are finished, with
+                // nothing left open.
+                let last = p + 1 == self.pages.len();
+                if last {
+                    self.mark_artifact();
+                }
                 let ops = &mut self.pages[p].ops;
+                if !last {
+                    ops.extend_from_slice(b"/Artifact BMC\n");
+                }
                 nums(ops, &[RULE.0, RULE.1, RULE.2]);
                 ops.extend_from_slice(b"rg ");
                 nums(ops, &[bar_x, bot, 2.5, top - bot]);
                 ops.extend_from_slice(b"re f\n");
+                if !last {
+                    ops.extend_from_slice(b"EMC\n");
+                }
             }
         }
     }
@@ -2684,6 +2939,15 @@ impl Layout<'_> {
             list_depth: ctx.list_depth + 1,
             ..ctx
         };
+        let list = self.tags.begin("L");
+        self.tags.elems[list].attrs = format!(
+            "/O /List /ListNumbering /{}",
+            match (ordered, items.iter().any(|i| i.task.is_some())) {
+                (true, _) => "Decimal",
+                (false, true) => "None",
+                (false, false) => "Disc",
+            }
+        );
         for (k, item) in items.iter().enumerate() {
             // Right-to-left items are indented from the right, with the
             // marker on that side.
@@ -2694,8 +2958,11 @@ impl Layout<'_> {
                 None if ordered => MarkerKind::Text(format!("{}.", start.saturating_add(k as u64))),
                 None => MarkerKind::Text(bullet.to_string()),
             };
+            self.tags.begin("LI");
+            let lbl = self.tags.add(self.tags.current(), "Lbl");
             self.marker = Some(Marker {
                 kind,
+                lbl,
                 edge: if rtl {
                     ctx.x + ctx.w - indent + fs * 0.45
                 } else {
@@ -2710,12 +2977,16 @@ impl Layout<'_> {
                 self.penalize_next(keep + BETWEEN_ITEMS);
             }
             self.keep += IN_ITEM;
+            self.tags.begin("LBody");
             self.blocks(&item.blocks, child);
+            self.tags.end();
+            self.tags.end();
             self.keep = keep;
             if !tight {
                 self.gap(fs * 0.75);
             }
         }
+        self.tags.end();
     }
 
     fn table(&mut self, aligns: &[Align], header: &[String], rows: &[Vec<String>], ctx: Ctx) {
@@ -2735,6 +3006,24 @@ impl Layout<'_> {
         self.may_break(0.0);
         self.draw_marker(self.y - fs);
         self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, 0.8, RULE);
+        // The first row is the header, whose cells head their columns.
+        let table = self.tags.begin("Table");
+        let cell_elems: Vec<Vec<usize>> = grid
+            .iter()
+            .enumerate()
+            .map(|(r, cells)| {
+                let tr = self.tags.add(table, "TR");
+                (0..cells.len())
+                    .map(|_| {
+                        let cell = self.tags.add(tr, if r == 0 { "TH" } else { "TD" });
+                        if r == 0 {
+                            self.tags.elems[cell].attrs = "/O /Table /Scope /Column".into();
+                        }
+                        cell
+                    })
+                    .collect()
+            })
+            .collect();
         let text_h = self.top() - self.bottom();
         for (r, cells) in grid.iter().enumerate() {
             let nlines = cells.iter().map(|c| c.0.len()).max().unwrap_or(0).max(1);
@@ -2776,7 +3065,9 @@ impl Layout<'_> {
                             Align::None if *rtl => slack,
                             _ => 0.0,
                         };
+                        self.tags.enter(cell_elems[r][c]);
                         self.draw_line(line, x + pad + off, lh);
+                        self.tags.end();
                     }
                     x += widths[c] + 2.0 * pad;
                 }
@@ -2789,6 +3080,7 @@ impl Layout<'_> {
             let (lw, color) = if bg { (0.8, MUTED) } else { (0.5, RULE) };
             self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, lw, color);
         }
+        self.tags.end();
         self.keep_laidout(slot, Laidout::Table(widths, table_w, grid));
     }
 
@@ -3028,6 +3320,27 @@ impl Layout<'_> {
         self.may_break(0.0);
         self.draw_marker(self.y - fs);
         self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, 0.8, RULE);
+        // Keys head the rows they span.
+        let table = self.tags.begin("Table");
+        let mut cell_elems = vec![0; t.cells.len()];
+        for r in 0..t.rows {
+            let tr = self.tags.add(table, "TR");
+            for (i, c) in t.cells.iter().enumerate().filter(|(_, c)| c.row == r) {
+                let cell = self.tags.add(tr, if c.key { "TH" } else { "TD" });
+                let mut attrs = String::from("/O /Table");
+                if c.key {
+                    attrs.push_str(" /Scope /Row");
+                }
+                if c.rows > 1 {
+                    attrs.push_str(&format!(" /RowSpan {}", c.rows));
+                }
+                if c.cols > 1 {
+                    attrs.push_str(&format!(" /ColSpan {}", c.cols));
+                }
+                self.tags.elems[cell].attrs = attrs;
+                cell_elems[i] = cell;
+            }
+        }
         for r in 0..t.rows {
             let slots = first[r]..first[r + 1];
             self.may_break(match r {
@@ -3047,7 +3360,9 @@ impl Layout<'_> {
                     let last = c.col + c.cols - 1;
                     let w = x_at[last] + widths[last] - x_at[c.col];
                     let off = if *rtl { (w - line.width).max(0.0) } else { 0.0 };
+                    self.tags.enter(cell_elems[i]);
                     self.draw_line(line, x_at[c.col] + pad + off, lh);
+                    self.tags.end();
                 }
                 self.y -= lh;
             }
@@ -3059,6 +3374,7 @@ impl Layout<'_> {
             };
             self.stroke_line(x0, self.y, ctx.x + table_w, self.y, lw, RULE);
         }
+        self.tags.end();
     }
 
     fn number_pages(&mut self) {
@@ -3069,13 +3385,25 @@ impl Layout<'_> {
             let runs = self.shape(&(i + 1).to_string(), false, false, false, size);
             let w: f32 = runs.iter().map(|r| r.2).sum();
             let mut x = (self.o.page_width - w) / 2.0;
+            let (texts, mapped) = (self.texts.borrow(), self.mapped.borrow());
+            let ops = &mut self.pages[i].ops;
+            ops.extend_from_slice(b"/Artifact <</Type /Pagination /Subtype /Footer>> BDC\n");
             for (face, glyphs, gw) in &runs {
                 let font = &self.o.fonts.faces[*face];
-                glyph_ops(&mut self.pages[i].ops, *face, size, x, y, MUTED, glyphs, |g| {
-                    font.advance_1000(g)
-                });
+                draw_glyphs(
+                    ops,
+                    &texts.0,
+                    &mapped[*face],
+                    font,
+                    *face,
+                    size,
+                    (x, y),
+                    MUTED,
+                    glyphs,
+                );
                 x += gw;
             }
+            ops.extend_from_slice(b"EMC\n");
         }
     }
 }

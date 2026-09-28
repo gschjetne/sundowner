@@ -1,49 +1,112 @@
-//! PDF 1.4 file serialization.
+//! PDF file serialization: tagged PDF 1.7, and PDF/A-2 where the document
+//! allows it (see [`crate::pdfa`]).
 
 use crate::flate;
 use crate::layout::{Output, Target};
+use crate::pdfa;
+use crate::tags::{text_string, Kid};
 use crate::ttf::Face;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
+/// Where an object is in the file.
+#[derive(Clone, Copy)]
+enum Place {
+    /// At a byte offset.
+    At(usize),
+    /// In an object stream, at an index.
+    In(usize, usize),
+}
+
+/// Objects per object stream.
+const PER_STREAM: usize = 200;
+
+/// Writes the objects of a PDF file. Streams are written as they come;
+/// other objects (dictionaries: pages, fonts, structure elements...) are
+/// kept and packed into compressed object streams at the end, which makes
+/// them several times smaller, and the cross-reference table is a
+/// compressed stream too (PDF 1.5).
 struct Writer {
     out: Vec<u8>,
-    offsets: Vec<usize>,
+    places: Vec<Place>,
+    /// Objects waiting for an object stream.
+    packed: Vec<(usize, String)>,
 }
 
 impl Writer {
     fn alloc(&mut self) -> usize {
-        self.offsets.push(0);
-        self.offsets.len() - 1
-    }
-
-    fn begin(&mut self, id: usize) {
-        self.offsets[id] = self.out.len();
-        let _ = writeln!(self.out, "{id} 0 obj");
+        self.places.push(Place::At(0));
+        self.places.len() - 1
     }
 
     fn obj(&mut self, id: usize, body: &str) {
-        self.begin(id);
-        self.out.extend_from_slice(body.as_bytes());
-        self.out.extend_from_slice(b"\nendobj\n");
+        self.packed.push((id, body.to_string()));
     }
 
     fn stream(&mut self, id: usize, dict: &str, data: &[u8]) {
-        self.begin(id);
-        let _ = write!(self.out, "<< {dict} /Length {} >>\nstream\n", data.len());
+        self.places[id] = Place::At(self.out.len());
+        let _ = write!(
+            self.out,
+            "{id} 0 obj\n<< {dict} /Length {} >>\nstream\n",
+            data.len()
+        );
         self.out.extend_from_slice(data);
         self.out.extend_from_slice(b"\nendstream\nendobj\n");
     }
-}
 
-/// Encode a text string as UTF-16BE hex, which PDF accepts for any Unicode text.
-fn text_string(s: &str) -> String {
-    let mut out = String::from("<FEFF");
-    for u in s.encode_utf16() {
-        out.push_str(&format!("{u:04X}"));
+    /// Write the object streams, and the cross-reference stream with the
+    /// trailer's entries (`/Root`, `/Info`), and end the file. The file
+    /// identifier is a hash of the file, so the same input still gives the
+    /// same file.
+    fn finish(mut self, trailer: &str) -> Vec<u8> {
+        let packed = std::mem::take(&mut self.packed);
+        for chunk in packed.chunks(PER_STREAM) {
+            let stm = self.alloc();
+            let (mut index, mut body) = (String::new(), String::new());
+            for (k, (id, obj)) in chunk.iter().enumerate() {
+                index.push_str(&format!("{id} {} ", body.len()));
+                body.push_str(obj);
+                body.push('\n');
+                self.places[*id] = Place::In(stm, k);
+            }
+            let data = flate::zlib_compress(format!("{index}\n{body}").as_bytes());
+            self.stream(
+                stm,
+                &format!(
+                    "/Type /ObjStm /N {} /First {} /Filter /FlateDecode",
+                    chunk.len(),
+                    index.len() + 1
+                ),
+                &data,
+            );
+        }
+        let id = format!("{:016X}{:016X}", fnv1a(&self.out, 0), fnv1a(&self.out, 1));
+        let xref = self.alloc();
+        let at = self.out.len();
+        self.places[xref] = Place::At(at);
+        // Rows of a type byte, 4 bytes of offset (or object stream) and 2
+        // of generation (or index).
+        let mut rows = vec![0, 0, 0, 0, 0, 0xFF, 0xFF];
+        for place in &self.places[1..] {
+            let (kind, a, b) = match *place {
+                Place::At(off) => (1u8, off as u32, 0u16),
+                Place::In(stm, k) => (2, stm as u32, k as u16),
+            };
+            rows.push(kind);
+            rows.extend_from_slice(&a.to_be_bytes());
+            rows.extend_from_slice(&b.to_be_bytes());
+        }
+        let size = self.places.len();
+        self.stream(
+            xref,
+            &format!(
+                "/Type /XRef /Size {size} /W [1 4 2] {trailer} /ID [<{id}> <{id}>] /Filter /FlateDecode"
+            ),
+            &flate::zlib_compress(&rows),
+        );
+        let _ = write!(self.out, "startxref\n{at}\n%%EOF\n");
+        self.out
     }
-    out.push('>');
-    out
 }
 
 /// Only web and mail links become clickable; other schemes (`javascript:`,
@@ -81,14 +144,20 @@ fn n(v: f32) -> String {
 pub fn write(doc: &Output, page_w: f32, page_h: f32) -> Vec<u8> {
     let mut w = Writer {
         out: Vec::new(),
-        offsets: vec![0],
+        places: vec![Place::At(0)],
+        packed: Vec::new(),
     };
-    w.out.extend_from_slice(b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+    w.out.extend_from_slice(b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n");
 
     let catalog = w.alloc();
     let pages_id = w.alloc();
     let info = w.alloc();
     let resources = w.alloc();
+    let struct_root = w.alloc();
+    let parent_tree = w.alloc();
+    let metadata = w.alloc();
+    let output_intent = w.alloc();
+    let profile = w.alloc();
     // Five objects per embedded face: Type0 font, CIDFont, descriptor,
     // font file and ToUnicode map.
     let fonts: Vec<(usize, [usize; 5])> = doc
@@ -110,6 +179,7 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32) -> Vec<u8> {
         Some(w.alloc())
     };
     let outline_ids: Vec<usize> = doc.headings.iter().map(|_| w.alloc()).collect();
+    let elem_ids: Vec<usize> = doc.structure.iter().map(|_| w.alloc()).collect();
 
     // Fonts and resources.
     for &(face, ids) in &fonts {
@@ -157,43 +227,87 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32) -> Vec<u8> {
         Some(format!("[{pid} 0 R /XYZ null {} null]", n(y)))
     };
 
-    // Pages, content streams and link annotations.
-    for (page, &(pid, cid)) in doc.pages.iter().zip(&page_ids) {
-        let mut annots = String::new();
-        for link in &page.links {
-            let action = match &link.target {
-                Target::Uri(u) if uri_allowed(u) => format!("/A << /S /URI /URI {} >>", uri_string(u)),
-                Target::Uri(_) => continue,
-                Target::Anchor(a) => {
-                    let found = doc
-                        .anchors
-                        .get(a.as_str())
-                        .or_else(|| doc.anchors.get(&a.to_lowercase()));
-                    match found.and_then(|&(p, y)| dest(p, y)) {
-                        Some(d) => format!("/Dest {d}"),
-                        None => continue,
+    // Link annotations: the action and description of each link area that
+    // becomes a link; the others (links to other schemes, or to anchors
+    // that do not exist) are left as plain text.
+    let links: Vec<Vec<Option<(String, String)>>> = doc
+        .pages
+        .iter()
+        .map(|page| {
+            page.links
+                .iter()
+                .map(|link| match &link.target {
+                    Target::Uri(u) if uri_allowed(u) => {
+                        Some((format!("/A << /S /URI /URI {} >>", uri_string(u)), u.clone()))
                     }
-                }
+                    Target::Uri(_) => None,
+                    Target::Anchor(a) => {
+                        let found = doc
+                            .anchors
+                            .get(a.as_str())
+                            .or_else(|| doc.anchors.get(&a.to_lowercase()));
+                        let &(p, y) = found?;
+                        let d = dest(p, y)?;
+                        // Described by the heading it leads to.
+                        let title = doc
+                            .headings
+                            .iter()
+                            .find(|h| h.page == p && h.y == y)
+                            .map_or_else(|| format!("#{a}"), |h| h.title.clone());
+                        Some((format!("/Dest {d}"), title))
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let annot_ids: Vec<Vec<Option<usize>>> = links
+        .iter()
+        .map(|page| page.iter().map(|l| l.as_ref().map(|_| w.alloc())).collect())
+        .collect();
+
+    // Keys of the parent tree: each page's marked content has the page's
+    // number, and each link annotation a number after those.
+    let mut next_key = doc.pages.len();
+    let mut annot_parents: Vec<(usize, usize)> = Vec::new();
+
+    // Pages, content streams and link annotations.
+    for (i, (page, &(pid, cid))) in doc.pages.iter().zip(&page_ids).enumerate() {
+        let mut annots = Vec::new();
+        for (k, link) in page.links.iter().enumerate() {
+            let (Some((action, desc)), Some(id)) = (&links[i][k], annot_ids[i][k]) else {
+                continue;
             };
             let r = link.rect;
-            annots.push_str(&format!(
-                "<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border [0 0 0] {action} >> ",
-                n(r[0]),
-                n(r[1]),
-                n(r[2]),
-                n(r[3])
-            ));
+            w.obj(
+                id,
+                &format!(
+                    "<< /Type /Annot /Subtype /Link /Rect [{} {} {} {}] /Border [0 0 0] /F 4 \
+                     /Contents {} /StructParent {next_key} {action} >>",
+                    n(r[0]),
+                    n(r[1]),
+                    n(r[2]),
+                    n(r[3]),
+                    text_string(desc)
+                ),
+            );
+            annot_parents.push((next_key, link.elem));
+            next_key += 1;
+            annots.push(format!("{id} 0 R"));
         }
         let annots = if annots.is_empty() {
             String::new()
         } else {
-            format!(" /Annots [{annots}]")
+            format!(" /Annots [{}] /Tabs /S", annots.join(" "))
+        };
+        let parents = match doc.marked.get(i) {
+            Some(m) if !m.is_empty() => format!(" /StructParents {i}"),
+            _ => String::new(),
         };
         w.obj(
             pid,
             &format!(
                 "<< /Type /Page /Parent {pages_id} 0 R /MediaBox [0 0 {} {}] /Resources {resources} 0 R \
-                 /Contents {cid} 0 R{annots} >>",
+                 /Contents {cid} 0 R{annots}{parents} >>",
                 n(page_w),
                 n(page_h)
             ),
@@ -277,38 +391,141 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32) -> Vec<u8> {
                 top.len()
             ),
         );
-        w.obj(
-            catalog,
-            &format!(
-                "<< /Type /Catalog /Pages {pages_id} 0 R /Outlines {root} 0 R /PageMode /UseOutlines >>"
-            ),
-        );
-    } else {
-        w.obj(catalog, &format!("<< /Type /Catalog /Pages {pages_id} 0 R >>"));
     }
 
-    let mut info_dict = format!(
-        "<< /Producer {}",
-        text_string(concat!("sundowner ", env!("CARGO_PKG_VERSION")))
+    write_structure(
+        &mut w,
+        doc,
+        &elem_ids,
+        &page_ids,
+        &annot_ids,
+        struct_root,
+        parent_tree,
     );
+    let mut tree = String::from("<< /Nums [");
+    for (i, m) in doc.marked.iter().enumerate().filter(|(_, m)| !m.is_empty()) {
+        let refs: Vec<String> = m.iter().map(|&e| format!("{} 0 R", elem_ids[e])).collect();
+        tree.push_str(&format!(" {i} [{}]", refs.join(" ")));
+    }
+    for &(key, elem) in &annot_parents {
+        tree.push_str(&format!(" {key} {} 0 R", elem_ids[elem]));
+    }
+    tree.push_str(" ] >>");
+    w.obj(parent_tree, &tree);
+
+    let level = pdfa::conformance(doc).ok();
+    let producer = concat!("sundowner ", env!("CARGO_PKG_VERSION"));
+    let xmp = pdfa::xmp(doc.title.as_deref(), doc.lang.as_deref(), producer, level);
+    // PDF/A wants the metadata unfiltered, so that it can be read without
+    // PDF tools.
+    w.stream(metadata, "/Type /Metadata /Subtype /XML", xmp.as_bytes());
+    w.obj(
+        output_intent,
+        &format!(
+            "<< /Type /OutputIntent /S /GTS_PDFA1 /OutputConditionIdentifier (sRGB IEC61966-2.1) \
+             /Info (sRGB IEC61966-2.1) /DestOutputProfile {profile} 0 R >>"
+        ),
+    );
+    w.stream(
+        profile,
+        "/N 3 /Filter /FlateDecode",
+        &flate::zlib_compress(&pdfa::srgb_profile()),
+    );
+
+    let mut cat = format!(
+        "<< /Type /Catalog /Pages {pages_id} 0 R /StructTreeRoot {struct_root} 0 R \
+         /MarkInfo << /Marked true >> /ViewerPreferences << /DisplayDocTitle true >> \
+         /Metadata {metadata} 0 R /OutputIntents [{output_intent} 0 R]"
+    );
+    if let Some(lang) = &doc.lang {
+        cat.push_str(&format!(" /Lang {}", text_string(lang)));
+    }
+    if let Some(root) = outline_root {
+        cat.push_str(&format!(" /Outlines {root} 0 R /PageMode /UseOutlines"));
+    }
+    cat.push_str(" >>");
+    w.obj(catalog, &cat);
+
+    let mut info_dict = format!("<< /Producer {}", text_string(producer));
     if let Some(t) = &doc.title {
         info_dict.push_str(&format!(" /Title {}", text_string(t)));
     }
     info_dict.push_str(" >>");
     w.obj(info, &info_dict);
 
-    // Cross-reference table and trailer.
-    let xref = w.out.len();
-    let size = w.offsets.len();
-    let _ = write!(w.out, "xref\n0 {size}\n0000000000 65535 f \n");
-    for off in &w.offsets[1..] {
-        let _ = writeln!(w.out, "{off:010} 00000 n ");
+    w.finish(&format!("/Root {catalog} 0 R /Info {info} 0 R"))
+}
+
+/// A 64-bit FNV-1a hash of `data`, varied by `seed`.
+fn fnv1a(data: &[u8], seed: u8) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ seed as u64;
+    for &b in data {
+        h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
     }
-    let _ = write!(
-        w.out,
-        "trailer\n<< /Size {size} /Root {catalog} 0 R /Info {info} 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+    h
+}
+
+/// Write the structure tree root and elements. Marked content on an
+/// element's own page (that of its first) is referred to by MCID alone.
+#[allow(clippy::too_many_arguments)]
+fn write_structure(
+    w: &mut Writer,
+    doc: &Output,
+    elem_ids: &[usize],
+    page_ids: &[(usize, usize)],
+    annot_ids: &[Vec<Option<usize>>],
+    struct_root: usize,
+    parent_tree: usize,
+) {
+    let next_key = doc.pages.len() + annot_ids.iter().flatten().flatten().count();
+    w.obj(
+        struct_root,
+        &format!(
+            "<< /Type /StructTreeRoot /K [{} 0 R] /ParentTree {parent_tree} 0 R /ParentTreeNextKey {next_key} >>",
+            elem_ids[0]
+        ),
     );
-    w.out
+    for (k, e) in doc.structure.iter().enumerate() {
+        let parent = if k == 0 { struct_root } else { elem_ids[e.parent] };
+        let mut d = format!("<< /Type /StructElem /S /{} /P {parent} 0 R", e.tag);
+        let own_page = e.kids.iter().find_map(|kid| match kid {
+            Kid::Content { page, .. } => Some(*page),
+            _ => None,
+        });
+        if let Some(p) = own_page {
+            d.push_str(&format!(" /Pg {} 0 R", page_ids[p].0));
+        }
+        let kids: Vec<String> = e
+            .kids
+            .iter()
+            .filter_map(|kid| match *kid {
+                Kid::Elem(c) => Some(format!("{} 0 R", elem_ids[c])),
+                Kid::Content { page, mcid } if Some(page) == own_page => Some(mcid.to_string()),
+                Kid::Content { page, mcid } => Some(format!(
+                    "<< /Type /MCR /Pg {} 0 R /MCID {mcid} >>",
+                    page_ids[page].0
+                )),
+                Kid::Link { page, index } => {
+                    let annot = annot_ids.get(page)?.get(index).copied().flatten()?;
+                    Some(format!(
+                        "<< /Type /OBJR /Obj {annot} 0 R /Pg {} 0 R >>",
+                        page_ids[page].0
+                    ))
+                }
+            })
+            .collect();
+        if !kids.is_empty() {
+            d.push_str(&format!(" /K [{}]", kids.join(" ")));
+        }
+        if let Some(alt) = &e.alt {
+            d.push_str(&format!(" /Alt {}", text_string(alt)));
+        }
+        if !e.attrs.is_empty() {
+            d.push_str(&format!(" /A << {} >>", e.attrs));
+        }
+        d.push_str(" >>");
+        w.obj(elem_ids[k], &d);
+    }
 }
 
 /// Embed one face as a subset Type0/CIDFontType2 font with Identity-H

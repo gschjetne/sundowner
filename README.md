@@ -212,6 +212,8 @@ anchors, aliases or complex keys.
 The PDF also gets a bookmark outline built from the headings, clickable links,
 page numbers and a document title. Only `http:`, `https:` and `mailto:` links
 and `#anchor` links become clickable; other links are shown as plain text.
+It is a tagged PDF, which screen readers can read, and a PDF/A file, for
+archiving; see *Tagged PDF* and *PDF/A* below.
 
 ## Design
 
@@ -222,9 +224,49 @@ and `#anchor` links become clickable; other links are shown as plain text.
   - Every font is embedded as a subset (Type 0 / CIDFontType2 with
     Identity-H encoding), so viewers never substitute fonts.
   - A ToUnicode map keeps copy-paste and search working.
-  - A one-word document is about 3 KB.
+  - A one-word document is about 4 KB.
   - Subset names are derived from their contents, so identical input gives
     byte-identical output.
+- **Tagged PDF.** The PDF carries the document's logical structure
+  (ISO 32000-1, 14.8), which screen readers, reflowing viewers and text
+  extraction follow: headings (`H1` to `H6`), paragraphs, lists (`L`,
+  `LI`, `Lbl`, `LBody`), tables (`TH` cells head their column, or their
+  row for front matter keys, with row and column spans), block quotes,
+  code blocks, figures with their alt text, and links, each tied to its
+  annotation. Every piece of page content is marked as part of an element
+  or as an artifact: backgrounds, rules, the bars of quotes and page
+  numbers are artifacts, and so is an image without alt text, as
+  decoration.
+
+  Lines are drawn in visual order, as readers expect: they put
+  right-to-left text in logical order themselves (pdftotext and MuPDF
+  read Hebrew correctly this way, and turn it around if it is given in
+  logical order, even as `ActualText`). The structure places the pieces
+  of a line in its elements in logical order, so a link in the middle of
+  a Hebrew sentence is read where it belongs. Where a glyph's Unicode
+  mapping would give the wrong text, that glyph carries its text as
+  `ActualText`: a hyphen added where a line breaks inside a word stands
+  for a soft hyphen (U+00AD), so search finds the whole word, and a
+  character that no font has, drawn as the outline of a box, keeps its
+  character. Ligatures already map back to their characters (see
+  *Ligatures* below).
+- **PDF/A.** Every PDF is also PDF/A-2 (ISO 19005-2), the archival form
+  of PDF: at level A (accessible), as it is tagged and all its text maps
+  to Unicode, or at level B where a font sets a character with several
+  glyphs, some of which stand for no text of their own. It holds XMP
+  metadata (the title, language and producer, as in its document
+  information) and an sRGB output intent with a 1 KB ICC profile that
+  sundowner generates. Its file identifier is a hash of its contents, so
+  identical input still gives byte-identical output. A CMYK JPEG cannot be
+  in a PDF/A file with RGB colours; such a PDF is not declared PDF/A, with
+  a warning. The example documents pass [veraPDF](https://verapdf.org)'s
+  PDF/A-2a validation.
+
+  They are not declared PDF/UA (ISO 14289), the standard for accessible
+  PDF, as that asks for more than a Markdown file guarantees, such as a
+  language and headings that do not skip levels. A document that has
+  those (and alt text for its images) passes veraPDF's PDF/UA-1 checks,
+  apart from the declaration.
 - **Bidirectional text.** Hebrew and other right-to-left text is laid out
   with the Unicode Bidirectional Algorithm
   ([UAX #9](https://www.unicode.org/reports/tr9/), Unicode 17.0) in full,
@@ -356,7 +398,10 @@ and `#anchor` links become clickable; other links are shown as plain text.
   and each block coded with Huffman codes built for it (length-limited by
   package-merge), the fixed code, or stored, whichever is smallest. It
   compresses as well as zlib at its highest level, to within a fraction
-  of a percent.
+  of a percent. The other objects (pages, fonts, the structure tree) are
+  packed into compressed object streams, with a compressed
+  cross-reference stream (PDF 1.5), which keeps the structure tree from
+  adding more than about 6 % to a document.
 - **Crash-proof.**
   - No `unsafe` code.
   - Nesting depth is capped.
