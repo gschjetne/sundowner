@@ -193,6 +193,10 @@ impl Tagger {
 
     /// End the marked content that is open, before the page ends or other
     /// content is written to it out of order.
+    ///
+    /// This writes one `EMC`, so spans nested in the open sequence (see
+    /// [`begin_actual_text`]) must have been ended by then; `draw_glyphs`
+    /// ends each right after its glyph.
     pub fn close(&mut self, ops: &mut Vec<u8>) {
         if self.open != Open::Nothing {
             ops.extend_from_slice(b"EMC\n");

@@ -56,8 +56,9 @@ impl Writer {
 
     /// Write the object streams, and the cross-reference stream with the
     /// trailer's entries (`/Root`, `/Info`), and end the file. The file
-    /// identifier is a hash of the file, so the same input still gives the
-    /// same file.
+    /// identifier is a hash of the file up to the cross-reference stream,
+    /// which holds it (so it cannot hash itself): the same input still
+    /// gives the same file.
     fn finish(mut self, trailer: &str) -> Vec<u8> {
         let packed = std::mem::take(&mut self.packed);
         for chunk in packed.chunks(PER_STREAM) {

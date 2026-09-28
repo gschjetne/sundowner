@@ -1129,6 +1129,31 @@ fn documents_are_pdfa_and_tagged() {
 }
 
 #[test]
+fn images_with_alt_text_are_figures_and_others_artifacts() {
+    let o = Options {
+        base_dir: Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples")),
+        page_numbers: false,
+        ..Options::default()
+    };
+    let out = layout::layout(
+        &markdown::parse("![A sunset](sunset.png)\n\n![](sunset.png)\n"),
+        &o,
+    );
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let figures: Vec<_> = out.structure.iter().filter(|e| e.tag == "Figure").collect();
+    assert_eq!(figures.len(), 1);
+    assert_eq!(figures[0].alt.as_deref(), Some("A sunset"));
+    // The second image is drawn as an artifact.
+    let ops = String::from_utf8_lossy(&out.pages[0].ops).to_string();
+    let second = ops.rfind("/Im0 Do").unwrap();
+    let before = &ops[..second];
+    assert!(
+        before.rfind("/Artifact BMC").unwrap() > before.rfind("/Figure <<").unwrap(),
+        "{ops}"
+    );
+}
+
+#[test]
 fn cmyk_images_are_not_pdfa() {
     let dir = std::env::temp_dir().join(format!("sundowner-cmyk-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

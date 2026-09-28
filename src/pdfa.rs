@@ -12,6 +12,11 @@ use crate::layout::Output;
 
 /// The PDF/A conformance level a document reaches (`'A'` or `'B'`), or why
 /// it is not PDF/A.
+///
+/// Every document is tagged, with all its content marked, so level A turns
+/// on whether every glyph maps to Unicode. It is not PDF/UA, which asks
+/// more (a language, headings that do not skip levels), and is not
+/// declared.
 pub fn conformance(doc: &Output) -> Result<char, String> {
     if doc.images.iter().any(|img| img.dict.contains("/DeviceCMYK")) {
         return Err("it has a CMYK image, and its colours are RGB".into());
