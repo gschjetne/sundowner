@@ -161,7 +161,8 @@ CommonMark core plus the common GitHub extensions:
 - `*emphasis*`, `**strong**`, `~~strikethrough~~`, `` `code` ``
 - Fenced and indented code blocks, block quotes (nested)
 - Ordered, unordered and nested lists, task lists (`- [x]`)
-- Tables with column alignment and wrapping cells
+- Tables with column alignment and wrapping cells; the header row is
+  repeated on each page a table continues on
 - Inline, reference and autolinks (`<https://…>` and bare URLs). Links to
   `#heading-slugs` jump within the document.
 - Local PNG and JPEG images, given as relative paths inside the Markdown
@@ -235,8 +236,8 @@ archiving; see *Tagged PDF* and *PDF/A* below.
   code blocks, figures with their alt text, and links, each tied to its
   annotation. Every piece of page content is marked as part of an element
   or as an artifact: backgrounds, rules, the bars of quotes and page
-  numbers are artifacts, and so is an image without alt text, as
-  decoration.
+  numbers are artifacts, and so are table header rows repeated on later
+  pages and an image without alt text, as decoration.
 
   Lines are drawn in visual order, as readers expect: they put
   right-to-left text in logical order themselves (pdftotext and MuPDF
@@ -405,9 +406,11 @@ archiving; see *Tagged PDF* and *PDF/A* below.
   split moves whole to the next page, and the space it leaves falls at the
   bottom of a page instead of the end of the document. A page costs more
   than any bad break except one right after a heading or a table's header
-  row, so avoiding bad breaks does not add pages. The document is laid out
-  twice: once to find the breaks, and again to set the pages, reusing the
-  lines of the first pass.
+  row, so avoiding bad breaks does not add pages. A break inside a table
+  counts the height of its header row, which is repeated at the top of the
+  next page (unless it is taller than a quarter of a page). The document
+  is laid out twice: once to find the breaks, and again to set the pages,
+  reusing the lines of the first pass.
 - **Compact output.** Content streams and fonts are compressed with a
   small built-in DEFLATE encoder: LZ77 with hash chains and lazy matching,
   and each block coded with Huffman codes built for it (length-limited by

@@ -100,9 +100,6 @@ Patterns for the main European languages, from hyph-utf8 (sizes of the
 
 ## Page breaking
 
-- Repeat a table's header row at the top of each page it continues on.
-  The page breaker would count the header's height at every break between
-  rows.
 - An explicit page break, for example a `<!-- pagebreak -->` comment: a
   breakpoint with a penalty that forces a break (TeX's `\penalty-10000`).
 
