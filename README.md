@@ -369,8 +369,11 @@ archiving; see *Tagged PDF* and *PDF/A* below.
   a final reh or dal; before a final alef, tah, lam or kaf; after beh and
   the letters like it; before a final waw, ain, qaf or feh; before any
   other final letter), never inside lam-alef or a ligature, and by at most
-  one em; each word on a line by one tatweel before any by two. The line
-  breaker counts kashidas as stretch. Tatweels are text: text read from
+  one em; each word on a line by one tatweel before any by two. A kashida
+  goes only between letters of one style and font: not across a change
+  of emphasis, nor in a part of a word that falls back to another font.
+  The line breaker counts kashidas as stretch; a line too loose for its
+  spaces keeps its kashidas and is left short. Tatweels are text: text read from
   the PDF has them, as it does from Word and LibreOffice.
 
   Text is hyphenated if its language is known (from `--lang`, the front

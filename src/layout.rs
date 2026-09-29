@@ -2237,7 +2237,7 @@ impl Layout<'_> {
     /// (`kashidas`: their frags in the line, and where) by as many tatweels
     /// as fit, the best places first and each by one before any by two;
     /// then widen (or narrow) the spaces between the words, `gaps`, by what
-    /// is left. Unless that would widen them by more than [`MAX_GROWTH`].
+    /// is left, unless that would widen them by more than [`MAX_GROWTH`].
     fn justify(&self, line: &mut Line, gaps: &[usize], kashidas: &[(usize, &Kashida)], max_w: f32) {
         let spaces: f32 = gaps.iter().map(|&k| line.frags[k].1.width).sum();
         let slack = max_w - line.width;
@@ -2265,8 +2265,7 @@ impl Layout<'_> {
             }
             more &= any;
         }
-        let lengthened = counts.iter().any(|&n| n > 0);
-        if spaces > 0.0 && left / spaces > MAX_GROWTH || spaces <= 0.0 && !lengthened {
+        if counts.iter().all(|&n| n == 0) && (spaces <= 0.0 || left / spaces > MAX_GROWTH) {
             return;
         }
         for (&(k, kd), &n) in kashidas.iter().zip(&counts) {
@@ -2283,7 +2282,9 @@ impl Layout<'_> {
             line.width = x;
         };
         place(line);
-        if spaces > 0.0 {
+        // The spaces fill the rest, unless that is too much for them: then
+        // the line keeps its kashidas and is left short.
+        if spaces > 0.0 && (max_w - line.width) / spaces <= MAX_GROWTH {
             let scale = 1.0 + (max_w - line.width) / spaces;
             for &k in gaps {
                 line.frags[k].1.width *= scale;

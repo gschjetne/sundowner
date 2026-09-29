@@ -107,8 +107,9 @@ enum Group {
     Heh,
     /// Reh and dal.
     Reh,
-    /// Alef, tah, lam and kaf (with gaf).
+    /// Alef, tah and kaf (with gaf).
     Alef,
+    /// Lam, which ranks with alef, but takes no kashida before an alef.
     Lam,
     /// Beh, teh, noon, yeh and the letters built on them.
     Beh,
@@ -239,7 +240,8 @@ mod tests {
     fn kashidas_go_between_joined_letters_by_priority() {
         // After seen, rather than before the final beh-like letter.
         assert_eq!(kashida_in("سلام"), Some(("سـلام".into(), 1)));
-        // Before a final teh marbuta or heh.
+        // After seen, which is also before a final teh marbuta; and before
+        // a final teh marbuta or heh.
         assert_eq!(kashida_in("مدرسة"), Some(("مدرسـة".into(), 1)));
         assert_eq!(kashida_in("كلمة"), Some(("كلمـة".into(), 2)));
         // Before a final reh or dal.

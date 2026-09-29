@@ -922,6 +922,11 @@ fn arabic_is_justified_with_kashidas() {
 
     let ragged = lines(&render_with(&src, Options { justify: false, ..o }));
     assert!(ragged.iter().all(|l| !l.contains(tatweel)), "{ragged:?}");
+
+    // A line too loose for its spaces (before a word that does not fit
+    // on it) still gets its kashidas.
+    let texts = lines(&render_narrow("سلام سلام المستشفيات", 100.0));
+    assert!(texts.len() == 2 && texts[0].contains(tatweel), "{texts:?}");
 }
 
 /// The lines of `src` set `width` wide, in language `lang`.
