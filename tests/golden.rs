@@ -287,6 +287,51 @@ fn table_rows_taller_than_half_a_page_are_split() {
 }
 
 #[test]
+fn table_headers_repeat_on_each_page_the_table_continues_on() {
+    let rows: String = (0..120).map(|k| format!("| row{k} | x |\n")).collect();
+    let out = render(&format!(
+        "{}| Name | [Value](https://example.com) |\n|---|---|\n{rows}",
+        filler(10)
+    ));
+    let pages = out.pages.len();
+    assert!(pages >= 3);
+    // Each row once, and the header at the top of every page with rows.
+    for k in 0..120 {
+        assert_eq!(pages_of(&out, &format!("row{k}")).len(), 1, "row{k}");
+    }
+    assert_eq!(pages_of(&out, "Name"), (0..pages).collect::<Vec<_>>());
+    for p in 1..pages {
+        let runs = runs(&out, p);
+        let name = run(&runs, "Name");
+        assert!(runs.iter().all(|r| r.y <= name.y), "page {p}");
+        assert!(name.y < 842.0 - 50.0);
+    }
+    // Nothing is pushed below the bottom margin by the header.
+    for p in 0..pages {
+        for r in runs(&out, p) {
+            assert!(r.y > 50.0, "text below the margin: {r:?}");
+        }
+    }
+    // The repeated header is an artifact, and its link is not repeated:
+    // the table has one header row, and the link one area.
+    assert_eq!(out.structure.iter().filter(|e| e.tag == "TH").count(), 2);
+    assert_eq!(out.pages.iter().map(|p| p.links.len()).sum::<usize>(), 1);
+    let ops = String::from_utf8_lossy(&out.pages[1].ops).to_string();
+    let header = &ops[..ops.find(" BDC").unwrap()];
+    assert!(header.starts_with("/Artifact BMC"));
+    assert_eq!(header.matches("BT ").count(), 2);
+}
+
+#[test]
+fn tall_table_headers_are_not_repeated() {
+    let head: Vec<String> = (0..1500).map(|k| format!("h{k}")).collect();
+    let rows: String = (0..80).map(|k| format!("| row{k} | x |\n")).collect();
+    let out = render(&format!("| {} | y |\n|---|---|\n{rows}", head.join(" ")));
+    assert!(out.pages.len() >= 2);
+    assert_eq!(pages_of(&out, "h0"), [0]);
+}
+
+#[test]
 fn every_script_in_the_bundled_fonts_uses_real_glyphs() {
     let out = render("Καλημέρα Съешь Łódź “q” € `код κώδικας Łódź ἀρχὴ` *`курсив`* **_`ᾠδή`_**");
     let r = runs(&out, 0);

@@ -69,6 +69,9 @@ const TABLE_ROW: f32 = 50.0;
 const IN_ROW: f32 = 1000.0;
 const IN_TALL_ROW: f32 = 100.0;
 const TALL_ROW: f32 = 0.5;
+/// A table's header row is repeated at the top of each page the table
+/// continues on, unless it is taller than this fraction of the text area.
+const REPEAT_HEADER: f32 = 0.25;
 /// Breaks in front matter cost this more than [`TABLE_ROW`] for each key
 /// that spans the rows on both sides, so they fall between the largest
 /// groups of rows that can be kept together.
@@ -312,7 +315,7 @@ enum Tok {
     },
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Line {
     frags: Vec<(f32, Frag)>,
     width: f32,
@@ -408,6 +411,15 @@ pub struct Breakpoint {
     pub penalty: f32,
 }
 
+/// The geometry of a table, for drawing its rows.
+struct TableRow<'a> {
+    widths: &'a [f32],
+    aligns: &'a [Align],
+    table_w: f32,
+    pad: f32,
+    x: f32,
+}
+
 /// Lines laid out in the first pass, for the second.
 enum Laidout {
     Text(Vec<Laid>, bool),
@@ -438,6 +450,11 @@ struct Layout<'a> {
     keep: f32,
     /// Penalty of the next break instead of `keep`, if set.
     next_penalty: Option<f32>,
+    /// Height of what is repeated at the top of a page when it breaks
+    /// here: the header of the table being set.
+    carry: f32,
+    /// Whether text is drawn as an artifact, as a repeated table header is.
+    artifact: bool,
     /// Blocks laid out in the first pass, in order, and how many of them
     /// have been used in this pass.
     laidout: Vec<Option<Laidout>>,
@@ -493,6 +510,8 @@ impl<'a> Layout<'a> {
             breakpoints: 0,
             keep: 0.0,
             next_penalty: None,
+            carry: 0.0,
+            artifact: false,
             laidout: Vec::new(),
             blocks_laid: 0,
             marker: None,
@@ -1709,6 +1728,9 @@ impl Layout<'_> {
     /// Mark what is drawn next on the current page as content of the
     /// structure element `elem`.
     fn mark(&mut self, elem: usize) {
+        if self.artifact {
+            return self.mark_artifact();
+        }
         let page = self.pages.len() - 1;
         self.tags.mark(&mut self.pages[page].ops, page, elem);
     }
@@ -1773,6 +1795,8 @@ impl Layout<'_> {
         self.breakpoints = 0;
         self.keep = 0.0;
         self.next_penalty = None;
+        self.carry = 0.0;
+        self.artifact = false;
         self.blocks_laid = 0;
         self.marker = None;
         self.headings.clear();
@@ -1821,26 +1845,30 @@ impl Layout<'_> {
 
     /// A place where the page may break, before content that is about to be
     /// drawn: `penalty` adds to that of the blocks it is in. Applies any
-    /// pending gap, unless the page breaks here.
-    fn may_break(&mut self, penalty: f32) {
+    /// pending gap, unless the page breaks here. Returns whether it does,
+    /// in which case what [`Self::carry`] stands for is to be drawn first.
+    fn may_break(&mut self, penalty: f32) -> bool {
         let penalty = self.next_penalty.take().unwrap_or(self.keep) + penalty;
         let k = self.breakpoints;
         self.breakpoints += 1;
         let above = self.y;
+        let mut broke = false;
         match &mut self.pass {
             Pass::Measure(breakpoints) => {
                 if !self.at_top {
                     self.y -= self.pending_gap;
                 }
+                // A page that starts here also holds what is carried.
                 breakpoints.push(Breakpoint {
                     above,
-                    below: self.y,
+                    below: self.y + self.carry,
                     penalty,
                 });
             }
             Pass::Set(plan) => {
                 if plan.get(k).copied().unwrap_or(false) && !self.at_top {
                     self.new_page();
+                    broke = true;
                 }
                 if !self.at_top {
                     self.y -= self.pending_gap;
@@ -1849,6 +1877,7 @@ impl Layout<'_> {
         }
         self.pending_gap = 0.0;
         self.at_top = false;
+        broke
     }
 
     /// Fill a rectangle, as an artifact (a background).
@@ -3245,63 +3274,139 @@ impl Layout<'_> {
             })
             .collect();
         let text_h = self.top() - self.bottom();
+        // The height of each line of each row: that of its tallest cell.
+        let heights: Vec<Vec<f32>> = grid
+            .iter()
+            .map(|cells| {
+                let nlines = cells.iter().map(|c| c.0.len()).max().unwrap_or(0).max(1);
+                (0..nlines)
+                    .map(|k| {
+                        cells
+                            .iter()
+                            .filter_map(|c| c.0.get(k))
+                            .map(|l| self.line_height(l))
+                            .fold(size * LINE_SPACING, f32::max)
+                    })
+                    .collect()
+            })
+            .collect();
+        // The header is repeated on each page the rows continue on, without
+        // its links, as an artifact: it is read once, from the first page.
+        let header_h = 2.0 * pad + heights[0].iter().sum::<f32>();
+        let repeat = (header_h <= REPEAT_HEADER * text_h).then(|| {
+            let mut cells = grid[0].clone();
+            for (lines, _) in &mut cells {
+                for f in lines.iter_mut().flat_map(|l| &mut l.frags) {
+                    f.1.link = None;
+                }
+            }
+            cells
+        });
+        let row = TableRow {
+            widths: &widths,
+            aligns,
+            table_w,
+            pad,
+            x: ctx.x,
+        };
         for (r, cells) in grid.iter().enumerate() {
-            let nlines = cells.iter().map(|c| c.0.len()).max().unwrap_or(0).max(1);
-            let heights: Vec<f32> = (0..nlines)
-                .map(|k| {
-                    cells
-                        .iter()
-                        .filter_map(|c| c.0.get(k))
-                        .map(|l| self.line_height(l))
-                        .fold(size * LINE_SPACING, f32::max)
-                })
-                .collect();
-            let in_row = if 2.0 * pad + heights.iter().sum::<f32>() > TALL_ROW * text_h {
+            let in_row = if 2.0 * pad + heights[r].iter().sum::<f32>() > TALL_ROW * text_h {
                 IN_TALL_ROW
             } else {
                 IN_ROW
             };
-            let bg = r == 0;
-            // The header stays with the first row.
-            self.may_break(if r < 2 { FORBID } else { TABLE_ROW });
-            if bg {
+            // The header stays with the first row, and is repeated where
+            // the page breaks after it.
+            let header = r == 0;
+            if r == 1 && repeat.is_some() {
+                self.carry = header_h;
+            }
+            let again = if header { None } else { repeat.as_deref() };
+            if self.may_break(if r < 2 { FORBID } else { TABLE_ROW }) {
+                self.repeat_header(&row, again, &heights[0]);
+            }
+            if header {
                 self.fill_rect(ctx.x, self.y - pad, table_w, pad, CODE_BG);
             }
             self.y -= pad;
-            for (k, &lh) in heights.iter().enumerate() {
-                self.may_break(if k == 0 { FORBID } else { in_row });
-                if bg {
-                    self.fill_rect(ctx.x, self.y - lh, table_w, lh + 0.3, CODE_BG);
+            for (k, &lh) in heights[r].iter().enumerate() {
+                if self.may_break(if k == 0 { FORBID } else { in_row }) {
+                    self.repeat_header(&row, again, &heights[0]);
                 }
-                let mut x = ctx.x;
-                for (c, (lines, rtl)) in cells.iter().enumerate() {
-                    if let Some(line) = lines.get(k) {
-                        let slack = (widths[c] - line.width).max(0.0);
-                        // Cells without an alignment follow their text's
-                        // direction.
-                        let off = match aligns[c] {
-                            Align::Right => slack,
-                            Align::Center => slack / 2.0,
-                            Align::None if *rtl => slack,
-                            _ => 0.0,
-                        };
-                        self.tags.enter(cell_elems[r][c]);
-                        self.draw_line(line, x + pad + off, lh);
-                        self.tags.end();
-                    }
-                    x += widths[c] + 2.0 * pad;
-                }
-                self.y -= lh;
+                self.table_line(&row, cells, k, lh, header, Some(&cell_elems[r]));
             }
-            if bg {
-                self.fill_rect(ctx.x, self.y - pad, table_w, pad + 0.3, CODE_BG);
-            }
-            self.y -= pad;
-            let (lw, color) = if bg { (0.8, MUTED) } else { (0.5, RULE) };
-            self.stroke_line(ctx.x, self.y, ctx.x + table_w, self.y, lw, color);
+            self.end_row(&row, header);
         }
+        self.carry = 0.0;
         self.tags.end();
         self.keep_laidout(slot, Laidout::Table(widths, table_w, grid));
+    }
+
+    /// Draw line `k` of a table row, `lh` high, with a background if it is
+    /// the header, and each cell's text in its element in `elems` (or as an
+    /// artifact without them).
+    fn table_line(
+        &mut self,
+        row: &TableRow,
+        cells: &[(Vec<Line>, bool)],
+        k: usize,
+        lh: f32,
+        header: bool,
+        elems: Option<&[usize]>,
+    ) {
+        if header {
+            self.fill_rect(row.x, self.y - lh, row.table_w, lh + 0.3, CODE_BG);
+        }
+        let mut x = row.x;
+        for (c, (lines, rtl)) in cells.iter().enumerate() {
+            if let Some(line) = lines.get(k) {
+                let slack = (row.widths[c] - line.width).max(0.0);
+                // Cells without an alignment follow their text's direction.
+                let off = match row.aligns[c] {
+                    Align::Right => slack,
+                    Align::Center => slack / 2.0,
+                    Align::None if *rtl => slack,
+                    _ => 0.0,
+                };
+                match elems {
+                    Some(elems) => {
+                        self.tags.enter(elems[c]);
+                        self.draw_line(line, x + row.pad + off, lh);
+                        self.tags.end();
+                    }
+                    None => {
+                        self.artifact = true;
+                        self.draw_line(line, x + row.pad + off, lh);
+                        self.artifact = false;
+                    }
+                }
+            }
+            x += row.widths[c] + 2.0 * row.pad;
+        }
+        self.y -= lh;
+    }
+
+    /// Finish a table row: its bottom padding and the rule under it.
+    fn end_row(&mut self, row: &TableRow, header: bool) {
+        if header {
+            self.fill_rect(row.x, self.y - row.pad, row.table_w, row.pad + 0.3, CODE_BG);
+        }
+        self.y -= row.pad;
+        let (lw, color) = if header { (0.8, MUTED) } else { (0.5, RULE) };
+        self.stroke_line(row.x, self.y, row.x + row.table_w, self.y, lw, color);
+    }
+
+    /// Repeat a table's header row, `cells` with line heights `heights`, at
+    /// the top of a page the table continues on.
+    fn repeat_header(&mut self, row: &TableRow, cells: Option<&[(Vec<Line>, bool)]>, heights: &[f32]) {
+        let Some(cells) = cells else { return };
+        self.stroke_line(row.x, self.y, row.x + row.table_w, self.y, 0.8, RULE);
+        self.fill_rect(row.x, self.y - row.pad, row.table_w, row.pad, CODE_BG);
+        self.y -= row.pad;
+        for (k, &lh) in heights.iter().enumerate() {
+            self.table_line(row, cells, k, lh, true, None);
+        }
+        self.end_row(row, true);
     }
 
     /// Lay out the cells of a table: the column widths, the table's width,
