@@ -882,6 +882,48 @@ fn right_to_left_paragraphs_are_justified_too() {
     }
 }
 
+/// Arabic in a justified paragraph is lengthened by kashidas (tatweels
+/// between joined letters), at most at one place in a word, and never on
+/// the last line; set ragged, it is not.
+#[cfg(feature = "silk")]
+#[test]
+fn arabic_is_justified_with_kashidas() {
+    let o = Options::default();
+    let left = o.margin;
+    let text = "كان الخط العربي منذ القدم فنًا رفيعًا، واهتم الخطاطون بتنسيق السطور حتى \
+        تستوي أطرافها، فمدوا الحروف المتصلة بدلًا من توسيع المسافات بين الحروف، وهذا ما \
+        يسمى التطويل. ويوضع التطويل بين حرفين متصلين، ولا يوضع في آخر الحرف ولا بين \
+        اللام والألف.";
+    let src = [text; 3].join(" ");
+    let out = render(&src);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    let edges = line_edges(&out);
+    assert!(edges.len() >= 5, "{edges:?}");
+    let n = edges.len();
+    for (k, (start, _, line)) in edges.iter().enumerate() {
+        // Flush left but for the last line.
+        assert_eq!((start - left).abs() < 0.05, k + 1 < n, "{line}: {start}");
+    }
+    let tatweel = '\u{640}';
+    let texts = lines(&out);
+    for (k, line) in texts.iter().enumerate() {
+        for word in line.split(' ') {
+            let places = word
+                .split(tatweel)
+                .filter(|s| !s.is_empty())
+                .count()
+                .saturating_sub(1);
+            assert!(places <= 1, "line {k}: {word}");
+        }
+    }
+    assert!(!texts[n - 1].contains(tatweel), "{}", texts[n - 1]);
+    let lengthened = texts.iter().filter(|l| l.contains(tatweel)).count();
+    assert!(lengthened * 2 >= n, "{texts:?}");
+
+    let ragged = lines(&render_with(&src, Options { justify: false, ..o }));
+    assert!(ragged.iter().all(|l| !l.contains(tatweel)), "{ragged:?}");
+}
+
 /// The lines of `src` set `width` wide, in language `lang`.
 fn hyphenated(src: &str, width: f32, lang: Option<&str>) -> Vec<String> {
     lines(&render_with(

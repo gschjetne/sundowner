@@ -360,7 +360,18 @@ archiving; see *Tagged PDF* and *PDF/A* below.
   instead. Headings, table cells and code are not justified, and
   `--no-justify` sets paragraphs ragged, with the breaks still chosen for
   an even edge. Right-to-left paragraphs are justified too, before they
-  are reordered; Arabic by widening its spaces, not yet by kashida.
+  are reordered.
+
+  Arabic is justified by kashida first: words are lengthened by tatweels
+  (U+0640) between two joined letters, as far as they fit, and the spaces
+  take what is left. A word gets them in one place, chosen by the classic
+  priorities (after seen or sad; before a final teh marbuta or heh; before
+  a final reh or dal; before a final alef, tah, lam or kaf; after beh and
+  the letters like it; before a final waw, ain, qaf or feh; before any
+  other final letter), never inside lam-alef or a ligature, and by at most
+  one em; each word on a line by one tatweel before any by two. The line
+  breaker counts kashidas as stretch. Tatweels are text: text read from
+  the PDF has them, as it does from Word and LibreOffice.
 
   Text is hyphenated if its language is known (from `--lang`, the front
   matter's `lang`, or `lang` in `.sundowner`, in that order), by Liang's
@@ -431,9 +442,8 @@ archiving; see *Tagged PDF* and *PDF/A* below.
 
 - **Scripts.** Latin, Greek, Cyrillic, Armenian, Hebrew, Arabic and CJK
   render correctly. There is none of the shaping that Syriac, N'Ko, the
-  Indic scripts, Thai or Mongolian need. Arabic text is justified by
-  widening its spaces, not by lengthening its joins (kashida), and letters
-  do not take language-specific forms (such as Urdu's or Sindhi's). Fonts without OpenType Arabic features are not shaped from
+  Indic scripts, Thai or Mongolian need. Arabic letters do not take
+  language-specific forms (such as Urdu's or Sindhi's). Fonts without OpenType Arabic features are not shaped from
   the presentation forms.
 - **Traditional Chinese characters.** Markdown does not say which
   language text is in, so the silk build sets Chinese characters in one
@@ -481,7 +491,7 @@ archiving; see *Tagged PDF* and *PDF/A* below.
   no spaces to widen, is not justified.
 
 [`IDEAS.md`](IDEAS.md) collects features that may come later, such as
-kashida and hyphenation for more languages.
+hyphenation for more languages.
 
 ## Building
 

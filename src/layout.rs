@@ -250,6 +250,35 @@ struct Word {
     /// without a space, in 1/1000 em; taken off again if the line breaks
     /// between them.
     join_kern: f32,
+    /// Where the word may be lengthened, if the line it is on is justified.
+    kashida: Option<Kashida>,
+}
+
+/// A place where an Arabic word may be lengthened by kashidas: tatweels
+/// (U+0640) inserted between two of its joined letters, which is then
+/// shaped again. The part of the word shaped with them is a segment of one
+/// style, set in one run.
+struct Kashida {
+    /// The frag of the word the segment is in, and its glyphs there.
+    frag: usize,
+    glyphs: std::ops::Range<usize>,
+    /// The segment, and where in it the tatweels go.
+    text: Vec<char>,
+    at: usize,
+    bold: bool,
+    italic: bool,
+    rtl: bool,
+    joins: Joins,
+    /// Its priority, from [`arabic::kashida`]: lower is better.
+    priority: u8,
+    /// The advance of the segment's glyphs as shaped, in 1/1000 em.
+    /// Kerning added to its last glyph later (with text that continues it)
+    /// is the difference.
+    adv: f32,
+    /// How much wider each tatweel makes the word, and how many it may
+    /// take (see [`KASHIDA_MAX`]).
+    step: f32,
+    most: usize,
 }
 
 impl Word {
@@ -914,6 +943,8 @@ const HOPELESS: f64 = 12.0;
 /// Badness of a line that is too wide however it is set: a word longer
 /// than the line, which will be split.
 const OVERFULL: f64 = 1e6;
+/// The most a word is lengthened by kashidas, in ems.
+const KASHIDA_MAX: f32 = 1.0;
 
 /// A word of a paragraph, for [`total_fit`].
 struct FitWord {
@@ -925,6 +956,8 @@ struct FitWord {
     space: f32,
     /// The width of the hyphen shown if the line breaks after it.
     hyphen: f32,
+    /// How much its kashidas can lengthen it.
+    kashida: f32,
 }
 
 /// Choose where the lines of a paragraph break, by Knuth and Plass's
@@ -932,8 +965,9 @@ struct FitWord {
 /// least total demerits, which grow with the square of each line's
 /// badness and the penalty of the break that ends it. A line's badness
 /// grows with the cube of how far its spaces must stretch (or shrink) to
-/// fill it: [`STRETCH`] and [`SHRINK`] when `justify`, or else as if each
-/// line had [`RAGGED_STRETCH`]. Hyphens, and very loose lines next to
+/// fill it: [`STRETCH`] and [`SHRINK`] when `justify` (and the kashidas of
+/// its Arabic words, which stretch too), or else as if each line had
+/// [`RAGGED_STRETCH`]. Hyphens, and very loose lines next to
 /// tight ones, cost extra, as in TeX. The last line, and lines before a
 /// hard line break, may be as short as they like.
 ///
@@ -953,6 +987,7 @@ fn total_fit(toks: &[Tok], max_w: f32, size: f32, justify: bool) -> Vec<bool> {
                     width: w.width(),
                     space: if words.is_empty() { 0.0 } else { space },
                     hyphen: w.hyphen.as_ref().map_or(0.0, |h| h.width),
+                    kashida: w.kashida.as_ref().map_or(0.0, |k| k.step * k.most as f32),
                 });
                 space = 0.0;
             }
@@ -974,12 +1009,13 @@ fn fit_lines(words: &[FitWord], max_w: f32, size: f32, justify: bool, out: &mut 
     if n < 2 {
         return;
     }
-    // Where each word starts on one endless line, and the stretch and
-    // shrink of the spaces before it.
+    // Where each word starts on one endless line, the stretch and shrink
+    // of the spaces before it, and the stretch of the kashidas before it.
     let mut pos = Vec::with_capacity(n);
     let mut stretch = Vec::with_capacity(n);
     let mut shrink = Vec::with_capacity(n);
-    let (mut x, mut st, mut sh) = (0.0f32, 0.0f32, 0.0f32);
+    let mut kashidas = Vec::with_capacity(n + 1);
+    let (mut x, mut st, mut sh, mut ka) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     for (k, w) in words.iter().enumerate() {
         if k > 0 {
             x += words[k - 1].width + w.space;
@@ -989,7 +1025,10 @@ fn fit_lines(words: &[FitWord], max_w: f32, size: f32, justify: bool, out: &mut 
         pos.push(x);
         stretch.push(st);
         shrink.push(sh);
+        kashidas.push(ka);
+        ka += w.kashida;
     }
+    kashidas.push(ka);
     // Whether the line may break after word k, showing a hyphen.
     let hyphenated = |k: usize| k + 1 < n && words[k + 1].space == 0.0 && words[k].hyphen > 0.0;
 
@@ -1004,7 +1043,10 @@ fn fit_lines(words: &[FitWord], max_w: f32, size: f32, justify: bool, out: &mut 
         for a in (0..=b).rev() {
             let natural = pos[b] + words[b].width - pos[a] + if hyph { words[b].hyphen } else { 0.0 };
             let (st, sh) = if justify {
-                (stretch[b] - stretch[a], shrink[b] - shrink[a])
+                (
+                    stretch[b] - stretch[a] + kashidas[b + 1] - kashidas[a],
+                    shrink[b] - shrink[a],
+                )
             } else {
                 (RAGGED_STRETCH * size, 0.0)
             };
@@ -1086,27 +1128,6 @@ fn fit_lines(words: &[FitWord], max_w: f32, size: f32, justify: bool, out: &mut 
         b = a - 1;
         c = pc;
     }
-}
-
-/// Widen (or narrow) the spaces between the words of a line, `gaps`, so
-/// that it fills `max_w`; unless that would widen them by more than
-/// [`MAX_GROWTH`].
-fn justify(line: &mut Line, gaps: &[usize], max_w: f32) {
-    let spaces: f32 = gaps.iter().map(|&k| line.frags[k].1.width).sum();
-    let slack = max_w - line.width;
-    if spaces <= 0.0 || slack / spaces > MAX_GROWTH {
-        return;
-    }
-    let scale = 1.0 + slack / spaces;
-    for &k in gaps {
-        line.frags[k].1.width *= scale;
-    }
-    let mut x = line.frags.first().map_or(0.0, |f| f.0);
-    for (fx, f) in &mut line.frags {
-        *fx = x;
-        x += f.width;
-    }
-    line.width = x;
 }
 
 fn lower(c: char) -> char {
@@ -1879,6 +1900,7 @@ impl Layout<'_> {
         color: Color,
         force_bold: bool,
         hyphenate: bool,
+        justify: bool,
     ) -> (Vec<Tok>, bool) {
         // The paragraph as one character sequence. Hard breaks and images
         // stand in as LINE SEPARATOR and OBJECT REPLACEMENT CHARACTER, which
@@ -2025,9 +2047,12 @@ impl Layout<'_> {
                     let (mono, bold, italic) = (st.style.code, st.style.bold, st.style.italic);
                     let level = levels[i];
                     let joins = Joins::of(&text, i..j);
-                    for (face, glyphs, w) in
-                        self.shape_joined(&seg, mono, bold, italic, st.size, level % 2 == 1, joins)
-                    {
+                    let runs = self.shape_joined(&seg, mono, bold, italic, st.size, level % 2 == 1, joins);
+                    // The frag the segment went into and where, if it is
+                    // set in one run.
+                    let one = runs.iter().filter(|r| !r.1.is_empty()).count() == 1;
+                    let mut into: Option<(FaceId, usize, usize)> = None;
+                    for (face, glyphs, w) in runs {
                         if glyphs.is_empty() {
                             continue;
                         }
@@ -2042,13 +2067,37 @@ impl Layout<'_> {
                             }
                         }
                         joined = false;
+                        let n = word.frags.len();
                         match word.frags.last_mut() {
                             Some(f) if f.same_run(face, st, level) => {
                                 self.kern_join(f, &glyphs[0]);
+                                into = Some((face, n - 1, f.glyphs.len()));
                                 f.glyphs.extend_from_slice(&glyphs);
                                 f.width += w;
                             }
-                            _ => word.frags.push(st.frag(glyphs, w, face, level)),
+                            _ => {
+                                into = Some((face, n, 0));
+                                word.frags.push(st.frag(glyphs, w, face, level));
+                            }
+                        }
+                    }
+                    if let Some((face, k, start)) = into.filter(|_| justify && one) {
+                        let shaped = &word.frags[k].glyphs;
+                        let range = start..shaped.len();
+                        let found = self.kashida(
+                            &text[i..j],
+                            st,
+                            level % 2 == 1,
+                            joins,
+                            face,
+                            k,
+                            range,
+                            &shaped[start..],
+                        );
+                        if let Some(found) = found {
+                            if word.kashida.as_ref().is_none_or(|w| found.priority <= w.priority) {
+                                word.kashida = Some(found);
+                            }
                         }
                     }
                     i = j;
@@ -2184,6 +2233,166 @@ impl Layout<'_> {
         Some(st.frag(glyphs, w, face, level))
     }
 
+    /// Fill a line to `max_w`: lengthen the words that have kashidas
+    /// (`kashidas`: their frags in the line, and where) by as many tatweels
+    /// as fit, the best places first and each by one before any by two;
+    /// then widen (or narrow) the spaces between the words, `gaps`, by what
+    /// is left. Unless that would widen them by more than [`MAX_GROWTH`].
+    fn justify(&self, line: &mut Line, gaps: &[usize], kashidas: &[(usize, &Kashida)], max_w: f32) {
+        let spaces: f32 = gaps.iter().map(|&k| line.frags[k].1.width).sum();
+        let slack = max_w - line.width;
+        let mut counts = vec![0; kashidas.len()];
+        let mut left = slack;
+        let mut order: Vec<usize> = (0..kashidas.len()).collect();
+        order.sort_by_key(|&k| kashidas[k].1.priority);
+        // Round by round, until a round runs out of room: so no word gets
+        // two more than another (their steps differ).
+        let mut more = slack > 0.0;
+        while more {
+            let mut any = false;
+            for &k in &order {
+                let kd = kashidas[k].1;
+                if counts[k] == kd.most {
+                    continue;
+                }
+                if kd.step > left {
+                    more = false;
+                    continue;
+                }
+                counts[k] += 1;
+                left -= kd.step;
+                any = true;
+            }
+            more &= any;
+        }
+        let lengthened = counts.iter().any(|&n| n > 0);
+        if spaces > 0.0 && left / spaces > MAX_GROWTH || spaces <= 0.0 && !lengthened {
+            return;
+        }
+        for (&(k, kd), &n) in kashidas.iter().zip(&counts) {
+            if n > 0 {
+                self.lengthen(&mut line.frags[k].1, kd, n);
+            }
+        }
+        let place = |line: &mut Line| {
+            let mut x = line.frags.first().map_or(0.0, |f| f.0);
+            for (fx, f) in &mut line.frags {
+                *fx = x;
+                x += f.width;
+            }
+            line.width = x;
+        };
+        place(line);
+        if spaces > 0.0 {
+            let scale = 1.0 + (max_w - line.width) / spaces;
+            for &k in gaps {
+                line.frags[k].1.width *= scale;
+            }
+            place(line);
+        }
+    }
+
+    /// Where a segment of an Arabic word, `text` in style `st` shaped as
+    /// `shaped` (glyphs `glyphs` of frag `frag` in face `face`), may be
+    /// lengthened by kashidas (see [`arabic::kashida`]).
+    /// Not where a ligature would be broken, nor if the font has no tatweel
+    /// (or it does not make the word wider).
+    #[allow(clippy::too_many_arguments)]
+    fn kashida(
+        &self,
+        text: &[char],
+        st: &TextStyle,
+        rtl: bool,
+        joins: Joins,
+        face: FaceId,
+        frag: usize,
+        glyphs: std::ops::Range<usize>,
+        shaped: &[G],
+    ) -> Option<Kashida> {
+        if st.style.code || !arabic::needs_joining(text) {
+            return None;
+        }
+        let forms = arabic::forms(text, joins.before, joins.after);
+        let (at, priority) = arabic::kashida(text, &forms)?;
+        // Whether a glyph stands for letters on both sides: count the
+        // letters (which normalization keeps) each glyph stands for.
+        let letter = |c: &char| {
+            use crate::bidi_table::JoiningType::{D, L, R};
+            matches!(arabic::joining_type(*c), D | L | R)
+        };
+        let before = text[..at].iter().filter(|c| letter(c)).count();
+        let mut seen = 0;
+        {
+            let texts = self.texts.borrow();
+            for g in shaped {
+                let n = texts.0[g.text as usize].chars().filter(letter).count();
+                if seen < before && before < seen + n {
+                    return None;
+                }
+                seen += n;
+            }
+        }
+        let (bold, italic) = (st.style.bold, st.style.italic);
+        let mut kashida = Kashida {
+            frag,
+            glyphs,
+            text: text.to_vec(),
+            at,
+            bold,
+            italic,
+            rtl,
+            joins,
+            priority,
+            adv: shaped.iter().map(|g| g.adv).sum(),
+            step: 0.0,
+            most: 0,
+        };
+        let (_, lengthened) = self.shape_kashida(&kashida, st.size, 1).filter(|r| r.0 == face)?;
+        let adv: f32 = lengthened.iter().map(|g| g.adv).sum();
+        kashida.step = (adv - kashida.adv) * st.size / 1000.0;
+        if kashida.step < 0.01 * st.size {
+            return None;
+        }
+        kashida.most = (KASHIDA_MAX * st.size / kashida.step) as usize;
+        (kashida.most > 0).then_some(kashida)
+    }
+
+    /// Shape the segment of `k` with `n` tatweels, if it is set in one run.
+    ///
+    /// The tatweels are text, as in PDFs from Word and LibreOffice: text
+    /// read from the PDF has them. (Standing for no text, in an
+    /// `ActualText` span, they would leave a gap that MuPDF reads as a
+    /// space, splitting the word.)
+    fn shape_kashida(&self, k: &Kashida, size: f32, n: usize) -> Option<(FaceId, Vec<G>)> {
+        let mut text: String = k.text[..k.at].iter().collect();
+        text.extend(std::iter::repeat_n(arabic::TATWEEL, n));
+        text.extend(&k.text[k.at..]);
+        let mut runs = self.shape_joined(&text, false, k.bold, k.italic, size, k.rtl, k.joins);
+        if runs.len() != 1 {
+            return None;
+        }
+        let (face, glyphs, _) = runs.pop()?;
+        Some((face, glyphs))
+    }
+
+    /// Lengthen the word in `f` by `n` tatweels at its kashida `k`.
+    fn lengthen(&self, f: &mut Frag, k: &Kashida, n: usize) {
+        let Some((face, glyphs)) = self.shape_kashida(k, f.size, n) else {
+            return;
+        };
+        if face != f.face {
+            return;
+        }
+        let old: f32 = f.glyphs[k.glyphs.clone()].iter().map(|g| g.adv).sum();
+        let mut piece = f.piece(0..0, 0.0);
+        piece.glyphs = glyphs;
+        // Keep the kerning with the text after it.
+        kern_last(&mut piece, old - k.adv);
+        let new: f32 = piece.glyphs.iter().map(|g| g.adv).sum();
+        f.width += (new - old) * f.size / 1000.0;
+        f.glyphs.splice(k.glyphs.clone(), piece.glyphs);
+    }
+
     /// Break a paragraph into lines of at most `max_w`, and justify them
     /// if `fill` says so.
     fn wrap(&self, toks: &[Tok], max_w: f32, base_size: f32, fill: Fill) -> Vec<Laid> {
@@ -2195,8 +2404,10 @@ impl Layout<'_> {
             Fill::Ragged => Some(total_fit(toks, max_w, base_size, false)),
             Fill::Justify => Some(total_fit(toks, max_w, base_size, true)),
         };
-        // The spaces between words on the current line (frag indices).
+        // The spaces between words on the current line (frag indices),
+        // and the kashidas of its words (the same, and where).
         let mut gaps: Vec<usize> = Vec::new();
+        let mut kashidas: Vec<(usize, &Kashida)> = Vec::new();
         let mut out = Vec::new();
         let new_line = || Line {
             size: base_size,
@@ -2227,6 +2438,7 @@ impl Layout<'_> {
                     out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
                     placed.clear();
                     gaps.clear();
+                    kashidas.clear();
                     space = 0.0;
                 }
                 Tok::Image { alt, src } => {
@@ -2239,6 +2451,7 @@ impl Layout<'_> {
                     });
                     placed.clear();
                     gaps.clear();
+                    kashidas.clear();
                     space = 0.0;
                 }
                 Tok::Word(word) => {
@@ -2288,11 +2501,12 @@ impl Layout<'_> {
                             }
                         }
                         if fill == Fill::Justify {
-                            justify(&mut line, &gaps, max_w);
+                            self.justify(&mut line, &gaps, &kashidas, max_w);
                         }
                         out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
                         placed.clear();
                         gaps.clear();
+                        kashidas.clear();
                         space = 0.0;
                         if restart != i {
                             i = restart;
@@ -2321,6 +2535,7 @@ impl Layout<'_> {
                                     out.push(Laid::Line(std::mem::replace(&mut line, new_line())));
                                     placed.clear();
                                     gaps.clear();
+                                    kashidas.clear();
                                     start = k;
                                     x = 0.0;
                                     acc = 0.0;
@@ -2352,6 +2567,9 @@ impl Layout<'_> {
                             gaps.push(line.frags.len());
                             push_frag(&mut line, x, gap);
                             x += space;
+                        }
+                        if let Some(k) = word.kashida.as_ref().filter(|_| fill == Fill::Justify) {
+                            kashidas.push((line.frags.len() + k.frag, k));
                         }
                         for f in &word.frags {
                             push_frag(&mut line, x, f.clone());
@@ -2556,7 +2774,8 @@ impl Layout<'_> {
         let (laid, rtl) = match laidout {
             Some(Laidout::Text(laid, rtl)) => (laid, rtl),
             _ => {
-                let (toks, rtl) = self.tokenize(inlines, size, ctx.color, bold, body);
+                let justify = body && self.o.justify;
+                let (toks, rtl) = self.tokenize(inlines, size, ctx.color, bold, body, justify);
                 let fill = match (body, self.o.justify) {
                     (false, _) => Fill::Greedy,
                     (true, false) => Fill::Ragged,
@@ -3107,7 +3326,7 @@ impl Layout<'_> {
                     };
                 }
             }
-            l.tokenize(&inl, size, ctx.color, bold, false)
+            l.tokenize(&inl, size, ctx.color, bold, false, false)
         };
         let mut grid: Vec<Vec<(Vec<Tok>, bool)>> = Vec::with_capacity(rows.len() + 1);
         grid.push(header.iter().map(|c| cell_toks(self, c, true)).collect());
@@ -3225,7 +3444,7 @@ impl Layout<'_> {
                         link: None,
                     });
                 }
-                self.tokenize(&inl, size, ctx.color, c.key, false)
+                self.tokenize(&inl, size, ctx.color, c.key, false, false)
             })
             .collect();
 
