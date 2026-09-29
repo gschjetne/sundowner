@@ -11,26 +11,20 @@ the language is known; so far only English. What could follow:
 
 ### Kashida
 
-- Arabic justification lengthens the connection between two joined
-  letters, by inserting tatweel (U+0640) or by using wider alternates of
-  the letters where the font has them, instead of (or before) widening the
-  spaces. Words are never broken across lines.
-- Where a kashida may go: only between two letters that are joined (the
-  joining state machine in `arabic::forms` knows which), and by the
-  classic priorities: after seen and sad, before a final teh marbuta or
-  heh, before a final reh or dal, after beh-like letters, and so on; at
-  most one per word, and never inside lam-alef or after the last letter.
-  HarfBuzz records the same information as `SAFE_TO_INSERT_TATWEEL`, which
-  our joining code can mirror.
-- Tatweel is join-causing, so inserting it does not change the letters'
-  forms; the run is shaped again with it, and with Amiri the tatweel
-  connects by cursive attachment. Its width comes in steps, so the rest of
-  the slack still goes into the spaces.
-- Fonts with a `jalt` feature or stretchable glyph variants could use
-  those instead of tatweel; worth trying with Amiri.
-- The line breaker takes it as stretch: `FitWord` would get the stretch
-  of its kashida points, which `fit_lines` adds to that of the spaces,
-  and `justify` would give each line's slack to the kashidas first.
+Arabic is justified by kashida (`arabic::kashida` chooses the place in
+each word, `Layout::justify` inserts tatweels). What could follow:
+
+- Wider alternates of the letters instead of tatweel, where a font has
+  them (a `jalt` feature or stretchable glyph variants). Amiri has no
+  `jalt`.
+- Kashida placement differs by language and style: Persian and Urdu
+  conventions differ from Arabic ones, and Nastaliq is not lengthened
+  this way at all. With the `lang` setting, the priorities could follow
+  the language, or be turned off.
+- A glyph Amiri inserts between some letters (lam before kaf) is its
+  tatweel glyph, with no text of its own. Readers may take it for a
+  tatweel, or show nothing there and see a space; it could carry an empty
+  text that readers do not take for a gap.
 
 ### More languages
 
