@@ -5,8 +5,9 @@
 //!
 //! A document conforms at level A (accessible) when it is tagged and every
 //! glyph maps to Unicode, and at level B (basic, visual) when some glyph
-//! stands for no text of its own. It cannot conform when it holds a CMYK
-//! image, as the output intent is RGB.
+//! stands for no text of its own, or it shows a PDF page with a font that
+//! has no Unicode map. It cannot conform when it holds a CMYK image or a
+//! PDF page in CMYK, as the output intent is RGB.
 
 use crate::layout::Output;
 
@@ -21,12 +22,16 @@ pub fn conformance(doc: &Output) -> Result<char, String> {
     if doc.images.iter().any(|img| img.dict.contains("/DeviceCMYK")) {
         return Err("it has a CMYK image, and its colours are RGB".into());
     }
+    if doc.forms.iter().any(|f| f.cmyk) {
+        return Err("a PDF it shows uses CMYK colours, and its colours are RGB".into());
+    }
     // Glyphs that stand for no text: the second and later glyphs a
     // character is set with.
     let unmapped = doc
         .used
         .iter()
         .any(|used| used.iter().any(|(&g, text)| g != 0 && text.is_empty()));
+    let unmapped = unmapped || doc.forms.iter().any(|f| f.unmapped);
     Ok(if unmapped { 'B' } else { 'A' })
 }
 

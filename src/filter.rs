@@ -2,7 +2,7 @@
 //!
 //! sundowner draws no diagrams itself. Instead, code blocks of a given
 //! language can be piped through a command, which reads the code on its
-//! standard input and writes a PNG or JPEG image on its standard output.
+//! standard input and writes a PDF, PNG or JPEG file on its standard output.
 //! The image takes the code block's place, with the code as its alt text.
 //! Filters are listed in a file given with `--filters`:
 //!
@@ -223,9 +223,25 @@ pub fn apply(doc: &mut Document, filters: &Filters) -> Vec<String> {
     // The figure each job made, if it succeeded.
     let mut figures = Vec::with_capacity(jobs.len());
     for (job, result) in jobs.iter().zip(run_all(&jobs)) {
-        let checked = result.and_then(|data| match crate::image::load(&data) {
-            Ok(_) => Ok(data),
-            Err(e) => Err(format!("it did not write a PNG or JPEG image it can embed ({e})")),
+        let checked = result.and_then(|data| {
+            let loaded = if crate::import::is_pdf(&data) {
+                crate::import::load(&data).map(|form| {
+                    if form.pages > 1 {
+                        warnings.push(format!(
+                            "{} code block {}: only the first of the {} pages its filter wrote is shown",
+                            job.lang, job.ordinal, form.pages
+                        ));
+                    }
+                })
+            } else {
+                crate::image::load(&data).map(|_| ())
+            };
+            match loaded {
+                Ok(()) => Ok(data),
+                Err(e) => Err(format!(
+                    "it did not write a PDF, PNG or JPEG file it can embed ({e})"
+                )),
+            }
         });
         match checked {
             Ok(data) => {

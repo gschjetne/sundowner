@@ -67,7 +67,7 @@ pub fn load(bytes: &[u8]) -> Result<Image, String> {
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         png(bytes)
     } else {
-        Err("unsupported image format (only PNG and JPEG are supported)".into())
+        Err("unsupported image format (only PDF, PNG and JPEG are supported)".into())
     }
 }
 
@@ -248,7 +248,8 @@ fn png(b: &[u8]) -> Result<Image, String> {
     })
 }
 
-fn unfilter(raw: &[u8], row: usize, height: usize, bpp: usize) -> Option<Vec<u8>> {
+/// Undo PNG row filters (also used for PDF's PNG predictors).
+pub(crate) fn unfilter(raw: &[u8], row: usize, height: usize, bpp: usize) -> Option<Vec<u8>> {
     let mut out = vec![0u8; row * height];
     for y in 0..height {
         let src = raw.get(y * (row + 1)..(y + 1) * (row + 1))?;

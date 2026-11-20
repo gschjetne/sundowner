@@ -2,6 +2,7 @@
 //! allows it (see [`crate::pdfa`]).
 
 use crate::flate;
+use crate::import;
 use crate::layout::{Output, Target};
 use crate::pdfa;
 use crate::tags::{text_string, Kid};
@@ -173,6 +174,13 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32) -> Vec<u8> {
         .iter()
         .map(|img| (w.alloc(), img.smask.as_ref().map(|_| w.alloc())))
         .collect();
+    // The objects of each page imported from a PDF file; the first is the
+    // form XObject that draws it.
+    let forms: Vec<Vec<usize>> = doc
+        .forms
+        .iter()
+        .map(|f| f.objects.iter().map(|_| w.alloc()).collect())
+        .collect();
     let page_ids: Vec<(usize, usize)> = doc.pages.iter().map(|_| (w.alloc(), w.alloc())).collect();
     let outline_root = if doc.headings.is_empty() {
         None
@@ -191,10 +199,13 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32) -> Vec<u8> {
         res.push_str(&format!(" /F{face} {} 0 R", ids[0]));
     }
     res.push_str(" >>");
-    if !images.is_empty() {
+    if !images.is_empty() || !forms.is_empty() {
         res.push_str(" /XObject <<");
         for (i, (id, _)) in images.iter().enumerate() {
             res.push_str(&format!(" /Im{i} {id} 0 R"));
+        }
+        for (i, ids) in forms.iter().enumerate() {
+            res.push_str(&format!(" /Fm{i} {} 0 R", ids[0]));
         }
         res.push_str(" >>");
     }
@@ -219,6 +230,21 @@ pub fn write(doc: &Output, page_w: f32, page_h: f32) -> Vec<u8> {
             );
         }
         w.stream(id, &dict, &img.data);
+    }
+    for (form, ids) in doc.forms.iter().zip(&forms) {
+        for (obj, &id) in form.objects.iter().zip(ids) {
+            let mut text = String::new();
+            match obj {
+                import::Obj::Stream(dict, data) => {
+                    import::write_entries(&mut text, dict, ids);
+                    w.stream(id, &text, data);
+                }
+                other => {
+                    import::write(&mut text, other, ids);
+                    w.obj(id, &text);
+                }
+            }
+        }
     }
 
     // None if the page does not exist; callers then omit the destination

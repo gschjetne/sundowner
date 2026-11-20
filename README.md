@@ -167,8 +167,10 @@ CommonMark core plus the common GitHub extensions:
   repeated on each page a table continues on
 - Inline, reference and autolinks (`<https://…>` and bare URLs). Links to
   `#heading-slugs` jump within the document.
-- Local PNG and JPEG images, given as relative paths inside the Markdown
-  file's directory. Transparent PNGs keep their transparency.
+- Local PNG, JPEG and PDF images, given as relative paths inside the
+  Markdown file's directory. Transparent PNGs keep their transparency. Of
+  a PDF file, the first page is drawn, as vector graphics with its text
+  (see *Pictures from PDF files* below).
 - HTML comments are dropped, `<br>` becomes a line break, other inline tags
   are removed, and HTML entities are decoded.
 - YAML front matter (see below).
@@ -222,26 +224,29 @@ archiving; see *Tagged PDF* and *PDF/A* below.
 
 sundowner draws no diagrams itself, but it can pipe code blocks through
 programs that do. A filter is a command that reads a code block on its
-standard input and writes a PNG or JPEG image on its standard output;
-the image takes the code block's place. Filters are listed, by the
-language of the code blocks they are for, in a file given with
-`--filters`:
+standard input and writes a PDF, PNG or JPEG file on its standard
+output; the picture takes the code block's place. PDF is best: diagrams
+stay vector graphics, sharp at any size, and their text can be selected
+and searched. Filters are listed, by the language of the code blocks
+they are for, in a file given with `--filters`:
 
 ```ini
 # Mermaid diagrams, with mermaid-cli (npm install -g @mermaid-js/mermaid-cli)
 [mermaid]
-command = mmdc --input - --output - --outputFormat png --scale 2 --quiet
-dpi = 192
+command = mmdc --input - --output - --outputFormat pdf --quiet
 timeout = 60
 
 # Graphviz, under either name
 [dot graphviz]
-command = dot -Tpng -Gdpi=192
-dpi = 192
+command = dot -Tpdf
 
 # A program that writes SVG can be piped through rsvg-convert (librsvg)
 [neato]
-command = neato -Tsvg | rsvg-convert --zoom 2
+command = neato -Tsvg | rsvg-convert --format pdf
+
+# A program that only writes PNG: say at what resolution
+[plot]
+command = my-plotter --png --dpi 192
 dpi = 192
 ```
 
@@ -264,16 +269,19 @@ graph LR
   other shell syntax work, in sundowner's working directory and
   environment. The code is its standard input, with a newline at the
   end; nothing of the document ever goes on its command line. It must exit
-  with status 0 and write a PNG or JPEG image.
-- **Size.** `dpi` (default 96) is the resolution of the images it writes:
-  an image 384 pixels wide at 192 dpi is 2 inches wide. Images wider than
-  the column, or taller than the page, are shrunk to fit.
+  with status 0 and write a PDF, PNG or JPEG file. Of a PDF, the first
+  page is drawn, at its size (mmdc and Graphviz make the page as large as
+  the diagram).
+- **Size.** `dpi` (default 96) is the resolution of the PNG and JPEG
+  images it writes: an image 384 pixels wide at 192 dpi is 2 inches wide.
+  Pictures wider than the column, or taller than the page, are shrunk to
+  fit.
 - **Failures.** If a filter fails (exits with another status, writes
-  something other than an image, or takes longer than its `timeout`, in
+  something that cannot be embedded, or takes longer than its `timeout`, in
   seconds, default 30), the code block is set as code, with a warning
   that gives the first line it wrote to standard error.
-- **Accessibility.** The image is a `Figure` in the PDF's structure, with
-  the code as its alternate description.
+- **Accessibility.** The picture is a `Figure` in the PDF's structure,
+  with the code as its alternate description.
 - **Speed.** Filters run before layout, up to four at a time; identical
   code blocks of one language are run once.
 - Filters make output only as reproducible as they are.
@@ -285,8 +293,8 @@ it, whoever wrote the document. Filters keep to that as follows:
 
 - **Only the person running sundowner gives commands.** There are no
   filters unless `--filters` names a file. They cannot be set in
-  `.sundowner` (a filter's section there is an error), since those files are found next to documents and travel with
-  them, and a document cannot name a command, only the language of its
+  `.sundowner` (a filter's section there is an error), since those files
+  are found next to documents and travel with them, and a document cannot name a command, only the language of its
   code blocks.
 - **The document is only data.** The command line is fixed in the
   filters file; the code reaches the command only on its standard input.
@@ -296,7 +304,8 @@ it, whoever wrote the document. Filters keep to that as follows:
   background. Its output is limited to 64 MiB, and all filters' output
   to 256 MiB per document. At most 100 different code blocks per
   document are run through filters; the rest are set as code, with a
-  warning. Images are checked like image files (see *Crash-proof* below).
+  warning. What they write is checked like image files (see *Crash-proof*
+  below).
 
 What a filter does with its input is up to the filter. Mermaid, for
 example, renders diagrams in a headless Chromium. For documents you do
@@ -311,21 +320,58 @@ directories, and nothing left running after it:
 # private /tmp. mmdc must be installed outside /home (npm install -g).
 exec bwrap --ro-bind / / --tmpfs /home --tmpfs /root --tmpfs /tmp \
     --dev /dev --proc /proc --unshare-all --new-session --die-with-parent \
-    mmdc --input - --output - --outputFormat png --scale 2 --quiet
+    mmdc --input - --output - --outputFormat pdf --quiet
 ```
 
 ```ini
 [mermaid]
 command = mermaid-sandboxed
-dpi = 192
 timeout = 60
 ```
+
+### Pictures from PDF files
+
+The first page of a PDF file, from an image link or a filter, is drawn as
+it is: its drawing, fonts and images are copied into the document (as a
+form XObject), and nothing in them is interpreted or redrawn. Its text
+stays text, which can be selected, searched and copied. The page is as
+large as its crop box, turned as its `Rotate` says, and shrunk to fit the
+column like any picture.
+
+On the way in:
+
+- **Its structure is left behind.** The page's marked content (Chromium,
+  which mmdc prints with, tags the PDFs it writes) is taken out, as is
+  what ties its objects to its own file: structure, metadata, optional
+  content (which is then always shown) and private data. The picture is
+  one `Figure` in sundowner's structure, with its alternate description.
+  Links and other annotations on the page are not kept.
+- **What PDF/A forbids is left out:** transfer functions, alternate
+  images, OPI, and interpolation of images.
+- **Some files are refused,** with a warning, and shown as an image
+  placeholder (or, from a filter, as code): encrypted files, files that
+  use fonts they do not embed (viewers would substitute other fonts, which
+  sundowner never lets happen), PostScript, LZW compression (which PDF/A
+  forbids), and files sundowner cannot read. It reads the usual forms of
+  PDF up to 2.0: cross-reference tables and streams, object streams,
+  incremental updates, and files whose cross-references are broken, by
+  scanning them. It decodes Flate, ASCIIHex and ASCII85 streams where it
+  needs to read them; other streams, such as JPEG images, are copied as
+  they are.
+- **PDF/A.** The document stays PDF/A-2 if the page keeps to it: it is
+  not declared PDF/A if the page uses CMYK colours (its colours are RGB),
+  and is level B if a font on the page has no Unicode map. Pages from
+  mmdc, Graphviz, rsvg-convert and sundowner itself pass veraPDF's
+  PDF/A-2a validation.
+- A file with more than one page gives a warning that only the first is
+  shown.
 
 ## Design
 
 - **No dependencies.** Everything is in `src/`: the Markdown parser, layout
   engine, Unicode line breaker and normalizer, TrueType parser and
-  subsetter, OpenType glyph substitution and positioning, PDF writer, DEFLATE codec and PNG/JPEG readers. The bundled fonts are compiled into the binary.
+  subsetter, OpenType glyph substitution and positioning, PDF writer and
+  reader, DEFLATE codec and PNG/JPEG readers. The bundled fonts are compiled into the binary.
 - **Self-contained PDFs.**
   - Every font is embedded as a subset (Type 0 / CIDFontType2 with
     Identity-H encoding), so viewers never substitute fonts.
@@ -535,6 +581,10 @@ timeout = 60
   - Images are limited in file size (64 MiB each, 256 MiB total per
     document) and dimensions (20,000 px per side, 64 megapixels), for every
     format.
+  - PDF files are read with bounds checks everywhere, with nesting,
+    chains of references and the number of objects capped, cycles
+    followed once, and decompression limited (64 MiB per stream, 256 MiB
+    per file). Nothing in them is run.
   - Image paths must be relative and resolve (after following symlinks)
     inside the Markdown file's directory, so a document cannot embed
     arbitrary files from the system.
@@ -596,11 +646,10 @@ timeout = 60
 - **Marks on ligatures** attach to the ligature's last component. A mark
   that belonged to an earlier component, such as an accent on the f of an
   "fi" ligature, is placed on the last one instead.
-- Remote images, interlaced PNGs and formats other than PNG and JPEG are not
-  embedded. They appear as an italic `[image: …]` placeholder with a warning.
-- **Filters** write raster images, so diagrams are not vector graphics in
-  the PDF: their text cannot be selected or searched, and they are as
-  sharp as their `dpi`.
+- Remote images, interlaced PNGs and formats other than PNG, JPEG and PDF
+  are not embedded. They appear as an italic `[image: …]` placeholder with
+  a warning. SVG is not read; pipe it through `rsvg-convert --format pdf`.
+- **PDF pictures** show only the first page of a file, without its links.
 
 - **Hyphenation** is only for English so far, and for the whole
   document: a passage in another language is hyphenated as if it were

@@ -10,6 +10,7 @@ use crate::gpos::Attachment;
 use crate::gsub::{mask, Glyph, Script};
 use crate::hyphenate::{self, Patterns};
 use crate::image::{self, Image};
+use crate::import::{self, Form};
 use crate::inline::{self, Inline, Style};
 use crate::linebreak::{self, Break};
 use crate::markdown::{Align, Block, Document, Figure};
@@ -359,6 +360,8 @@ pub struct Heading {
 pub struct Output {
     pub pages: Vec<Page>,
     pub images: Vec<Image>,
+    /// Pages of PDF files, drawn as pictures (`/Fm0`, `/Fm1`...).
+    pub forms: Vec<Form>,
     pub headings: Vec<Heading>,
     pub anchors: HashMap<String, (usize, f32)>,
     pub title: Option<String>,
@@ -465,12 +468,13 @@ struct Layout<'a> {
     blocks_laid: usize,
     marker: Option<Marker>,
     images: Vec<Image>,
-    image_cache: HashMap<String, Option<usize>>,
+    forms: Vec<Form>,
+    image_cache: HashMap<String, Option<Pic>>,
     image_bytes: usize,
     /// Images that filters made from code blocks, and which of them have
     /// been loaded, as which of `images`.
     figures: &'a [Figure],
-    figure_cache: HashMap<usize, Option<usize>>,
+    figure_cache: HashMap<usize, Option<Pic>>,
     headings: Vec<Heading>,
     anchors: HashMap<String, (usize, f32)>,
     slug_counts: HashMap<String, usize>,
@@ -524,6 +528,7 @@ impl<'a> Layout<'a> {
             blocks_laid: 0,
             marker: None,
             images: Vec::new(),
+            forms: Vec::new(),
             image_cache: HashMap::new(),
             image_bytes: 0,
             figures: &[],
@@ -671,6 +676,7 @@ pub fn layout(doc: &Document, o: &Options) -> Output {
     Output {
         pages: l.pages,
         images: l.images,
+        forms: l.forms,
         headings: l.headings,
         anchors: l.anchors,
         title,
@@ -762,6 +768,25 @@ fn num(out: &mut Vec<u8>, v: f32) {
             let _ = write!(out, ".{frac:02}");
         }
     }
+}
+
+/// A number with up to five decimals, for scale factors.
+fn fine(v: f32) -> String {
+    let s = format!("{:.5}", if v.is_finite() { v } else { 0.0 });
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    if s == "-0" {
+        "0".into()
+    } else {
+        s.to_string()
+    }
+}
+
+/// A picture in the document: one of its images, or a page of a PDF file
+/// (one of its forms).
+#[derive(Clone, Copy, Debug)]
+enum Pic {
+    Image(usize),
+    Form(usize),
 }
 
 fn nums(out: &mut Vec<u8>, vs: &[f32]) {
@@ -2861,67 +2886,95 @@ impl Layout<'_> {
 
     // ------------------------------------------------------------ images
 
-    fn load_image(&mut self, src: &str) -> Option<usize> {
+    fn load_image(&mut self, src: &str) -> Option<Pic> {
         if let Some(r) = self.image_cache.get(src) {
             return *r;
         }
-        let idx = self
+        let pic = self
             .read_image(src)
-            .and_then(|img| self.add_image(img))
+            .and_then(|data| self.add_picture(&data, &format!("image '{src}'")))
             .map_err(|e| self.warnings.push(format!("image '{src}': {e}")))
             .ok();
-        self.image_cache.insert(src.to_string(), idx);
-        idx
+        self.image_cache.insert(src.to_string(), pic);
+        pic
     }
 
     /// Load the image a filter made, `figures[k]`.
-    fn load_figure(&mut self, k: usize) -> Option<usize> {
+    fn load_figure(&mut self, k: usize) -> Option<Pic> {
         if let Some(r) = self.figure_cache.get(&k) {
             return *r;
         }
-        let idx = image::load(&self.figures[k].data)
-            .and_then(|img| self.add_image(img))
+        let figures = self.figures;
+        let pic = self
+            .add_picture(&figures[k].data, "")
             .map_err(|e| {
                 self.warnings
                     .push(format!("an image a filter made is shown as code, as {e}"))
             })
             .ok();
-        self.figure_cache.insert(k, idx);
-        idx
+        self.figure_cache.insert(k, pic);
+        pic
     }
 
-    /// Add an image to the document, within the limit on their total size.
-    fn add_image(&mut self, img: Image) -> Result<usize, String> {
-        let size = img.data.len() + img.smask.as_ref().map_or(0, Vec::len);
+    /// Add a PNG, JPEG or PDF file to the document as a picture, within
+    /// the limit on the total size of pictures. A PDF file with more than
+    /// one page gets a warning that names it as `what`, if given.
+    fn add_picture(&mut self, data: &[u8], what: &str) -> Result<Pic, String> {
+        let (size, pic) = if import::is_pdf(data) {
+            let form = import::load(data)?;
+            if form.pages > 1 && !what.is_empty() {
+                self.warnings.push(format!(
+                    "{what}: only the first of its {} pages is shown",
+                    form.pages
+                ));
+            }
+            (form.size(), Err(form))
+        } else {
+            let img = image::load(data)?;
+            (img.data.len() + img.smask.as_ref().map_or(0, Vec::len), Ok(img))
+        };
         if self.image_bytes + size > image::MAX_TOTAL_BYTES {
             return Err("total size of embedded images exceeds the limit".into());
         }
         self.image_bytes += size;
-        self.images.push(img);
-        Ok(self.images.len() - 1)
+        Ok(match pic {
+            Ok(img) => {
+                self.images.push(img);
+                Pic::Image(self.images.len() - 1)
+            }
+            Err(form) => {
+                self.forms.push(form);
+                Pic::Form(self.forms.len() - 1)
+            }
+        })
     }
 
-    fn read_image(&self, src: &str) -> Result<Image, String> {
+    fn read_image(&self, src: &str) -> Result<Vec<u8>, String> {
         let base = self.o.base_dir.as_ref().ok_or("image loading is disabled")?;
         let path = confine(base, src)?;
-        image::load(&image::read_file(&path)?)
+        image::read_file(&path)
     }
 
     fn image(&mut self, alt: &str, src: &str, ctx: Ctx, penalty: f32) {
-        let Some(idx) = self.load_image(src) else {
+        let Some(pic) = self.load_image(src) else {
             self.penalize_next(self.keep + penalty);
             return self.text_block(&[placeholder(alt, src)], self.o.font_size, ctx, false, false);
         };
         // Treat pixels as 96 dpi.
-        self.place_image(idx, 0.75, alt, ctx, penalty);
+        self.place(pic, 0.75, alt, ctx, penalty);
     }
 
-    /// Draw `images[idx]`, at `scale` points per pixel, shrunk to fit the
-    /// column and page if need be.
-    fn place_image(&mut self, idx: usize, scale: f32, alt: &str, ctx: Ctx, penalty: f32) {
-        let (pw, ph) = (self.images[idx].width as f32, self.images[idx].height as f32);
-        let mut w = pw * scale;
-        let mut h = ph * scale;
+    /// Draw a picture, an image at `scale` points per pixel or a PDF page
+    /// at its size, shrunk to fit the column and page if need be.
+    fn place(&mut self, pic: Pic, scale: f32, alt: &str, ctx: Ctx, penalty: f32) {
+        let (mut w, mut h) = match pic {
+            Pic::Image(i) => (
+                self.images[i].width as f32 * scale,
+                self.images[i].height as f32 * scale,
+            ),
+            Pic::Form(i) => (self.forms[i].width, self.forms[i].height),
+        };
+        let (natural_w, natural_h) = (w, h);
         let max_h = (self.top() - self.bottom()) * 0.95;
         if w > ctx.w {
             h *= ctx.w / w;
@@ -2947,8 +3000,24 @@ impl Layout<'_> {
             }
             let ops = &mut self.page().ops;
             ops.extend_from_slice(b"q ");
-            nums(ops, &[w, 0.0, 0.0, h, ctx.x, y]);
-            let _ = writeln!(ops, "cm /Im{idx} Do Q");
+            match pic {
+                Pic::Image(i) => {
+                    nums(ops, &[w, 0.0, 0.0, h, ctx.x, y]);
+                    let _ = writeln!(ops, "cm /Im{i} Do Q");
+                }
+                Pic::Form(i) => {
+                    // A page is drawn at its size in points, so scale it;
+                    // finely, as the factor applies to all of it.
+                    let _ = write!(
+                        ops,
+                        "{} 0 0 {} ",
+                        fine(w / natural_w.max(1e-3)),
+                        fine(h / natural_h.max(1e-3))
+                    );
+                    nums(ops, &[ctx.x, y]);
+                    let _ = writeln!(ops, "cm /Fm{i} Do Q");
+                }
+            }
         }
         self.y -= h + 4.0;
     }
@@ -2976,9 +3045,9 @@ impl Layout<'_> {
                     // The code is its description; if the image cannot be
                     // embedded, it is shown as code after all.
                     match self.load_figure(*index) {
-                        Some(idx) => {
+                        Some(pic) => {
                             let scale = 72.0 / self.figures[*index].dpi;
-                            self.place_image(idx, scale, &lines.join("\n"), ctx, 0.0);
+                            self.place(pic, scale, &lines.join("\n"), ctx, 0.0);
                         }
                         None => self.code_block(lines, ctx),
                     }

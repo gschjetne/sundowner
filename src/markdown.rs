@@ -70,7 +70,7 @@ pub struct Document {
 
 /// An image a filter made from a code block.
 pub struct Figure {
-    /// The PNG or JPEG file.
+    /// The PDF, PNG or JPEG file.
     pub data: Vec<u8>,
     /// Its resolution, in pixels per inch.
     pub dpi: f32,

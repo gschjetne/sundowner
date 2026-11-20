@@ -14,6 +14,7 @@ pub mod gpos;
 pub mod gsub;
 pub mod hyphenate;
 pub mod image;
+pub mod import;
 pub mod inline;
 pub mod kern;
 pub mod layout;

@@ -131,7 +131,7 @@ fn failed_filters_leave_the_code_with_a_warning() {
             "exited with status 3: Parse error on line 2",
         ),
         ("true", "it wrote nothing"),
-        ("echo not an image", "did not write a PNG or JPEG"),
+        ("echo not an image", "did not write a PDF, PNG or JPEG"),
         ("/nonexistent/command", "exited with status 127"),
     ] {
         let f = filters(&format!("[d]\ncommand = {command}\n"));
