@@ -6,6 +6,7 @@ pub mod bidi;
 pub mod bidi_table;
 pub mod chars;
 pub mod config;
+pub mod filter;
 pub mod flate;
 pub mod fonts;
 pub mod front_matter;
@@ -40,11 +41,12 @@ pub struct Converted {
 
 /// Convert Markdown source to a PDF document.
 pub fn convert(markdown: &str, options: &Options) -> Converted {
-    let doc = markdown::parse(markdown);
+    let mut doc = markdown::parse(markdown);
+    let mut warnings = filter::apply(&mut doc, &options.filters);
     let out = layout::layout(&doc, options);
     let pdf = pdf::write(&out, options.page_width, options.page_height);
     let archival = pdfa::conformance(&out);
-    let mut warnings = out.warnings;
+    warnings.extend(out.warnings);
     if let Err(why) = archival {
         warnings.push(format!("the PDF is not PDF/A, as {why}"));
     }

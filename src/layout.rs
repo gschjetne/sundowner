@@ -12,7 +12,7 @@ use crate::hyphenate::{self, Patterns};
 use crate::image::{self, Image};
 use crate::inline::{self, Inline, Style};
 use crate::linebreak::{self, Break};
-use crate::markdown::{Align, Block, Document};
+use crate::markdown::{Align, Block, Document, Figure};
 use crate::normalize;
 use crate::tags::{self, Tagger};
 use crate::yaml;
@@ -111,6 +111,9 @@ pub struct Options {
     /// The language to assume when neither the command line nor the front
     /// matter gives one (from `.sundowner`).
     pub default_lang: Option<String>,
+    /// Commands that turn code blocks into images (see [`crate::filter`]).
+    /// None by default: only the person running sundowner can give them.
+    pub filters: crate::filter::Filters,
 }
 
 impl Default for Options {
@@ -128,6 +131,7 @@ impl Default for Options {
             justify: true,
             lang: None,
             default_lang: None,
+            filters: Default::default(),
         }
     }
 }
@@ -463,6 +467,10 @@ struct Layout<'a> {
     images: Vec<Image>,
     image_cache: HashMap<String, Option<usize>>,
     image_bytes: usize,
+    /// Images that filters made from code blocks, and which of them have
+    /// been loaded, as which of `images`.
+    figures: &'a [Figure],
+    figure_cache: HashMap<usize, Option<usize>>,
     headings: Vec<Heading>,
     anchors: HashMap<String, (usize, f32)>,
     slug_counts: HashMap<String, usize>,
@@ -518,6 +526,8 @@ impl<'a> Layout<'a> {
             images: Vec::new(),
             image_cache: HashMap::new(),
             image_bytes: 0,
+            figures: &[],
+            figure_cache: HashMap::new(),
             headings: Vec::new(),
             anchors: HashMap::new(),
             slug_counts: HashMap::new(),
@@ -587,6 +597,7 @@ pub fn shape_text(
 
 pub fn layout(doc: &Document, o: &Options) -> Output {
     let mut l = Layout::new(o, &doc.refs);
+    l.figures = &doc.figures;
     let ctx = Ctx {
         x: o.margin,
         w: o.page_width - 2.0 * o.margin,
@@ -2854,26 +2865,40 @@ impl Layout<'_> {
         if let Some(r) = self.image_cache.get(src) {
             return *r;
         }
-        let result = self.read_image(src).and_then(|img| {
-            let size = img.data.len() + img.smask.as_ref().map_or(0, Vec::len);
-            if self.image_bytes + size > image::MAX_TOTAL_BYTES {
-                return Err("total size of embedded images exceeds the limit".into());
-            }
-            self.image_bytes += size;
-            Ok(img)
-        });
-        let idx = match result {
-            Ok(img) => {
-                self.images.push(img);
-                Some(self.images.len() - 1)
-            }
-            Err(e) => {
-                self.warnings.push(format!("image '{src}': {e}"));
-                None
-            }
-        };
+        let idx = self
+            .read_image(src)
+            .and_then(|img| self.add_image(img))
+            .map_err(|e| self.warnings.push(format!("image '{src}': {e}")))
+            .ok();
         self.image_cache.insert(src.to_string(), idx);
         idx
+    }
+
+    /// Load the image a filter made, `figures[k]`.
+    fn load_figure(&mut self, k: usize) -> Option<usize> {
+        if let Some(r) = self.figure_cache.get(&k) {
+            return *r;
+        }
+        let idx = image::load(&self.figures[k].data)
+            .and_then(|img| self.add_image(img))
+            .map_err(|e| {
+                self.warnings
+                    .push(format!("an image a filter made is shown as code, as {e}"))
+            })
+            .ok();
+        self.figure_cache.insert(k, idx);
+        idx
+    }
+
+    /// Add an image to the document, within the limit on their total size.
+    fn add_image(&mut self, img: Image) -> Result<usize, String> {
+        let size = img.data.len() + img.smask.as_ref().map_or(0, Vec::len);
+        if self.image_bytes + size > image::MAX_TOTAL_BYTES {
+            return Err("total size of embedded images exceeds the limit".into());
+        }
+        self.image_bytes += size;
+        self.images.push(img);
+        Ok(self.images.len() - 1)
     }
 
     fn read_image(&self, src: &str) -> Result<Image, String> {
@@ -2887,10 +2912,16 @@ impl Layout<'_> {
             self.penalize_next(self.keep + penalty);
             return self.text_block(&[placeholder(alt, src)], self.o.font_size, ctx, false, false);
         };
+        // Treat pixels as 96 dpi.
+        self.place_image(idx, 0.75, alt, ctx, penalty);
+    }
+
+    /// Draw `images[idx]`, at `scale` points per pixel, shrunk to fit the
+    /// column and page if need be.
+    fn place_image(&mut self, idx: usize, scale: f32, alt: &str, ctx: Ctx, penalty: f32) {
         let (pw, ph) = (self.images[idx].width as f32, self.images[idx].height as f32);
-        // Treat pixels as 96 dpi, then shrink to fit the column and page.
-        let mut w = pw * 0.75;
-        let mut h = ph * 0.75;
+        let mut w = pw * scale;
+        let mut h = ph * scale;
         let max_h = (self.top() - self.bottom()) * 0.95;
         if w > ctx.w {
             h *= ctx.w / w;
@@ -2937,8 +2968,20 @@ impl Layout<'_> {
                     self.tags.end();
                     self.gap(para_gap);
                 }
-                Block::Code(lines) => {
+                Block::Code { lines, .. } => {
                     self.code_block(lines, ctx);
+                    self.gap(para_gap.max(fs * 0.5));
+                }
+                Block::Figure { index, lines } => {
+                    // The code is its description; if the image cannot be
+                    // embedded, it is shown as code after all.
+                    match self.load_figure(*index) {
+                        Some(idx) => {
+                            let scale = 72.0 / self.figures[*index].dpi;
+                            self.place_image(idx, scale, &lines.join("\n"), ctx, 0.0);
+                        }
+                        None => self.code_block(lines, ctx),
+                    }
                     self.gap(para_gap.max(fs * 0.5));
                 }
                 Block::Quote(inner) => {
@@ -3761,7 +3804,7 @@ fn blocks_rtl(blocks: &[Block]) -> bool {
             Block::Quote(inner) => first(inner, text_rtl),
             Block::List { items, .. } => items.iter().find_map(|i| first(&i.blocks, text_rtl)),
             Block::Table { header, .. } => header.iter().find_map(|h| text_rtl(h)),
-            Block::Code(_) | Block::Rule => None,
+            Block::Code { .. } | Block::Figure { .. } | Block::Rule => None,
         })
     }
     first(blocks, &text_rtl) == Some(true)

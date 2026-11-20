@@ -65,6 +65,8 @@ cat in.md | sundowner > out.pdf    # stdin -> stdout
 -l, --lang <TAG>        Language of the text, such as en or en-US (default: the
                         front matter's lang); English text is hyphenated
     --no-images         Do not load image files
+    --filters <FILE>    Commands that turn code blocks into images, such as
+                        Mermaid diagrams, by language (see below)
 -q, --quiet             Do not print warnings
     --licenses          Show the licenses of sundowner and its bundled fonts
 ```
@@ -215,6 +217,109 @@ page numbers and a document title. Only `http:`, `https:` and `mailto:` links
 and `#anchor` links become clickable; other links are shown as plain text.
 It is a tagged PDF, which screen readers can read, and a PDF/A file, for
 archiving; see *Tagged PDF* and *PDF/A* below.
+
+## Diagrams and other filters
+
+sundowner draws no diagrams itself, but it can pipe code blocks through
+programs that do. A filter is a command that reads a code block on its
+standard input and writes a PNG or JPEG image on its standard output;
+the image takes the code block's place. Filters are listed, by the
+language of the code blocks they are for, in a file given with
+`--filters`:
+
+```ini
+# Mermaid diagrams, with mermaid-cli (npm install -g @mermaid-js/mermaid-cli)
+[mermaid]
+command = mmdc --input - --output - --outputFormat png --scale 2 --quiet
+dpi = 192
+timeout = 60
+
+# Graphviz, under either name
+[dot graphviz]
+command = dot -Tpng -Gdpi=192
+dpi = 192
+
+# A program that writes SVG can be piped through rsvg-convert (librsvg)
+[neato]
+command = neato -Tsvg | rsvg-convert --zoom 2
+dpi = 192
+```
+
+```sh
+sundowner --filters ~/.config/sundowner/filters notes.md
+```
+
+````markdown
+```mermaid
+graph LR
+  A[Markdown] --> B(sundowner) --> C[PDF]
+```
+````
+
+- **Language.** A code block's language is the first word of its info
+  string (`mermaid` in `` ```mermaid ``), in any case. A section may name
+  several languages. Code blocks of other languages, and indented code
+  blocks, are set as code.
+- **Command.** It runs with `sh -c` (`cmd /C` on Windows), so pipes and
+  other shell syntax work, in sundowner's working directory and
+  environment. The code is its standard input, with a newline at the
+  end; nothing of the document ever goes on its command line. It must exit
+  with status 0 and write a PNG or JPEG image.
+- **Size.** `dpi` (default 96) is the resolution of the images it writes:
+  an image 384 pixels wide at 192 dpi is 2 inches wide. Images wider than
+  the column, or taller than the page, are shrunk to fit.
+- **Failures.** If a filter fails (exits with another status, writes
+  something other than an image, or takes longer than its `timeout`, in
+  seconds, default 30), the code block is set as code, with a warning
+  that gives the first line it wrote to standard error.
+- **Accessibility.** The image is a `Figure` in the PDF's structure, with
+  the code as its alternate description.
+- **Speed.** Filters run before layout, up to four at a time; identical
+  code blocks of one language are run once.
+- Filters make output only as reproducible as they are.
+
+### Filters and untrusted documents
+
+Running sundowner on a document should never do more than make a PDF of
+it, whoever wrote the document. Filters keep to that as follows:
+
+- **Only the person running sundowner gives commands.** There are no
+  filters unless `--filters` names a file. They cannot be set in
+  `.sundowner` (a filter's section there is an error), since those files are found next to documents and travel with
+  them, and a document cannot name a command, only the language of its
+  code blocks.
+- **The document is only data.** The command line is fixed in the
+  filters file; the code reaches the command only on its standard input.
+- **Runs are bounded.** Each run has its `timeout`. When it is over, the
+  command is killed, and on Unix so is every process it started (they
+  share a process group of their own), even those that went on in the
+  background. Its output is limited to 64 MiB, and all filters' output
+  to 256 MiB per document. At most 100 different code blocks per
+  document are run through filters; the rest are set as code, with a
+  warning. Images are checked like image files (see *Crash-proof* below).
+
+What a filter does with its input is up to the filter. Mermaid, for
+example, renders diagrams in a headless Chromium. For documents you do
+not trust, choose filters that are safe with any input, or run them in a
+sandbox. On Linux, [bubblewrap](https://github.com/containers/bubblewrap)
+can run a filter with no network, a read-only file system without home
+directories, and nothing left running after it:
+
+```sh
+#!/bin/sh
+# mermaid-sandboxed: mmdc with no network, no home directories and a
+# private /tmp. mmdc must be installed outside /home (npm install -g).
+exec bwrap --ro-bind / / --tmpfs /home --tmpfs /root --tmpfs /tmp \
+    --dev /dev --proc /proc --unshare-all --new-session --die-with-parent \
+    mmdc --input - --output - --outputFormat png --scale 2 --quiet
+```
+
+```ini
+[mermaid]
+command = mermaid-sandboxed
+dpi = 192
+timeout = 60
+```
 
 ## Design
 
@@ -433,6 +538,9 @@ archiving; see *Tagged PDF* and *PDF/A* below.
   - Image paths must be relative and resolve (after following symlinks)
     inside the Markdown file's directory, so a document cannot embed
     arbitrary files from the system.
+  - A document cannot run commands: filters come only from a file given
+    with `--filters`, and are bounded in time and output (see *Filters and
+    untrusted documents*).
   - Output is written to a temporary file and renamed into place, so a
     failed run never leaves a truncated PDF.
   - If an internal error happens anyway, only that file fails and the run
@@ -490,6 +598,9 @@ archiving; see *Tagged PDF* and *PDF/A* below.
   "fi" ligature, is placed on the last one instead.
 - Remote images, interlaced PNGs and formats other than PNG and JPEG are not
   embedded. They appear as an italic `[image: …]` placeholder with a warning.
+- **Filters** write raster images, so diagrams are not vector graphics in
+  the PDF: their text cannot be selected or searched, and they are as
+  sharp as their `dpi`.
 
 - **Hyphenation** is only for English so far, and for the whole
   document: a passage in another language is hyphenated as if it were

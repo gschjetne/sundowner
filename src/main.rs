@@ -37,6 +37,8 @@ OPTIONS:
                             front matter's lang); English text is hyphenated
         --no-images         Do not load image files (images must be relative paths
                             inside the input file's directory)
+        --filters <FILE>    Commands that turn code blocks into images, such as
+                            Mermaid diagrams, by language (see the README)
     -q, --quiet             Do not print warnings
         --licenses          Show the licenses of sundowner, its bundled fonts
                             and the Unicode data it includes
@@ -81,6 +83,7 @@ struct Args {
     justify: Option<bool>,
     lang: Option<String>,
     images: bool,
+    filters: sundowner::filter::Filters,
     quiet: bool,
 }
 
@@ -118,6 +121,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         justify: None,
         lang: None,
         images: true,
+        filters: Default::default(),
         quiet: false,
     };
     let mut it = std::env::args_os().skip(1);
@@ -174,6 +178,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--no-justify" => a.justify = Some(false),
             "-l" | "--lang" => a.lang = Some(config::parse_lang("--lang", &value()?)?),
             "--no-images" => a.images = false,
+            "--filters" => a.filters = sundowner::filter::load(Path::new(&value()?))?,
             "-q" | "--quiet" => a.quiet = true,
             _ => return Err(format!("unknown option '{arg}' (see --help)")),
         }
@@ -236,6 +241,7 @@ fn build_options(args: &Args, cfg: &Config, fonts: Arc<Fonts>, base_dir: Option<
     o.default_lang = cfg.lang.clone();
     o.title = args.title.clone();
     o.base_dir = if args.images { base_dir } else { None };
+    o.filters = args.filters.clone();
     // Keep a sensible text column no matter what margin and paper were chosen.
     let max_margin = (o.page_width.min(o.page_height) - 12.0 * o.font_size) / 2.0;
     o.margin = o.margin.min(max_margin.max(0.0));
