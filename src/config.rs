@@ -154,7 +154,12 @@ pub fn parse(text: &str, base: &Path) -> Result<Config, String> {
                     cfg.fonts.fallbacks.push(FamilySpec::default());
                     Section::Fallback
                 }
-                other => return Err(err(format!("unknown section [{other}]"))),
+                other => {
+                    return Err(err(format!(
+                        "unknown section [{other}] (filters for code blocks go in a file given \
+                         with --filters, not in .sundowner)"
+                    )))
+                }
             };
             continue;
         }

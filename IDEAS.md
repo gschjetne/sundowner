@@ -152,5 +152,10 @@ Patterns for the main European languages, from hyph-utf8 (sizes of the
 - More of the structure: a `BBox` for figures, for reflowing viewers;
   `Code` elements for inline code; and `Lang` on elements, for passages
   in another language (the HTML `lang` attributes that are now dropped).
+- Vector images from filters: diagrams in PDF (embedding a page of a
+  one-page PDF as a form XObject, which needs a reader for PDF objects and
+  content streams) or in SVG (a subset: paths, fills and strokes, and text
+  set in sundowner's own fonts). Either would keep diagrams sharp, and
+  their text searchable.
 - CMYK JPEGs in PDF/A: convert them to RGB (which means decoding the
   JPEG), or give them an ICC-based colour space.

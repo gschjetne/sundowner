@@ -23,7 +23,19 @@ pub enum Block {
         text: String,
     },
     Paragraph(String),
-    Code(Vec<String>),
+    /// A fenced or indented code block: the fence's info string (empty for
+    /// indented code), whose first word names the language, and the lines.
+    Code {
+        info: String,
+        lines: Vec<String>,
+    },
+    /// A code block that a filter turned into an image: the image's index
+    /// in [`Document::figures`], and the code, which is shown instead if the
+    /// image cannot be embedded. See [`crate::filter`].
+    Figure {
+        index: usize,
+        lines: Vec<String>,
+    },
     Quote(Vec<Block>),
     List {
         ordered: bool,
@@ -52,6 +64,16 @@ pub struct Document {
     pub blocks: Vec<Block>,
     /// Link reference definitions, keyed by normalized label.
     pub refs: HashMap<String, String>,
+    /// Images that filters made from code blocks, for [`Block::Figure`].
+    pub figures: Vec<Figure>,
+}
+
+/// An image a filter made from a code block.
+pub struct Figure {
+    /// The PNG or JPEG file.
+    pub data: Vec<u8>,
+    /// Its resolution, in pixels per inch.
+    pub dpi: f32,
 }
 
 pub fn parse(src: &str) -> Document {
@@ -67,6 +89,7 @@ pub fn parse(src: &str) -> Document {
         front_matter,
         blocks,
         refs,
+        figures: Vec::new(),
     }
 }
 
@@ -137,6 +160,7 @@ struct Fence {
     indent: usize,
     ch: u8,
     len: usize,
+    info: String,
 }
 
 fn fence_start(s: &str) -> Option<Fence> {
@@ -156,7 +180,12 @@ fn fence_start(s: &str) -> Option<Fence> {
     if ch == b'`' && rest[len..].contains('`') {
         return None;
     }
-    Some(Fence { indent: ind, ch, len })
+    Some(Fence {
+        indent: ind,
+        ch,
+        len,
+        info: rest[len..].trim().to_string(),
+    })
 }
 
 fn is_fence_end(s: &str, f: &Fence) -> bool {
@@ -425,7 +454,10 @@ fn parse_blocks(lines: &[String], depth: usize, refs: &mut HashMap<String, Strin
             while code.last().is_some_and(|l| is_blank(l)) {
                 code.pop();
             }
-            out.push(Block::Code(code));
+            out.push(Block::Code {
+                info: String::new(),
+                lines: code,
+            });
             continue;
         }
 
@@ -437,7 +469,10 @@ fn parse_blocks(lines: &[String], depth: usize, refs: &mut HashMap<String, Strin
                 i += 1;
             }
             i += 1; // closing fence (or end of input)
-            out.push(Block::Code(code));
+            out.push(Block::Code {
+                info: f.info,
+                lines: code,
+            });
             continue;
         }
 
@@ -671,7 +706,7 @@ mod tests {
     #[test]
     fn code_quote_table() {
         let d = parse("```rust\nfn x() {}\n\n```\n> quote\nlazy\n\n| a | b |\n|:--|--:|\n| 1 | 2 |\n");
-        assert!(matches!(&d.blocks[0], Block::Code(l) if l.len() == 2));
+        assert!(matches!(&d.blocks[0], Block::Code { info, lines } if info == "rust" && lines.len() == 2));
         assert!(
             matches!(&d.blocks[1], Block::Quote(b) if matches!(&b[0], Block::Paragraph(t) if t == "quote\nlazy"))
         );
